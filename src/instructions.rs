@@ -78,6 +78,9 @@ pub enum Inst {
     TestRm8Imm { m: ModRm, imm: u8 },
     TestRm16Imm { m: ModRm, imm: u16 },
     TestRm32Imm { m: ModRm, imm: u32 },
+    TestAccImm8 { imm: u8 },
+    TestAccImm16 { imm: u16 },
+    TestAccImm32 { imm: u32 },
     NotRm8 { m: ModRm },
     NotRm16 { m: ModRm },
     NotRm32 { m: ModRm },
@@ -138,6 +141,14 @@ pub enum Inst {
     // CPUID (0x0F 0xA2) / RDTSC (0x0F 0x31)
     Cpuid,
     Rdtsc,
+    // RDMSR (0x0F 0x32) / WRMSR (0x0F 0x30)
+    Rdmsr,
+    Wrmsr,
+    // Bit tests: BT/BTS/BTR/BTC (0F A3/AB/B3/BB, and group 8 0F BA /4-/7)
+    Bt { m: ModRm, bit: u8 },
+    Bts { m: ModRm, bit: u8 },
+    Btr { m: ModRm, bit: u8 },
+    Btc { m: ModRm, bit: u8 },
     // IN / OUT (0xE4-0xE7, 0xEC-0xEF)
     InAlImm { port: u8 },
     InAxImm { port: u8 },
@@ -509,6 +520,12 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         // MOV AL, moffs8 / MOV moffs8, AL (0xA0/0xA2)
         0xA0 => Inst::MovAccMem8 { addr: cpu.fetch_u16() },
         0xA2 => Inst::MovMem8Acc { addr: cpu.fetch_u16() },
+        // TEST AL, imm8 (0xA8) / TEST AX/EAX, imm (0xA9)
+        0xA8 => Inst::TestAccImm8 { imm: cpu.fetch_u8() },
+        0xA9 => {
+            if w32 { Inst::TestAccImm32 { imm: cpu.fetch_u32() } }
+            else { Inst::TestAccImm16 { imm: cpu.fetch_u16() } }
+        }
         // MOV AX/EAX, moffs / MOV moffs, AX/EAX (0xA1/0xA3)
         0xA1 => {
             if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() } }
@@ -570,6 +587,25 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0xA2 => Inst::Cpuid,
                 // RDTSC (0x0F 0x31)
                 0x31 => Inst::Rdtsc,
+                // RDMSR (0x0F 0x32) / WRMSR (0x0F 0x30)
+                0x32 => Inst::Rdmsr,
+                0x30 => Inst::Wrmsr,
+                // Bit tests: BT/BTS/BTR/BTC with register operand
+                0xA3 => { let m = cpu.fetch_modrm(); Inst::Bt { m, bit: m.reg } }
+                0xAB => { let m = cpu.fetch_modrm(); Inst::Bts { m, bit: m.reg } }
+                0xB3 => { let m = cpu.fetch_modrm(); Inst::Btr { m, bit: m.reg } }
+                0xBB => { let m = cpu.fetch_modrm(); Inst::Btc { m, bit: m.reg } }
+                // Group 8 (0F BA /4-/7): bit tests with imm8
+                0xBA => {
+                    let m = cpu.fetch_modrm();
+                    let imm = cpu.fetch_u8();
+                    match m.reg & 7 {
+                        4 => Inst::Bt { m, bit: imm },
+                        5 => Inst::Bts { m, bit: imm },
+                        6 => Inst::Btr { m, bit: imm },
+                        _ => Inst::Btc { m, bit: imm },
+                    }
+                }
                 _ => Inst::Unknown { opcode: 0x0F },
             }
         }
@@ -896,6 +932,27 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
         Inst::TestRm32Imm { m, imm } => {
             let v = cpu.read_rm32(&m);
+            let r = v & imm;
+            set_logic_flags32(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestAccImm8 { imm } => {
+            let v = cpu.reg8(Reg8::Al);
+            let r = v & imm;
+            set_logic_flags8(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestAccImm16 { imm } => {
+            let v = cpu.reg16(Reg16::Ax);
+            let r = v & imm;
+            set_logic_flags16(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestAccImm32 { imm } => {
+            let v = cpu.reg32(Reg32::Eax);
             let r = v & imm;
             set_logic_flags32(cpu, r);
             cpu.set_flag(CF, false);
@@ -1395,6 +1452,69 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let tsc = cpu.rdtsc();
             cpu.set_reg32(Reg32::Eax, tsc as u32);
             cpu.set_reg32(Reg32::Edx, (tsc >> 32) as u32);
+        }
+
+        // ---- RDMSR (0x0F 0x32) / WRMSR (0x0F 0x30) ----
+        Inst::Rdmsr => {
+            // ECX = MSR index. Return 0 for all MSRs (a real CPU would
+            // return specific values; 0 is enough for early boot probing).
+            cpu.set_reg32(Reg32::Eax, 0);
+            cpu.set_reg32(Reg32::Edx, 0);
+        }
+        Inst::Wrmsr => {
+            // Ignore writes (no-op).
+        }
+
+        // ---- Bit tests: BT / BTS / BTR / BTC ----
+        Inst::Bt { m, bit } => {
+            if cpu.opsize {
+                let v = cpu.read_rm32(&m);
+                let b = (bit & 31) as u32;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+            } else {
+                let v = cpu.read_rm16(&m);
+                let b = (bit & 15) as u16;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+            }
+        }
+        Inst::Bts { m, bit } => {
+            if cpu.opsize {
+                let v = cpu.read_rm32(&m);
+                let b = (bit & 31) as u32;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm32(&m, v | (1 << b));
+            } else {
+                let v = cpu.read_rm16(&m);
+                let b = (bit & 15) as u16;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm16(&m, v | (1 << b));
+            }
+        }
+        Inst::Btr { m, bit } => {
+            if cpu.opsize {
+                let v = cpu.read_rm32(&m);
+                let b = (bit & 31) as u32;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm32(&m, v & !(1 << b));
+            } else {
+                let v = cpu.read_rm16(&m);
+                let b = (bit & 15) as u16;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm16(&m, v & !(1 << b));
+            }
+        }
+        Inst::Btc { m, bit } => {
+            if cpu.opsize {
+                let v = cpu.read_rm32(&m);
+                let b = (bit & 31) as u32;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm32(&m, v ^ (1 << b));
+            } else {
+                let v = cpu.read_rm16(&m);
+                let b = (bit & 15) as u16;
+                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
+                cpu.write_rm16(&m, v ^ (1 << b));
+            }
         }
 
         // ---- IN / OUT ----
@@ -2332,6 +2452,49 @@ mod tests {
         cpu.run(16);
         assert_eq!(cpu.eax, 0x9ABC_DEF0);
         assert_eq!(cpu.edx, 0x1234_5678);
+    }
+
+    #[test]
+    fn test_acc_imm_sets_flags() {
+        let mut cpu = Cpu::new();
+        // mov al, 0x0F ; test al, 0x0F (A8) ; hlt
+        load(&mut cpu, &[
+            0xB0, 0x0F,
+            0xA8, 0x0F,
+            0xF4,
+        ]);
+        cpu.run(16);
+        // 0x0F & 0x0F = 0x0F -> ZF clear, CF clear.
+        assert!(!cpu.get_flag(flags::ZF));
+        assert!(!cpu.get_flag(flags::CF));
+    }
+
+    #[test]
+    fn rdmsr_returns_zero() {
+        let mut cpu = Cpu::new();
+        // mov ecx, 0x1B ; rdmsr ; hlt
+        load(&mut cpu, &[
+            0x66, 0xB9, 0x1B, 0x00, 0x00, 0x00,
+            0x0F, 0x32,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert_eq!(cpu.eax, 0);
+        assert_eq!(cpu.edx, 0);
+    }
+
+    #[test]
+    fn bts_sets_bit_and_carry() {
+        let mut cpu = Cpu::new();
+        // mov eax, 0 ; bts eax, 3 (0F BA E8 03, /5) ; hlt
+        load(&mut cpu, &[
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00,
+            0x0F, 0xBA, 0xE8, 0x03,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert_eq!(cpu.eax, 0x8); // bit 3 set
+        assert!(!cpu.get_flag(flags::CF)); // was 0 before
     }
 
     #[test]

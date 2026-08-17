@@ -34,6 +34,12 @@ fn main() -> ExitCode {
     if args[1] == "--kernel" {
         return kernel(&args[2..]);
     }
+    if args[1] == "--kernel-elf" {
+        return kernel_elf(&args[2..]);
+    }
+    if args[1] == "--dump" {
+        return dump(&args[2..]);
+    }
 
     let path = &args[1];
     let (segment, offset) = args.get(2)
@@ -155,6 +161,117 @@ fn kernel(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error loading kernel: {}", e);
+            return ExitCode::from(1);
+        }
+    }
+
+    let ran = cpu.run(max);
+
+    println!("executed {} instructions", ran);
+    if cpu.halted {
+        println!("halted");
+    } else {
+        println!("stopped (instruction limit reached)");
+    }
+    print_state(&cpu);
+    println!();
+    println!("--- text screen ---");
+    for row in 0..x86emu::bios::SCREEN_ROWS {
+        let mut line = String::new();
+        for col in 0..x86emu::bios::SCREEN_COLS {
+            let cell = cpu.mem.vga_text[row * x86emu::bios::SCREEN_COLS + col];
+            let ch = (cell & 0xFF) as u8;
+            line.push(if ch == 0 { ' ' } else { ch as char });
+        }
+        println!("{}", line.trim_end());
+    }
+    ExitCode::from(0)
+}
+
+/// Dump a region of emulated memory to a file. Used for debugging the
+/// kernel decompressor: `x86emu --dump <bzImage> <outfile> <addr> <len> <max_instructions>`
+/// loads the kernel, runs it, and writes `len` bytes from physical `addr` to `outfile`.
+fn dump(args: &[String]) -> ExitCode {
+    if args.len() < 5 {
+        eprintln!("usage: x86emu --dump <bzImage> <outfile> <addr> <len> <max_instructions>");
+        return ExitCode::from(2);
+    }
+    let path = &args[0];
+    let outfile = &args[1];
+    let addr = usize::from_str_radix(&args[2], 16).unwrap_or(0);
+    let len = usize::from_str_radix(&args[3], 16).unwrap_or(0);
+    let max = args[4].parse::<u64>().unwrap_or(5_000_000);
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error reading {}: {}", path, e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut cpu = Cpu::new();
+    match x86emu::boot::load_kernel(&mut cpu, &bytes, "console=tty0") {
+        Ok(info) => {
+            println!("loaded bzImage: setup_sects={} syssize={} code32_start={:08X}",
+                info.setup_sects, info.syssize, info.code32_start);
+        }
+        Err(e) => {
+            eprintln!("error loading kernel: {}", e);
+            return ExitCode::from(1);
+        }
+    }
+
+    let ran = cpu.run(max);
+    println!("executed {} instructions", ran);
+    if cpu.halted {
+        println!("halted");
+    } else {
+        println!("stopped (instruction limit reached)");
+    }
+
+    // Dump the requested region.
+    let mut buf = Vec::with_capacity(len);
+    for i in 0..len {
+        buf.push(cpu.mem.read_u8(addr + i));
+    }
+    match std::fs::write(outfile, &buf) {
+        Ok(_) => println!("dumped {} bytes from {:08X} to {}", len, addr, outfile),
+        Err(e) => {
+            eprintln!("error writing {}: {}", outfile, e);
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::from(0)
+}
+
+/// Load a decompressed kernel ELF and run it (bypasses the in-kernel
+/// decompressor, which the emulator does not yet execute correctly).
+fn kernel_elf(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: x86emu --kernel-elf <kernel.elf> [max_instructions]");
+        return ExitCode::from(2);
+    }
+    let path = &args[0];
+    let max = args.get(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000_000);
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error reading {}: {}", path, e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut cpu = Cpu::new();
+    match x86emu::boot::load_elf_kernel(&mut cpu, &bytes, "console=tty0") {
+        Ok(entry) => {
+            println!("loaded kernel ELF, entry={:08X}", entry);
+        }
+        Err(e) => {
+            eprintln!("error loading kernel ELF: {}", e);
             return ExitCode::from(1);
         }
     }

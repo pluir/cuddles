@@ -131,7 +131,12 @@ cargo run -- --boot examples/boot.bin
   `0x20000`), writes a flat GDT at `0x1000`, enables protected mode (CR0.PE),
   loads flat segments, sets `ESI = boot_params`, and jumps to the kernel with
   `EIP = code32_start` — exactly what the kernel's `startup_32` expects. The
-  `--kernel` CLI mode drives it.
+  `--kernel` CLI mode drives it. There is also `load_elf_kernel` (driven by
+  `--kernel-elf`), which loads an already-decompressed kernel ELF directly —
+  the path a bootloader uses for an uncompressed kernel, and a way to boot a
+  kernel without running the in-kernel decompressor (which the emulator does
+  not yet execute correctly). The decompressed ELF is extracted from the
+  bzImage with `images/parse_bz4.py` (saved as `images/golden_kernel.bin`).
 
 ## Conventions
 
@@ -161,7 +166,7 @@ cargo run -- --boot examples/boot.bin
 - [x] Devices (part 1): 8254 PIT and 8259 PIC, hardware interrupts (IRQ0 from the timer), IN/OUT port I/O.
 - [x] Devices (part 2): VGA text/graphics framebuffer, 8042 keyboard controller, DMA, IDE/ATA disk, boot a real OS image.
 - [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes.
-- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. Next: keep chasing what breaks until the kernel reaches console output.
+- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. The in-kernel decompressor does not yet produce correct output, so `--kernel-elf` loads the decompressed ELF directly (`images/golden_kernel.bin`); booting that, the kernel now runs real 32-bit code (CPUID/RDTSC/RDMSR, paging setup) before hitting a page fault it can't yet handle (no IDT installed). Missing instructions added: `TEST acc,imm` (0xA8/0xA9), `RDMSR`/`WRMSR` (0x0F 0x32/0x30), bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB, group 8 0x0F 0xBA). Next: keep chasing what breaks until the kernel reaches console output.
 
 ## Common tasks
 

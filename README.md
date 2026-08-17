@@ -61,12 +61,21 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
     and family/model/feature flags (leaf 1, including the TSC bit).
   - `RDTSC` (0x0F 0x31) — reads the time-stamp counter (incremented each
     step) into EDX:EAX.
+  - `RDMSR`/`WRMSR` (0x0F 0x32 / 0x0F 0x30) — read/write model-specific
+    registers (all MSRs report 0; writes are no-ops).
+  - Bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB and group 8
+    `0x0F 0xBA` /4-/7), 16/32-bit.
+  - `TEST AL/AX/EAX, imm` (0xA8/0xA9).
 - **Linux boot-protocol loader** (`src/boot.rs`): parses a bzImage setup
   header, loads the protected-mode kernel at `code32_start`, builds a
   `boot_params` structure at `0x90000` (setup header, E820 memory map,
   command line), sets up a flat GDT, enables protected mode, and jumps to
   the kernel entry point with `ESI = boot_params` — exactly what the
-  kernel's `startup_32` expects. Driven by the `--kernel` CLI mode.
+  kernel's `startup_32` expects. Driven by the `--kernel` CLI mode. There is
+  also `load_elf_kernel` (driven by `--kernel-elf`), which loads an
+  already-decompressed kernel ELF directly — the path a bootloader uses for
+  an uncompressed kernel, and a way to boot a kernel without running the
+  in-kernel decompressor.
 - **Protected mode**: GDT/IDT parsing, segment-descriptor caching, 32-bit
   address translation, and protected-mode interrupt dispatch through the IDT.
 - **Paging**: 32-bit two-level page tables (page directory + page table),
@@ -217,5 +226,12 @@ Hello from x86emu!
    shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) have been added, and the
    decoder now derives the default operand/address size from the code
    segment's D bit (with `0x66`/`0x67` toggling it) so 32-bit kernel code
-   decodes correctly. The kernel is still executing in a region that needs
-   further debugging before it reaches console output.
+   decodes correctly. The in-kernel decompressor does not yet produce
+   correct output in the emulator, so the `--kernel-elf` mode loads the
+   decompressed kernel ELF directly (extracted from the bzImage with
+   `images/parse_bz4.py`). Booting that ELF, the kernel now runs real 32-bit
+   code: it probes CPUID/RDTSC/RDMSR, sets up paging, and gets well into
+   early boot before hitting a page fault (which it can't yet handle because
+   it hasn't installed its IDT). The missing instructions it needs
+   (`TEST acc,imm`, `RDMSR`/`WRMSR`, bit tests `BT/BTS/BTR/BTC`) have been
+   added. It has not yet reached console output.

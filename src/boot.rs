@@ -156,6 +156,82 @@ fn write_e820(mem: &mut Memory) {
     mem.write_u32(BOOT_PARAMS_ADDR as usize + BP_ALT_MEM_K, 0xF000); // 15360 KB
 }
 
+/// Load a decompressed kernel ELF into the emulator and enter its entry point.
+///
+/// This is the path a bootloader uses for an *uncompressed* kernel: parse the
+/// ELF program headers, load each PT_LOAD segment at its physical address, and
+/// jump to the entry point. It lets us boot a kernel without running the
+/// in-kernel decompressor (which our emulator does not yet execute correctly).
+pub fn load_elf_kernel(cpu: &mut Cpu, elf: &[u8], cmdline: &str) -> Result<u32, String> {
+    if elf.len() < 52 || &elf[0..4] != b"\x7fELF" {
+        return Err("not an ELF file".into());
+    }
+    let e_entry = le32(elf, 24);
+    let e_phoff = le32(elf, 28) as usize;
+    let e_phentsize = le16(elf, 42) as usize;
+    let e_phnum = le16(elf, 44) as usize;
+    if e_phnum == 0 || e_phentsize < 32 {
+        return Err("ELF has no program headers".into());
+    }
+    let mem = &mut cpu.mem;
+    for i in 0..e_phnum {
+        let off = e_phoff + i * e_phentsize;
+        let p_type = le32(elf, off);
+        let p_offset = le32(elf, off + 4) as usize;
+        let p_paddr = le32(elf, off + 12) as usize;
+        let p_filesz = le32(elf, off + 16) as usize;
+        let p_memsz = le32(elf, off + 20) as usize;
+        if p_type == 1 {
+            // PT_LOAD: copy file bytes, zero the rest of the segment.
+            for j in 0..p_filesz {
+                mem.write_u8(p_paddr + j, elf[p_offset + j]);
+            }
+            for j in p_filesz..p_memsz {
+                mem.write_u8(p_paddr + j, 0);
+            }
+        }
+    }
+    // Build boot_params, GDT, and enter protected mode (same as load_kernel).
+    setup_protected_mode(cpu, cmdline);
+    cpu.eip = e_entry;
+    cpu.halted = false;
+    Ok(e_entry)
+}
+
+/// Shared protected-mode setup used by both loaders: build boot_params at
+/// 0x90000, write the flat GDT, enable protected mode, load flat segments.
+fn setup_protected_mode(cpu: &mut Cpu, cmdline: &str) {
+    let mem = &mut cpu.mem;
+    // Write the E820 memory map.
+    write_e820(mem);
+    // Write the command line (NUL-terminated).
+    let cl = cmdline.as_bytes();
+    let cl_len = cl.len().min(1023);
+    for i in 0..cl_len {
+        mem.write_u8(CMDLINE_ADDR as usize + i, cl[i]);
+    }
+    mem.write_u8(CMDLINE_ADDR as usize + cl_len, 0);
+    // cmd_line_ptr in boot_params.hdr.
+    let hdr_dst = BOOT_PARAMS_ADDR as usize + BP_HDR;
+    mem.write_u32(hdr_dst + (CMD_LINE_PTR - SETUP_SECTS), CMDLINE_ADDR);
+    // Set up the flat GDT.
+    write_gdt(mem);
+    // Enter protected mode.
+    cpu.gdt_base = GDT_ADDR;
+    cpu.gdt_limit = 24;
+    cpu.pe = true;
+    cpu.cr0 |= 1;
+    cpu.load_seg(SegReg::Cs, KERNEL_CS);
+    cpu.load_seg(SegReg::Ds, KERNEL_DS);
+    cpu.load_seg(SegReg::Es, KERNEL_DS);
+    cpu.load_seg(SegReg::Ss, KERNEL_DS);
+    cpu.load_seg(SegReg::Fs, KERNEL_DS);
+    cpu.load_seg(SegReg::Gs, KERNEL_DS);
+    cpu.esp = 0x8FFF0;
+    cpu.esi = BOOT_PARAMS_ADDR;
+    cpu.set_flag(crate::cpu::flags::IF, false);
+}
+
 /// Load a bzImage and set up the CPU to enter the 32-bit kernel.
 ///
 /// Returns the parsed `KernelInfo` on success. On return the CPU is in

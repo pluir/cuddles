@@ -30,7 +30,7 @@ version control.
 | `src/cpu.rs` | `Cpu` struct: registers, flags, fetch-decode-execute loop, stack, ModR/M operand helpers. |
 | `src/instructions.rs` | The instruction decoder (`decode`) and executor (`execute`). The largest file. |
 | `src/modrm.rs` | ModR/M byte decoding and register-index helpers. |
-| `src/memory.rs` | Flat 128 MiB `Memory` with segment:offset → physical translation. |
+| `src/memory.rs` | Flat `Memory` (256 MiB; `Memory::SIZE` is the single source of truth for RAM size) with segment:offset → physical translation. |
 | `src/protected.rs` | Segment descriptors, GDT/IDT parsing, protected-mode translation. |
 | `src/paging.rs` | 32-bit page-directory/page-table walk (4 KiB and 4 MiB pages). |
 | `src/pit.rs` | 8254 Programmable Interval Timer (channel 0 -> IRQ0). |
@@ -61,7 +61,10 @@ cargo run -- --boot examples/boot.bin
 
 ## How the emulator works
 
-- **Memory** is a flat `Vec<u8>` of 128 MiB. Real-mode logical addresses
+- **Memory** is a flat `Vec<u8>` of 256 MiB. `Memory::SIZE` is the single
+  source of truth for the RAM size: the BIOS E820/E801/0x88 map and the boot
+  loader's `boot_params` derive their values from it, so scaling the RAM is a
+  one-line change to `Memory::SIZE`. Real-mode logical addresses
   `segment:offset` map to physical `segment * 16 + offset`, masked to 20 bits
   (wraps at 1 MiB). See `Memory::phys`. Protected mode translates through
   cached segment descriptors (`Cpu::translate`). When CR0.PG is set, the

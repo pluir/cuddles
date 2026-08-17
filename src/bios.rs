@@ -119,8 +119,8 @@ impl Bios {
     // ---- INT 0x15: memory map services (AH = function) ----
     // E820 (AH=0xE820), E801 (AH=0xE801) and 0x88 report the physical RAM
     // layout. Linux queries these very early in boot to learn how much memory
-    // it can use. The backing store is 128 MiB, so extended memory (above the
-    // 1 MiB mark) is 127 MiB.
+    // it can use. The backing store is `Memory::SIZE` (256 MiB), so extended
+    // memory (above the 1 MiB mark) is `Memory::SIZE - 1 MiB`.
 
     fn memory_map(&mut self, cpu: &mut Cpu) {
         match cpu.reg8(Reg8::Ah) {
@@ -143,12 +143,15 @@ impl Bios {
     fn e820(&mut self, cpu: &mut Cpu) {
         // E820 entry layout (20 bytes): base (u64), length (u64), type (u32).
         // Types: 1 = usable, 2 = reserved, 3 = ACPI reclaimable, 4 = ACPI NVS.
+        // The extended-memory entry and end marker are derived from
+        // `Memory::SIZE` so the reported layout always matches the backing
+        // store, no matter how the RAM is scaled.
         const ENTRIES: [(u64, u64, u32); 5] = [
             (0x00000000, 0x0009FC00, 1), // conventional memory (640K - 1K)
             (0x0009FC00, 0x00000400, 2), // EBDA
             (0x000A0000, 0x00060000, 2), // VGA / ROM area
-            (0x00100000, 0x07F00000, 1), // extended memory up to 128 MiB
-            (0x08000000, 0x00000000, 2), // end marker (reserved)
+            (0x00100000, (Memory::SIZE as u64) - 0x100000, 1), // extended memory
+            (Memory::SIZE as u64, 0x00000000, 2), // end marker (reserved)
         ];
         // E820 protocol: EAX=0x0000E820, EDX='SMAP' (0x534D4150),
         // EBX=continuation (0 first), ECX=buffer size, ES:DI=buffer.
@@ -176,13 +179,15 @@ impl Bios {
 
     fn e801(&mut self, cpu: &mut Cpu) {
         // Extended memory below 16 MiB in KB (15 MiB = 15360 KB), and above
-        // 16 MiB in 64 KiB units (128 MiB total = 112 * 64 KiB units above 16 MiB).
+        // 16 MiB in 64 KiB units, derived from `Memory::SIZE`.
         let ext_kb: u16 = 15 * 1024;
         cpu.ax = ext_kb;
         cpu.cx = ext_kb;
-        // (128 MiB - 16 MiB) / 64 KiB = 112 MiB / 64 KiB = 1792 units.
-        cpu.bx = 1792;
-        cpu.dx = 1792;
+        // (SIZE - 16 MiB) / 64 KiB units.
+        let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
+        let units = (above_16m / (64 << 10)) as u16;
+        cpu.bx = units;
+        cpu.dx = units;
     }
 
     fn mem88(&mut self, cpu: &mut Cpu) {
@@ -374,7 +379,7 @@ mod tests {
         let len = cpu.mem.read_u64(0x2008);
         let typ = cpu.mem.read_u32(0x2010);
         assert_eq!(base, 0x0010_0000); // 1 MiB
-        assert_eq!(len, 0x07F0_0000); // 127 MiB
+        assert_eq!(len, (Memory::SIZE as u64) - 0x100000); // extended memory
         assert_eq!(typ, 1);
         // Continuation advanced to 4 (index 4 is the end marker).
         assert_eq!(cpu.ebx, 4);
@@ -392,9 +397,11 @@ mod tests {
         // 15 MiB of extended memory below 16 MiB = 15360 KB in both AX and CX.
         assert_eq!(cpu.ax, 15 * 1024);
         assert_eq!(cpu.cx, 15 * 1024);
-        // Memory above 16 MiB: (128 MiB - 16 MiB) / 64 KiB = 1792 units.
-        assert_eq!(cpu.bx, 1792);
-        assert_eq!(cpu.dx, 1792);
+        // Memory above 16 MiB: (SIZE - 16 MiB) / 64 KiB units.
+        let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
+        let units = (above_16m / (64 << 10)) as u16;
+        assert_eq!(cpu.bx, units);
+        assert_eq!(cpu.dx, units);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Flat memory for real and protected mode.
 //!
 //! Real-mode physical addresses are 20 bits wide; protected mode uses 32-bit
-//! physical addresses. The backing store is 128 MiB, and 32-bit addresses are
-//! masked to that size.
+//! physical addresses. The backing store is 256 MiB, and 32-bit addresses are
+//! masked to that size. `Memory::SIZE` is the single source of truth for the
+//! RAM size — the BIOS E820/E801/0x88 map and the boot loader's `boot_params`
+//! derive their values from it, so scaling the RAM is a one-line change.
 
 pub struct Memory {
     pub data: Vec<u8>,
@@ -19,8 +21,11 @@ pub const VGA_TEXT_BASE: usize = 0xB8000;
 pub const VGA_TEXT_SIZE: usize = 80 * 25 * 2;
 
 impl Memory {
-    /// Backing store size (128 MiB).
-    pub const SIZE: usize = 128 << 20;
+    /// Backing store size (256 MiB). This is the single source of truth for
+    /// the machine's RAM: the BIOS E820/E801/0x88 memory map and the boot
+    /// loader's `boot_params` derive their values from this, so scaling the
+    /// RAM is a one-line change here.
+    pub const SIZE: usize = 256 << 20;
 
     pub fn new() -> Self {
         Memory {

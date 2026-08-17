@@ -13,7 +13,7 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
 
 ### What works
 
-- **128 MiB flat memory** with real-mode `segment:offset` → 20-bit physical
+- **256 MiB flat memory** with real-mode `segment:offset` → 20-bit physical
   address translation (`segment * 16 + offset`, with 1 MiB wraparound) and
   32-bit protected-mode translation through segment descriptors.
 - **Registers**: 8 × 16-bit general registers (AX/CX/DX/BX/SP/BP/SI/DI) with
@@ -142,7 +142,8 @@ making changes.
 src/
   lib.rs          — crate root, re-exports
   cpu.rs          — registers, flags, fetch-decode-execute loop, stack, ModR/M helpers
-  memory.rs       — 128 MiB flat memory + segment translation
+  memory.rs       — flat `Memory` (256 MiB, `Memory::SIZE` is the single source
+                  of truth for RAM size) + segment translation
   modrm.rs        — ModR/M byte decoding + register-index helpers
   instructions.rs — instruction decoder + executor + ALU flag computation
   protected.rs    — segment descriptors, GDT/IDT parsing, protected-mode translation

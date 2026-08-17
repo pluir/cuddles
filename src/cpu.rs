@@ -485,9 +485,13 @@ impl Cpu {
                 if base == 4 || base == 5 { default_seg = SegReg::Ss; }
             }
         } else {
-            let base_reg = Reg::reg32(m.rm);
-            ea = ea.wrapping_add(self.reg32(base_reg));
-            if m.rm == 4 || m.rm == 5 { default_seg = SegReg::Ss; }
+            // mod=00, rm=101 means disp32 with NO base register (only EBP/ESP
+            // use SS as the default segment, and only when they are a base).
+            if !(m.mod_field == 0 && m.rm == 5) {
+                let base_reg = Reg::reg32(m.rm);
+                ea = ea.wrapping_add(self.reg32(base_reg));
+                if m.rm == 4 || m.rm == 5 { default_seg = SegReg::Ss; }
+            }
         }
         if let Some(d32) = m.disp32 { ea = ea.wrapping_add(d32); }
         self.translate(self.operand_seg(default_seg), ea)

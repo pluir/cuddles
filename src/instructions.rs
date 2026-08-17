@@ -27,8 +27,12 @@ pub enum Inst {
     MovReg32Imm { dst: Reg32, imm: u32 },
     MovAccMem8 { addr: u16 },
     MovMem8Acc { addr: u16 },
+    MovAccMem8_32 { addr: u32 },
+    MovMem8Acc_32 { addr: u32 },
     MovAccMem16 { addr: u16 },
     MovMem16Acc { addr: u16 },
+    MovAccMem16_32 { addr: u32 },
+    MovMem16Acc_32 { addr: u32 },
     MovAccMem32 { addr: u32 },
     MovMem32Acc { addr: u32 },
     MovRmSeg { m: ModRm, seg: SegReg },
@@ -148,6 +152,8 @@ pub enum Inst {
     // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22)
     MovCr { cr: u8, reg: u8 },
     MovToCr { cr: u8, reg: u8 },
+    // CLTS (0x0F 0x06): clear CR0.TS (task-switched flag).
+    Clts,
     // CPUID (0x0F 0xA2) / RDTSC (0x0F 0x31)
     Cpuid,
     Rdtsc,
@@ -536,8 +542,16 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         }
 
         // MOV AL, moffs8 / MOV moffs8, AL (0xA0/0xA2)
-        0xA0 => Inst::MovAccMem8 { addr: cpu.fetch_u16() },
-        0xA2 => Inst::MovMem8Acc { addr: cpu.fetch_u16() },
+        // The moffs width follows the ADDRESS size (addrsize), not the
+        // operand size. In 32-bit addressing mode the moffs is 32-bit.
+        0xA0 => {
+            if cpu.addrsize { Inst::MovAccMem8_32 { addr: cpu.fetch_u32() } }
+            else { Inst::MovAccMem8 { addr: cpu.fetch_u16() } }
+        }
+        0xA2 => {
+            if cpu.addrsize { Inst::MovMem8Acc_32 { addr: cpu.fetch_u32() } }
+            else { Inst::MovMem8Acc { addr: cpu.fetch_u16() } }
+        }
         // TEST AL, imm8 (0xA8) / TEST AX/EAX, imm (0xA9)
         0xA8 => Inst::TestAccImm8 { imm: cpu.fetch_u8() },
         0xA9 => {
@@ -545,13 +559,24 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
             else { Inst::TestAccImm16 { imm: cpu.fetch_u16() } }
         }
         // MOV AX/EAX, moffs / MOV moffs, AX/EAX (0xA1/0xA3)
+        // The moffs width follows the ADDRESS size.
         0xA1 => {
-            if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() } }
-            else { Inst::MovAccMem16 { addr: cpu.fetch_u16() } }
+            if cpu.addrsize {
+                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() } }
+                else { Inst::MovAccMem16_32 { addr: cpu.fetch_u32() } }
+            } else {
+                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u16() as u32 } }
+                else { Inst::MovAccMem16 { addr: cpu.fetch_u16() } }
+            }
         }
         0xA3 => {
-            if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u32() } }
-            else { Inst::MovMem16Acc { addr: cpu.fetch_u16() } }
+            if cpu.addrsize {
+                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u32() } }
+                else { Inst::MovMem16Acc_32 { addr: cpu.fetch_u32() } }
+            } else {
+                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u16() as u32 } }
+                else { Inst::MovMem16Acc { addr: cpu.fetch_u16() } }
+            }
         }
 
         // LEA reg16/32, m (0x8D)
@@ -594,6 +619,8 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                         _ => Inst::Unknown { opcode: 0x0F },
                     }
                 }
+                // CLTS (0x0F 0x06)
+                0x06 => Inst::Clts,
                 // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22)
                 0x20 => {
                     let m = cpu.fetch_modrm();
@@ -688,16 +715,32 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
+        Inst::MovAccMem8_32 { addr } => {
+            let phys = cpu.translate(SegReg::Ds, addr);
+            cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
+        }
         Inst::MovMem8Acc { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
+            cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
+        }
+        Inst::MovMem8Acc_32 { addr } => {
+            let phys = cpu.translate(SegReg::Ds, addr);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
         Inst::MovAccMem16 { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
+        Inst::MovAccMem16_32 { addr } => {
+            let phys = cpu.translate(SegReg::Ds, addr);
+            cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
+        }
         Inst::MovMem16Acc { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
+            cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
+        }
+        Inst::MovMem16Acc_32 { addr } => {
+            let phys = cpu.translate(SegReg::Ds, addr);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
         Inst::MovAccMem32 { addr } => {
@@ -1612,6 +1655,11 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             }
         }
 
+        // ---- CLTS (0x0F 0x06) ----
+        Inst::Clts => {
+            cpu.cr0 &= !0x8; // clear CR0.TS (bit 3)
+        }
+
         // ---- CPUID (0x0F 0xA2) ----
         Inst::Cpuid => {
             let leaf = cpu.reg32(Reg32::Eax);
@@ -2000,7 +2048,8 @@ fn lea_offset(m: &ModRm, cpu: &Cpu) -> u32 {
             if !(m.mod_field == 0 && base == 5) {
                 ea = ea.wrapping_add(cpu.reg32(Reg::reg32(base)));
             }
-        } else if m.mod_field != 3 {
+        } else if m.mod_field != 3 && !(m.mod_field == 0 && m.rm == 5) {
+            // mod=00, rm=101 is disp32 with no base register.
             ea = ea.wrapping_add(cpu.reg32(Reg::reg32(m.rm)));
         }
         if let Some(d32) = m.disp32 { ea = ea.wrapping_add(d32); }
@@ -2838,6 +2887,30 @@ mod tests {
     }
 
     #[test]
+    fn mov_moffs32_uses_addrsize() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+        };
+        // mov [0x12345678], al (A2 moffs32) ; hlt
+        // In 32-bit addressing mode the moffs is 32-bit.
+        cpu.eip = 0x1000;
+        cpu.mem.load(0x1000, &[
+            0xA2, 0x78, 0x56, 0x34, 0x12,
+            0xF4,
+        ]);
+        cpu.set_reg8(Reg8::Al, 0xAB);
+        cpu.run(32);
+        assert_eq!(cpu.mem.read_u8(0x12345678), 0xAB);
+        assert!(cpu.halted);
+    }
+
+    #[test]
     fn mov_to_from_cr() {
         let mut cpu = Cpu::new();
         // mov eax, 0x12345000 ; mov cr3, eax ; mov ebx, cr3
@@ -3004,7 +3077,8 @@ mod tests {
         cpu.mem.write_u16(entry, 0x5000);
         cpu.mem.write_u16(entry + 2, 0x08);
         cpu.mem.write_u16(entry + 6, 0x0000);
-        // Handler at 0x5000: mov eax, 0xCAFE ; iret (32-bit)
+        // Handler at 0x5000: mov eax, 0xCAFE ; iret (32-bit, matching the
+        // 32-bit frame protected_int pushes)
         cpu.mem.load(0x5000, &[
             0x66, 0xB8, 0xFE, 0xCA, 0x00, 0x00,
             0x66, 0xCF,
@@ -3021,8 +3095,9 @@ mod tests {
         cpu.cr3 = 0x2000;
         cpu.cr0 = 0x8000_0000; // PG set
         // mov eax, [0x0040_0000] ; hlt  (linear 0x0040_0000 -> PD index 1)
+        // 66 = 32-bit operand, 67 = 32-bit addressing (so moffs is 32-bit).
         cpu.mem.load(0x1000, &[
-            0x66, 0xA1, 0x00, 0x00, 0x40, 0x00,
+            0x66, 0x67, 0xA1, 0x00, 0x00, 0x40, 0x00,
             0xF4,
         ]);
         cpu.cs = 0x08;

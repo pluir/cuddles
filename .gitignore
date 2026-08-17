@@ -10,3 +10,4 @@
 /images/parse*.py
 /images/findstart.py
 "*.py"  
+"echo trace.txt"  

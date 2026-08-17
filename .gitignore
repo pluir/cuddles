@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target
+
+# Downloaded OS images (large binaries, not source)
+/images/*.iso
+/images/*.bin
+
+# Scratch debugging scripts used while chasing the Linux boot
+/images/dump*.py
+/images/parse*.py
+/images/findstart.py

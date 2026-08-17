@@ -1,0 +1,19 @@
+[package]
+name = "x86emu"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "x86emu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "x86emu"
+path = "src/main.rs"
+
+[[example]]
+name = "gen_add"
+path = "examples/gen_add.rs"
+
+[profile.release]
+opt-level = 3

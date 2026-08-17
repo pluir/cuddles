@@ -119,8 +119,8 @@ impl Bios {
     // ---- INT 0x15: memory map services (AH = function) ----
     // E820 (AH=0xE820), E801 (AH=0xE801) and 0x88 report the physical RAM
     // layout. Linux queries these very early in boot to learn how much memory
-    // it can use. The backing store is 16 MiB, so extended memory (above the
-    // 1 MiB mark) is 15 MiB.
+    // it can use. The backing store is 128 MiB, so extended memory (above the
+    // 1 MiB mark) is 127 MiB.
 
     fn memory_map(&mut self, cpu: &mut Cpu) {
         match cpu.reg8(Reg8::Ah) {
@@ -147,8 +147,8 @@ impl Bios {
             (0x00000000, 0x0009FC00, 1), // conventional memory (640K - 1K)
             (0x0009FC00, 0x00000400, 2), // EBDA
             (0x000A0000, 0x00060000, 2), // VGA / ROM area
-            (0x00100000, 0x00F00000, 1), // extended memory up to 16 MiB
-            (0x01000000, 0x00000000, 2), // end marker (reserved)
+            (0x00100000, 0x07F00000, 1), // extended memory up to 128 MiB
+            (0x08000000, 0x00000000, 2), // end marker (reserved)
         ];
         // E820 protocol: EAX=0x0000E820, EDX='SMAP' (0x534D4150),
         // EBX=continuation (0 first), ECX=buffer size, ES:DI=buffer.
@@ -176,17 +176,21 @@ impl Bios {
 
     fn e801(&mut self, cpu: &mut Cpu) {
         // Extended memory below 16 MiB in KB (15 MiB = 15360 KB), and above
-        // 16 MiB in 64 KiB units (none here).
+        // 16 MiB in 64 KiB units (128 MiB total = 112 * 64 KiB units above 16 MiB).
         let ext_kb: u16 = 15 * 1024;
         cpu.ax = ext_kb;
         cpu.cx = ext_kb;
-        cpu.bx = 0;
-        cpu.dx = 0;
+        // (128 MiB - 16 MiB) / 64 KiB = 112 MiB / 64 KiB = 1792 units.
+        cpu.bx = 1792;
+        cpu.dx = 1792;
     }
 
     fn mem88(&mut self, cpu: &mut Cpu) {
-        // Extended memory in KB above the 1 MiB mark.
-        cpu.ax = 15 * 1024;
+        // Extended memory in KB above the 1 MiB mark. The 0x88 return is a
+        // 16-bit value, so it saturates at 65535 KB (~64 MiB); real BIOSes
+        // report 0xFFFF when extended memory exceeds that. Linux uses E820 /
+        // E801 for the full map.
+        cpu.ax = 0xFFFF;
     }
 
     // ---- INT 0x16: keyboard services (AH = function) ----
@@ -370,7 +374,7 @@ mod tests {
         let len = cpu.mem.read_u64(0x2008);
         let typ = cpu.mem.read_u32(0x2010);
         assert_eq!(base, 0x0010_0000); // 1 MiB
-        assert_eq!(len, 0x00F0_0000); // 15 MiB
+        assert_eq!(len, 0x07F0_0000); // 127 MiB
         assert_eq!(typ, 1);
         // Continuation advanced to 4 (index 4 is the end marker).
         assert_eq!(cpu.ebx, 4);
@@ -385,12 +389,12 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        // 15 MiB of extended memory = 15360 KB in both AX and CX.
+        // 15 MiB of extended memory below 16 MiB = 15360 KB in both AX and CX.
         assert_eq!(cpu.ax, 15 * 1024);
         assert_eq!(cpu.cx, 15 * 1024);
-        // No memory above 16 MiB.
-        assert_eq!(cpu.bx, 0);
-        assert_eq!(cpu.dx, 0);
+        // Memory above 16 MiB: (128 MiB - 16 MiB) / 64 KiB = 1792 units.
+        assert_eq!(cpu.bx, 1792);
+        assert_eq!(cpu.dx, 1792);
     }
 
     #[test]
@@ -402,7 +406,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 15 * 1024);
+        // 0x88 saturates at 0xFFFF KB (16-bit return) for >64 MiB extended.
+        assert_eq!(cpu.ax, 0xFFFF);
     }
 
     #[test]

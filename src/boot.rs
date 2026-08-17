@@ -147,13 +147,13 @@ fn write_e820(mem: &mut Memory) {
     mem.write_u64(map + 20, 0xA0000);
     mem.write_u64(map + 28, 0x60000);
     mem.write_u32(map + 36, 2);
-    // Extended memory 0x100000-16 MiB (type 1, usable).
+    // Extended memory 0x100000-128 MiB (type 1, usable).
     mem.write_u64(map + 40, 0x100000);
-    mem.write_u64(map + 48, 0xF00000);
+    mem.write_u64(map + 48, 0x7F00000);
     mem.write_u32(map + 56, 1);
     mem.write_u8(BOOT_PARAMS_ADDR as usize + BP_E820_ENTRIES, 3);
-    // alt_mem_k (extended memory in KB).
-    mem.write_u32(BOOT_PARAMS_ADDR as usize + BP_ALT_MEM_K, 0xF000); // 15360 KB
+    // alt_mem_k (extended memory in KB above 1 MiB = 127 MiB = 130048 KB).
+    mem.write_u32(BOOT_PARAMS_ADDR as usize + BP_ALT_MEM_K, 127 * 1024); // 130048 KB
 }
 
 /// Load a decompressed kernel ELF into the emulator and enter its entry point.

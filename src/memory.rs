@@ -1,7 +1,7 @@
 //! Flat memory for real and protected mode.
 //!
 //! Real-mode physical addresses are 20 bits wide; protected mode uses 32-bit
-//! physical addresses. The backing store is 16 MiB, and 32-bit addresses are
+//! physical addresses. The backing store is 128 MiB, and 32-bit addresses are
 //! masked to that size.
 
 pub struct Memory {
@@ -19,8 +19,8 @@ pub const VGA_TEXT_BASE: usize = 0xB8000;
 pub const VGA_TEXT_SIZE: usize = 80 * 25 * 2;
 
 impl Memory {
-    /// Backing store size (16 MiB).
-    pub const SIZE: usize = 16 << 20;
+    /// Backing store size (128 MiB).
+    pub const SIZE: usize = 128 << 20;
 
     pub fn new() -> Self {
         Memory {

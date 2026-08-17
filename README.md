@@ -5,7 +5,11 @@ emulator (CPU + memory + devices) that can eventually boot real firmware.
 We're starting with a solid 16-bit real-mode CPU core and layering on
 protected mode, paging, and devices.
 
-## Current stage: 16-bit real-mode core + minimal BIOS + 32-bit protected mode + paging + devices + exceptions
+## Current stage: 16-bit real-mode core + BIOS + 32-bit protected mode + paging + devices + exceptions + booting a real Linux kernel (in progress)
+
+The project is under git version control (see the repo root). A real 32-bit
+Linux kernel image (buildroot bzImage, extracted from the copy/images
+`linux.iso`) is kept at `images/bzImage` for the boot effort.
 
 ### What works
 
@@ -137,7 +141,7 @@ src/
   dma.rs          — 8237 DMA controller (4 channels, page registers)
   ide.rs          — IDE/ATA disk controller (PIO, LBA28, IRQ14)
   boot.rs         — Linux boot-protocol loader (parse bzImage, load kernel, boot_params)
-  bios.rs         — minimal BIOS: INT 0x10/0x16/0x13 handlers + text screen
+  bios.rs         — minimal BIOS: INT 0x10/0x15/0x16/0x13 handlers + text screen
   main.rs         — CLI binary: load a .bin and run it, --boot a boot sector, or --kernel a bzImage
 examples/
   gen_add.rs      — writes a tiny test program (examples/add.bin)
@@ -205,7 +209,13 @@ Hello from x86emu!
    boot-protocol loader is done: it parses the bzImage setup header, loads
    the kernel at `code32_start`, fills `boot_params` (E820 map + command
    line), sets up a flat GDT, enters protected mode, and jumps to the kernel
-   with `ESI = boot_params`. The next step is to actually load a real kernel
-   image and chase whatever breaks. Progress so far: the kernel's decompressor
-   runs and jumps to the decompressed kernel; the missing instructions it
-   needs (flag-control, shift-with-imm8, group-5 `FF`) have been added.
+   with `ESI = boot_params`. A real 32-bit buildroot kernel image has been
+   downloaded (`images/bzImage`) and the loader was fixed to use the correct
+   boot-protocol field offsets. Progress so far: the kernel's decompressor
+   runs end to end and jumps to the decompressed kernel; the missing
+   instructions it needs (flag-control `CLC/STC/CLI/STI/CLD/STD/CMC`,
+   shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) have been added, and the
+   decoder now derives the default operand/address size from the code
+   segment's D bit (with `0x66`/`0x67` toggling it) so 32-bit kernel code
+   decodes correctly. The kernel is still executing in a region that needs
+   further debugging before it reaches console output.

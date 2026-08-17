@@ -12,12 +12,15 @@ one clean, well-tested layer on top of the previous one.
 
 Current state: a solid **16-bit real-mode 8086-style core** (registers, flags,
 memory, ModR/M addressing, a broad instruction set) plus a **minimal BIOS
-layer** (native Rust handlers for `INT 0x10/0x16/0x13`), **32-bit protected
+layer** (native Rust handlers for `INT 0x10/0x16/0x13/0x15`), **32-bit protected
 mode** (GDT/IDT, segment descriptors, 32-bit registers and addressing,
 protected-mode interrupts), **32-bit paging** (page tables, CR0–CR4,
 virtual → physical translation), the full **PC device set** (8254 PIT,
 8259 PIC, VGA, 8042 keyboard, 8237 DMA, IDE/ATA disk) with hardware
-interrupts, and **exceptions** (`#DE`, `#BP`, `#OF`, `#UD`, `#PF`).
+interrupts, **exceptions** (`#DE`, `#BP`, `#OF`, `#UD`, `#PF`), and a
+**Linux boot-protocol loader** that is actively booting a real 32-bit kernel
+(in progress — the decompressor runs end to end). The project is under git
+version control.
 
 ## Layout
 
@@ -41,6 +44,11 @@ interrupts, and **exceptions** (`#DE`, `#BP`, `#OF`, `#UD`, `#PF`).
 | `src/main.rs` | CLI: load a flat binary, boot a boot sector, or boot a Linux bzImage. |
 | `examples/` | `gen_add.rs` (generates `add.bin`), plus prebuilt `add.bin` and `boot.bin`. |
 | `gen_boot.py` | Python script that hand-assembles `examples/boot.bin`. |
+| `images/` | Downloaded OS images for the boot effort: `bzImage` (a real 32-bit buildroot kernel, extracted from the copy/images `linux.iso`). Large `.iso`/`.bin` downloads are git-ignored. |
+
+The project is a git repository (initialized at the project root, branch
+`master`). Keep commits focused and the working tree clean before finishing a
+change.
 
 ## Build & test
 
@@ -74,7 +82,11 @@ cargo run -- --boot examples/boot.bin
 - **Prefixes** (`0x66` operand-size, `0x67` address-size, segment overrides,
   REP) are consumed at the top of `decode` and stored on the `Cpu`
   (`opsize`/`addrsize`/`seg_override`). They are reset at the *start* of the
-  next `decode` so `execute` can still see them.
+  next `decode` so `execute` can still see them. The *default* operand and
+  address size is 16-bit in real mode, but in protected mode it is derived
+  from the code segment's D bit (D=1 → 32-bit); a `0x66`/`0x67` prefix
+  *toggles* the size rather than forcing 32-bit. This matters for booting a
+  32-bit kernel, whose code runs in a D=1 segment with no size prefixes.
 - **The BIOS** is *not* machine code. It is a set of host-side Rust service
   routines. The `INT` executor checks the vector: if it is a BIOS vector
   (0x10/0x15/0x16/0x13), it calls the matching `Bios` method directly (no IVT frame
@@ -111,8 +123,9 @@ cargo run -- --boot examples/boot.bin
   any) and vectors through the IDT (protected mode) or IVT (real mode).
 - **The Linux boot loader** (`src/boot.rs`) implements the Linux boot
   protocol (Documentation/x86/boot.rst). `parse_bzimage` reads the setup
-  header (after the 512-byte boot sector at file offset `512 + 0x1F1`),
-  validating the `0xAA55` boot flag and the `"HdrS"` magic. `load_kernel`
+  header at file offset `0x1F1` (the boot sector occupies file offset 0,
+  and the setup-header fields begin at `0x1F1` within it), validating the
+  `0xAA55` boot flag and the `"HdrS"` magic. `load_kernel`
   loads the protected-mode kernel at `code32_start`, builds a `boot_params`
   structure at `0x90000` (setup header, E820 memory map, command line at
   `0x20000`), writes a flat GDT at `0x1000`, enables protected mode (CR0.PE),
@@ -148,7 +161,7 @@ cargo run -- --boot examples/boot.bin
 - [x] Devices (part 1): 8254 PIT and 8259 PIC, hardware interrupts (IRQ0 from the timer), IN/OUT port I/O.
 - [x] Devices (part 2): VGA text/graphics framebuffer, 8042 keyboard controller, DMA, IDE/ATA disk, boot a real OS image.
 - [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes.
-- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). Next: load a real kernel image and chase what breaks.
+- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. Next: keep chasing what breaks until the kernel reaches console output.
 
 ## Common tasks
 

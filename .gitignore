@@ -9,5 +9,17 @@
 /images/dump*.py
 /images/parse*.py
 /images/findstart.py
-"*.py"  
-"echo trace.txt"  
+/images/disasm.py
+/images/ph.py
+/images/walk_pg.py
+/images/compare*.py
+/images/elfinfo.py
+/images/layout.py
+
+# Trace output
+/trace.txt
+
+# Scratch files at the repo root
+/analysis*.txt
+/cr0lines.txt
+/parse_pgdir.py

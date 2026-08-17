@@ -27,12 +27,12 @@ pub enum Inst {
     MovReg32Imm { dst: Reg32, imm: u32 },
     MovAccMem8 { addr: u16 },
     MovMem8Acc { addr: u16 },
-    MovAccMem8_32 { addr: u32 },
-    MovMem8Acc_32 { addr: u32 },
+    MovAccMem8Addr32 { addr: u32 },
+    MovMem8AccAddr32 { addr: u32 },
     MovAccMem16 { addr: u16 },
     MovMem16Acc { addr: u16 },
-    MovAccMem16_32 { addr: u32 },
-    MovMem16Acc_32 { addr: u32 },
+    MovAccMem16Addr32 { addr: u32 },
+    MovMem16AccAddr32 { addr: u32 },
     MovAccMem32 { addr: u32 },
     MovMem32Acc { addr: u32 },
     MovRmSeg { m: ModRm, seg: SegReg },
@@ -157,6 +157,8 @@ pub enum Inst {
     // LGDT / LIDT (0x0F 0x01 /2 and /3)
     Lgdt { m: ModRm },
     Lidt { m: ModRm },
+    // INVLPG (0x0F 0x01 /7): invalidate TLB entry for a linear address.
+    Invlpg { m: ModRm },
     // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22)
     MovCr { cr: u8, reg: u8 },
     MovToCr { cr: u8, reg: u8 },
@@ -583,11 +585,11 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         // The moffs width follows the ADDRESS size (addrsize), not the
         // operand size. In 32-bit addressing mode the moffs is 32-bit.
         0xA0 => {
-            if cpu.addrsize { Inst::MovAccMem8_32 { addr: cpu.fetch_u32() } }
+            if cpu.addrsize { Inst::MovAccMem8Addr32 { addr: cpu.fetch_u32() } }
             else { Inst::MovAccMem8 { addr: cpu.fetch_u16() } }
         }
         0xA2 => {
-            if cpu.addrsize { Inst::MovMem8Acc_32 { addr: cpu.fetch_u32() } }
+            if cpu.addrsize { Inst::MovMem8AccAddr32 { addr: cpu.fetch_u32() } }
             else { Inst::MovMem8Acc { addr: cpu.fetch_u16() } }
         }
         // TEST AL, imm8 (0xA8) / TEST AX/EAX, imm (0xA9)
@@ -601,7 +603,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xA1 => {
             if cpu.addrsize {
                 if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() } }
-                else { Inst::MovAccMem16_32 { addr: cpu.fetch_u32() } }
+                else { Inst::MovAccMem16Addr32 { addr: cpu.fetch_u32() } }
             } else {
                 if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u16() as u32 } }
                 else { Inst::MovAccMem16 { addr: cpu.fetch_u16() } }
@@ -610,7 +612,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xA3 => {
             if cpu.addrsize {
                 if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u32() } }
-                else { Inst::MovMem16Acc_32 { addr: cpu.fetch_u32() } }
+                else { Inst::MovMem16AccAddr32 { addr: cpu.fetch_u32() } }
             } else {
                 if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u16() as u32 } }
                 else { Inst::MovMem16Acc { addr: cpu.fetch_u16() } }
@@ -654,6 +656,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                     match m.reg & 7 {
                         2 => Inst::Lgdt { m },
                         3 => Inst::Lidt { m },
+                        7 => Inst::Invlpg { m },
                         _ => Inst::Unknown { opcode: 0x0F },
                     }
                 }
@@ -879,7 +882,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
-        Inst::MovAccMem8_32 { addr } => {
+        Inst::MovAccMem8Addr32 { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
@@ -887,7 +890,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
-        Inst::MovMem8Acc_32 { addr } => {
+        Inst::MovMem8AccAddr32 { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
@@ -895,7 +898,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
-        Inst::MovAccMem16_32 { addr } => {
+        Inst::MovAccMem16Addr32 { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
@@ -903,7 +906,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let phys = cpu.translate(SegReg::Ds, addr as u32);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
-        Inst::MovMem16Acc_32 { addr } => {
+        Inst::MovMem16AccAddr32 { addr } => {
             let phys = cpu.translate(SegReg::Ds, addr);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
@@ -1813,19 +1816,51 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- LGDT / LIDT ----
+        // The address size of the memory operand follows the current
+        // addressing mode (addrsize): 32-bit (modrm_addr32) in a D=1
+        // segment, 16-bit (modrm_addr) otherwise. The decoder already
+        // fetched the ModR/M, SIB, and displacement bytes according to
+        // addrsize; the executor must compute the address the same way.
         Inst::Lgdt { m } => {
-            let base = cpu.modrm_addr(&m);
+            let base = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
             let limit = cpu.mem.read_u16(base);
             let base32 = cpu.mem.read_u32(base + 2);
             cpu.gdt_base = base32;
             cpu.gdt_limit = limit;
         }
         Inst::Lidt { m } => {
-            let base = cpu.modrm_addr(&m);
+            let base = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
             let limit = cpu.mem.read_u16(base);
             let base32 = cpu.mem.read_u32(base + 2);
             cpu.idt_base = base32;
             cpu.idt_limit = limit;
+        }
+
+        // ---- INVLPG (0x0F 0x01 /7) ----
+        // Invalidate the TLB entry for the linear address of the memory
+        // operand. The linear address is computed the same way as a normal
+        // memory operand (segment + offset), then we invalidate that page.
+        Inst::Invlpg { m } => {
+            // Compute the linear address (segment base + offset), not the
+            // physical address, since INVLPG operates on linear addresses.
+            let linear = if cpu.pe {
+                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+                let offset = if cpu.addrsize {
+                    cpu.modrm_offset32(&m)
+                } else {
+                    cpu.modrm_offset(&m)
+                };
+                cpu.seg_desc[seg as usize].base.wrapping_add(offset)
+            } else {
+                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+                let offset = if cpu.addrsize {
+                    cpu.modrm_offset32(&m)
+                } else {
+                    cpu.modrm_offset(&m)
+                };
+                ((cpu.seg(seg) as u32) << 4).wrapping_add(offset)
+            };
+            cpu.invlpg(linear);
         }
 
         // ---- MOV to/from control registers ----
@@ -1841,9 +1876,20 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::MovToCr { cr, reg } => {
             let v = cpu.reg32(Reg::reg32(reg));
             match cr {
-                0 => cpu.cr0 = v,
+                0 => {
+                    // If paging is being toggled (PG bit changes), flush TLB.
+                    let old_pg = cpu.cr0 & 0x8000_0000 != 0;
+                    let new_pg = v & 0x8000_0000 != 0;
+                    if old_pg != new_pg {
+                        cpu.flush_tlb();
+                    }
+                    cpu.cr0 = v;
+                }
                 2 => cpu.cr2 = v,
-                3 => cpu.cr3 = v,
+                3 => {
+                    cpu.cr3 = v;
+                    cpu.flush_tlb();
+                }
                 _ => cpu.cr4 = v,
             }
         }

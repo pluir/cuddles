@@ -21,11 +21,12 @@ pub const VGA_TEXT_BASE: usize = 0xB8000;
 pub const VGA_TEXT_SIZE: usize = 80 * 25 * 2;
 
 impl Memory {
-    /// Backing store size (256 MiB). This is the single source of truth for
+    /// Backing store size (128 MiB). This is the single source of truth for
     /// the machine's RAM: the BIOS E820/E801/0x88 memory map and the boot
     /// loader's `boot_params` derive their values from this, so scaling the
-    /// RAM is a one-line change here.
-    pub const SIZE: usize = 256 << 20;
+    /// RAM is a one-line change here. Reduced from 256 MiB to 128 MiB for
+    /// better cache locality during development.
+    pub const SIZE: usize = 128 << 20;
 
     pub fn new() -> Self {
         Memory {
@@ -55,19 +56,31 @@ impl Memory {
     /// Read a byte at a physical address.
     #[inline]
     pub fn read_u8(&self, addr: usize) -> u8 {
-        if self.in_vga_text(addr) {
+        if addr >= VGA_TEXT_BASE && addr < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             let cell = self.vga_text[(addr - VGA_TEXT_BASE) / 2];
             return if (addr - VGA_TEXT_BASE) % 2 == 0 { (cell & 0xFF) as u8 } else { (cell >> 8) as u8 };
         }
-        self.data[addr & (Self::SIZE - 1)]
+        // SAFETY: addr is masked to SIZE, which is within the data Vec.
+        unsafe { *self.data.get_unchecked(addr & (Self::SIZE - 1)) }
     }
 
     /// Read a little-endian u16 at a physical address.
     #[inline]
     pub fn read_u16(&self, addr: usize) -> u16 {
-        if self.in_vga_text(addr) && addr + 1 < VGA_TEXT_BASE + VGA_TEXT_SIZE {
+        if addr >= VGA_TEXT_BASE && addr + 1 < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             return self.vga_text[(addr - VGA_TEXT_BASE) / 2];
         }
+        // Fast path: read directly from the backing store.
+        let a = addr & (Self::SIZE - 1);
+        if a + 1 < Self::SIZE {
+            // SAFETY: a and a+1 are within bounds.
+            unsafe {
+                let lo = *self.data.get_unchecked(a) as u16;
+                let hi = *self.data.get_unchecked(a + 1) as u16;
+                return lo | (hi << 8);
+            }
+        }
+        // Wraparound fallback.
         let lo = self.read_u8(addr) as u16;
         let hi = self.read_u8(addr.wrapping_add(1)) as u16;
         lo | (hi << 8)
@@ -76,6 +89,19 @@ impl Memory {
     /// Read a little-endian u32 at a physical address.
     #[inline]
     pub fn read_u32(&self, addr: usize) -> u32 {
+        let a = addr & (Self::SIZE - 1);
+        if a + 3 < Self::SIZE {
+            // Fast path: read directly from the backing store.
+            // SAFETY: a..a+3 are within bounds.
+            unsafe {
+                let b0 = *self.data.get_unchecked(a) as u32;
+                let b1 = *self.data.get_unchecked(a + 1) as u32;
+                let b2 = *self.data.get_unchecked(a + 2) as u32;
+                let b3 = *self.data.get_unchecked(a + 3) as u32;
+                return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            }
+        }
+        // Wraparound fallback.
         let b0 = self.read_u8(addr) as u32;
         let b1 = self.read_u8(addr.wrapping_add(1)) as u32;
         let b2 = self.read_u8(addr.wrapping_add(2)) as u32;
@@ -101,7 +127,7 @@ impl Memory {
     /// Write a byte to a physical address.
     #[inline]
     pub fn write_u8(&mut self, addr: usize, val: u8) {
-        if self.in_vga_text(addr) {
+        if addr >= VGA_TEXT_BASE && addr < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             let idx = (addr - VGA_TEXT_BASE) / 2;
             let cell = self.vga_text[idx];
             let new = if (addr - VGA_TEXT_BASE) % 2 == 0 {
@@ -113,16 +139,28 @@ impl Memory {
             return;
         }
         let a = addr & (Self::SIZE - 1);
-        self.data[a] = val;
+        // SAFETY: a is within bounds.
+        unsafe { *self.data.get_unchecked_mut(a) = val; }
     }
 
     /// Write a little-endian u16 to a physical address.
     #[inline]
     pub fn write_u16(&mut self, addr: usize, val: u16) {
-        if self.in_vga_text(addr) && addr + 1 < VGA_TEXT_BASE + VGA_TEXT_SIZE {
+        if addr >= VGA_TEXT_BASE && addr + 1 < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             self.vga_text[(addr - VGA_TEXT_BASE) / 2] = val;
             return;
         }
+        let a = addr & (Self::SIZE - 1);
+        if a + 1 < Self::SIZE {
+            // Fast path: write directly to the backing store.
+            // SAFETY: a and a+1 are within bounds.
+            unsafe {
+                *self.data.get_unchecked_mut(a) = (val & 0xFF) as u8;
+                *self.data.get_unchecked_mut(a + 1) = (val >> 8) as u8;
+            }
+            return;
+        }
+        // Wraparound fallback.
         self.write_u8(addr, (val & 0xFF) as u8);
         self.write_u8(addr.wrapping_add(1), (val >> 8) as u8);
     }
@@ -130,6 +168,19 @@ impl Memory {
     /// Write a little-endian u32 to a physical address.
     #[inline]
     pub fn write_u32(&mut self, addr: usize, val: u32) {
+        let a = addr & (Self::SIZE - 1);
+        if a + 3 < Self::SIZE {
+            // Fast path: write directly to the backing store.
+            // SAFETY: a..a+3 are within bounds.
+            unsafe {
+                *self.data.get_unchecked_mut(a) = (val & 0xFF) as u8;
+                *self.data.get_unchecked_mut(a + 1) = ((val >> 8) & 0xFF) as u8;
+                *self.data.get_unchecked_mut(a + 2) = ((val >> 16) & 0xFF) as u8;
+                *self.data.get_unchecked_mut(a + 3) = ((val >> 24) & 0xFF) as u8;
+            }
+            return;
+        }
+        // Wraparound fallback.
         self.write_u8(addr, (val & 0xFF) as u8);
         self.write_u8(addr.wrapping_add(1), ((val >> 8) & 0xFF) as u8);
         self.write_u8(addr.wrapping_add(2), ((val >> 16) & 0xFF) as u8);

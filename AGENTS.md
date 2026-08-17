@@ -30,7 +30,7 @@ version control.
 | `src/cpu.rs` | `Cpu` struct: registers, flags, fetch-decode-execute loop, stack, ModR/M operand helpers. |
 | `src/instructions.rs` | The instruction decoder (`decode`) and executor (`execute`). The largest file. |
 | `src/modrm.rs` | ModR/M byte decoding and register-index helpers. |
-| `src/memory.rs` | Flat `Memory` (256 MiB; `Memory::SIZE` is the single source of truth for RAM size) with segment:offset → physical translation. |
+| `src/memory.rs` | Flat `Memory` (128 MiB; `Memory::SIZE` is the single source of truth for RAM size) with segment:offset → physical translation. |
 | `src/protected.rs` | Segment descriptors, GDT/IDT parsing, protected-mode translation. |
 | `src/paging.rs` | 32-bit page-directory/page-table walk (4 KiB and 4 MiB pages). |
 | `src/pit.rs` | 8254 Programmable Interval Timer (channel 0 -> IRQ0). |
@@ -62,7 +62,7 @@ cargo run -- --boot examples/boot.bin
 
 ## How the emulator works
 
-- **Memory** is a flat `Vec<u8>` of 256 MiB. `Memory::SIZE` is the single
+- **Memory** is a flat `Vec<u8>` of 128 MiB. `Memory::SIZE` is the single
   source of truth for the RAM size: the BIOS E820/E801/0x88 map and the boot
   loader's `boot_params` derive their values from it, so scaling the RAM is a
   one-line change to `Memory::SIZE`. Real-mode logical addresses
@@ -146,6 +146,32 @@ cargo run -- --boot examples/boot.bin
   not yet execute correctly). The decompressed ELF is extracted from the
   bzImage with `images/parse_bz4.py` (saved as `images/golden_kernel.bin`).
 
+## Performance
+
+The emulator runs at ~24 million instructions/second. Key optimizations:
+
+- **TLB.** `Cpu` has a 256-entry direct-mapped TLB (`tlb: [TlbEntry; 256]`)
+  that caches linear-page → physical-page translations. `apply_paging()`
+  checks the TLB first (fast path: one array index + comparison) and only
+  walks the page tables on a miss. `flush_tlb()` clears all entries (called
+  on MOV CR3 and when CR0.PG toggles). `invlpg()` invalidates a single entry
+  (called by the INVLPG instruction, 0F 01 /7). Without the TLB, every byte
+  fetch did a 2-read page-table walk; with it, ~99% of translations are a
+  single array lookup.
+- **Trace gating.** Instruction tracing (writing one line per instruction to
+  `trace.txt`) is disabled by default and only enabled when the
+  `X86EMU_TRACE` environment variable is set. The file handle is cached in
+  the `Cpu` struct (`trace_file: Option<File>`) rather than opened and
+  closed per instruction. When tracing is off, zero I/O happens.
+- **Fast multi-byte memory access.** `read_u16`/`read_u32`/`write_u16`/
+  `write_u32` have fast paths that read/write directly from the `data`
+  slice using `get_unchecked` (after bounds and VGA checks), avoiding the
+  per-byte branching of the byte-by-byte path.
+- **Batched interrupt checks.** `deliver_hardware_interrupt()` ticks the
+  PIT every instruction (for timing accuracy) but only checks the
+  keyboard/IDE IRQs and calls `pic.acknowledge()` every 64 instructions
+  (`IRQ_CHECK_INTERVAL`), reducing per-instruction overhead.
+
 ## Conventions
 
 - **One layer at a time.** Prefer completing the current layer over starting a
@@ -174,7 +200,7 @@ cargo run -- --boot examples/boot.bin
 - [x] Devices (part 1): 8254 PIT and 8259 PIC, hardware interrupts (IRQ0 from the timer), IN/OUT port I/O.
 - [x] Devices (part 2): VGA text/graphics framebuffer, 8042 keyboard controller, DMA, IDE/ATA disk, boot a real OS image.
 - [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes. Exceptions that fire with no IDT installed (or while handling another) **triple-fault** — the CPU halts cleanly instead of looping forever.
-- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. The in-kernel decompressor does not yet produce correct output, so `--kernel-elf` loads the decompressed ELF directly (`images/golden_kernel.bin`); booting that, the kernel now runs real 32-bit code (CPUID/RDTSC/RDMSR, paging setup) before hitting a page fault it can't yet handle (no IDT installed). Missing instructions added: `TEST acc,imm` (0xA8/0xA9), `RDMSR`/`WRMSR` (0x0F 0x32/0x30), bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB, group 8 0x0F 0xBA), 32-bit `LOOP`/`Jcc`/`JMP rel8` using `eip`, 32-bit string ops using `ecx`/`esi`/`edi`, `TEST r/m,r` (0x84/0x85), `LDS/LES/LSS/LFS/LGS`, 32-bit `MOV moffs` following the address size, and the **x87 FPU** (D8-DF: FNINIT, FSTCW/FLDCW, FSTSW, FLD/FST/FSTP, FILD/FISTP, FADD/FSUB/FMUL/FDIV, FXSAVE/FXRSTOR) for the kernel's early FPU probing. The "IDT problem" (an exception firing before the IDT is installed loops forever through the empty IDT) is now handled with **triple-fault detection**: the CPU halts cleanly with a diagnostic instead of looping. Next: keep chasing what breaks until the kernel reaches console output.
+- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. The in-kernel decompressor does not yet produce correct output, so `--kernel-elf` loads the decompressed ELF directly (`images/golden_kernel.bin`); booting that, the kernel now runs real 32-bit code (CPUID/RDTSC/RDMSR, paging setup) before hitting a page fault it can't yet handle (no IDT installed). Missing instructions added: `TEST acc,imm` (0xA8/0xA9), `RDMSR`/`WRMSR` (0x0F 0x32/0x30), bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB, group 8 0x0F 0xBA), 32-bit `LOOP`/`Jcc`/`JMP rel8` using `eip`, 32-bit string ops using `ecx`/`esi`/`edi`, `TEST r/m,r` (0x84/0x85), `LDS/LES/LSS/LFS/LGS`, 32-bit `MOV moffs` following the address size, and the **x87 FPU** (D8-DF: FNINIT, FSTCW/FLDCW, FSTSW, FLD/FST/FSTP, FILD/FISTP, FADD/FSUB/FMUL/FDIV, FXSAVE/FXRSTOR) for the kernel's early FPU probing. The "IDT problem" (an exception firing before the IDT is installed loops forever through the empty IDT) is now handled with **triple-fault detection**: the CPU halts cleanly with a diagnostic instead of looping. A critical bug in `LGDT`/`LIDT` was fixed: the executor always used 16-bit `modrm_addr` to compute the operand address, ignoring the 32-bit addressing mode (`addrsize`). In 32-bit protected mode the kernel's `lidt [disp32]` was reading the IDT descriptor from the wrong memory location, so the IDT was never loaded — the kernel then page-faulted on an unmapped address and triple-faulted. The fix routes LGDT/LIDT through `modrm_addr32` when `addrsize` is set, matching how the decoder fetched the ModR/M. After the fix the kernel loads its IDT (base=`C02C0000`, limit=`07FF`) and runs past 50000 instructions, handling page faults correctly. Next: keep chasing what breaks until the kernel reaches console output.
 
 ## Common tasks
 

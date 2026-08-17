@@ -13,7 +13,7 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
 
 ### What works
 
-- **256 MiB flat memory** with real-mode `segment:offset` → 20-bit physical
+- **128 MiB flat memory** with real-mode `segment:offset` → 20-bit physical
   address translation (`segment * 16 + offset`, with 1 MiB wraparound) and
   32-bit protected-mode translation through segment descriptors.
 - **Registers**: 8 × 16-bit general registers (AX/CX/DX/BX/SP/BP/SI/DI) with
@@ -59,7 +59,9 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
   - `LOOP/LOOPZ/LOOPNZ`, `JCXZ`.
   - String ops `MOVS/STOS/LODS/CMPS/SCAS` (byte/word) with the DF flag and
     `REP/REPE/REPNE` prefixes.
-  - `LGDT`/`LIDT` (0x0F 0x01 /2 and /3).
+  - `LGDT`/`LIDT` (0x0F 0x01 /2 and /3) — the memory operand address
+    follows the current addressing mode (16-bit `modrm_addr` or 32-bit
+    `modrm_addr32`), so `lidt [disp32]` works correctly in 32-bit mode.
   - `MOV r32, cr` / `MOV cr, r32` (0x0F 0x20 / 0x0F 0x22) for CR0/CR2/CR3/CR4.
   - `CPUID` (0x0F 0xA2) — returns the vendor string "GenuineIntel" (leaf 0)
     and family/model/feature flags (leaf 1, including the TSC bit).
@@ -148,7 +150,7 @@ making changes.
 src/
   lib.rs          — crate root, re-exports
   cpu.rs          — registers, flags, fetch-decode-execute loop, stack, ModR/M helpers
-  memory.rs       — flat `Memory` (256 MiB, `Memory::SIZE` is the single source
+  memory.rs       — flat `Memory` (128 MiB, `Memory::SIZE` is the single source
                   of truth for RAM size) + segment translation
   modrm.rs        — ModR/M byte decoding + register-index helpers
   instructions.rs — instruction decoder + executor + ALU flag computation
@@ -253,7 +255,7 @@ Hello from x86emu!
    dispatches through the empty IDT and loops forever. This is now handled
    with **triple-fault detection** — the CPU halts cleanly with a diagnostic
    instead of looping — which is the correct behavior (a real CPU resets on
-   a triple fault). The RAM was grown to 256 MiB (with `Memory::SIZE` as the
+   a triple fault). The RAM was grown to 128 MiB (with `Memory::SIZE` as the
    single source of truth that the E820/E801/0x88 map and `boot_params`
    derive from, so scaling is a one-line change). The kernel now gets
    through page-table setup, paging enablement, and CPU feature detection
@@ -261,5 +263,13 @@ Hello from x86emu!
    been added: 32-bit `LOOP`/`Jcc`/`JMP rel8` using `eip`, 32-bit string
    ops using `ecx`/`esi`/`edi`, `TEST r/m,r` (0x84/0x85), `LDS/LES/LSS/
    LFS/LGS`, 32-bit `MOV moffs` following the address size, and the **x87
-   FPU** (D8-DF) for the kernel's early FPU probing. It has not yet reached
-   console output.
+   FPU** (D8-DF) for the kernel's early FPU probing. A critical bug in
+   `LGDT`/`LIDT` was fixed: the executor always used 16-bit `modrm_addr`
+   to compute the operand address, ignoring the 32-bit addressing mode
+   (`addrsize`). In 32-bit protected mode the kernel's `lidt [disp32]` was
+   reading the IDT descriptor from the wrong memory location, so the IDT
+   was never loaded — the kernel then page-faulted on an unmapped address
+   and triple-faulted. The fix routes LGDT/LIDT through `modrm_addr32` when
+   `addrsize` is set. After the fix the kernel loads its IDT and runs past
+   50000 instructions, handling page faults correctly. It has not yet
+   reached console output.

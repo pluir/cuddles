@@ -11,6 +11,29 @@ use crate::instructions::Inst;
 use crate::instructions::protected_int;
 use crate::protected::Descriptor;
 
+/// Number of TLB entries (must be a power of two).
+const TLB_SIZE: usize = 256;
+/// TLB index mask.
+const TLB_MASK: usize = TLB_SIZE - 1;
+
+/// A single TLB entry: caches a 4 KiB page mapping (linear page → physical
+/// page). `valid` is the valid bit; the entry is invalidated on MOV CR3,
+/// INVLPG, or any write that changes page tables.
+#[derive(Clone, Copy)]
+pub struct TlbEntry {
+    pub valid: bool,
+    /// High 20 bits of the linear address (the virtual page number).
+    pub vpage: u32,
+    /// High 20 bits of the physical address (the physical page number).
+    pub ppage: u32,
+}
+
+impl Default for TlbEntry {
+    fn default() -> Self {
+        TlbEntry { valid: false, vpage: 0, ppage: 0 }
+    }
+}
+
 /// 16-bit general-purpose register indices.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reg16 {
@@ -149,6 +172,9 @@ pub struct Cpu {
     pub cr2: u32,
     pub cr3: u32,
     pub cr4: u32,
+    /// Translation Lookaside Buffer: caches linear→physical page mappings
+    /// so we don't walk the page tables on every byte fetch.
+    pub tlb: [TlbEntry; TLB_SIZE],
 
     // ---- Devices ----
     /// 8254 Programmable Interval Timer.
@@ -176,10 +202,28 @@ pub struct Cpu {
     pub ide: crate::ide::Ide,
     /// x87 FPU.
     pub fpu: crate::fpu::Fpu,
+
+    // ---- Debug tracing ----
+    /// Cached trace file handle (opened once when X86EMU_TRACE is set).
+    /// None when tracing is disabled — the common case.
+    pub trace_file: Option<std::fs::File>,
+    /// True if X86EMU_TRACE was set at startup (checked once, not per-instruction).
+    pub trace_enabled: bool,
 }
 
 impl Cpu {
     pub fn new() -> Self {
+        let trace_enabled = std::env::var("X86EMU_TRACE").is_ok();
+        let trace_file = if trace_enabled {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open("trace.txt")
+                .ok()
+        } else {
+            None
+        };
         Cpu {
             ax: 0, cx: 0, dx: 0, bx: 0,
             sp: 0, bp: 0, si: 0, di: 0,
@@ -216,6 +260,9 @@ impl Cpu {
             ide: crate::ide::Ide::new(),
             fpu: crate::fpu::Fpu::new(),
             pending_exception: None,
+            tlb: [TlbEntry::default(); TLB_SIZE],
+            trace_file,
+            trace_enabled,
         }
     }
 
@@ -338,22 +385,62 @@ impl Cpu {
         self.apply_paging(linear)
     }
 
+    /// Flush the entire TLB (called on MOV CR3, or when paging is toggled).
+    #[inline]
+    pub fn flush_tlb(&mut self) {
+        for e in self.tlb.iter_mut() {
+            e.valid = false;
+        }
+    }
+
+    /// Invalidate a single TLB entry for the given linear address (INVLPG).
+    #[inline]
+    pub fn invlpg(&mut self, linear: u32) {
+        let vpage = linear >> 12;
+        let idx = (vpage as usize) & TLB_MASK;
+        let e = &self.tlb[idx];
+        if e.valid && e.vpage == vpage {
+            self.tlb[idx].valid = false;
+        }
+    }
+
     /// Apply paging to a linear address if CR0.PG is set. If the page is not
     /// present, raise a #PF (vector 0x0E) with the faulting linear address in
     /// CR2 and an error code, and return 0.
+    ///
+    /// Uses the TLB to avoid walking the page tables on every access. On a
+    /// TLB miss, the page table walk fills the TLB entry.
     #[inline]
     pub fn apply_paging(&mut self, linear: u32) -> usize {
-        if self.cr0 & 0x8000_0000 != 0 {
-            match crate::paging::translate(&self.mem, self.cr3, linear) {
-                Some(phys) => phys,
-                None => {
-                    self.cr2 = linear;
-                    self.pending_exception = Some((0x0E, Some(0)));
-                    0
-                }
+        if self.cr0 & 0x8000_0000 == 0 {
+            return Memory::phys32(linear);
+        }
+        // Fast path: check the TLB.
+        let vpage = linear >> 12;
+        let idx = (vpage as usize) & TLB_MASK;
+        // SAFETY: we check valid before using vpage/ppage, and the TLB is
+        // only mutated through &mut self, so there's no aliasing issue.
+        let entry = &self.tlb[idx];
+        if entry.valid && entry.vpage == vpage {
+            let offset = linear & 0xFFF;
+            return Memory::phys32((entry.ppage << 12) | offset);
+        }
+        // TLB miss: walk the page tables.
+        match crate::paging::translate(&self.mem, self.cr3, linear) {
+            Some(phys) => {
+                // Fill the TLB entry. For 4 MiB pages, phys32 already
+                // encodes the full physical address; we cache the page
+                // number (high 20 bits) which works for both 4K and 4M
+                // pages since translate returns the full physical address.
+                let ppage = (phys >> 12) as u32;
+                self.tlb[idx] = TlbEntry { valid: true, vpage, ppage };
+                phys
             }
-        } else {
-            Memory::phys32(linear)
+            None => {
+                self.cr2 = linear;
+                self.pending_exception = Some((0x0E, Some(0)));
+                0
+            }
         }
     }
 
@@ -383,9 +470,35 @@ impl Cpu {
 
     #[inline]
     pub fn fetch_u16(&mut self) -> u16 {
-        let lo = self.fetch_u8() as u16;
-        let hi = self.fetch_u8() as u16;
-        lo | (hi << 8)
+        // Fast path: fetch both bytes from the same page when possible.
+        // This avoids a second TLB lookup / page walk for the second byte.
+        let addr = self.phys_ip();
+        let lo = self.mem.read_u8(addr);
+        if self.pe {
+            self.eip = self.eip.wrapping_add(1);
+        } else {
+            self.ip = self.ip.wrapping_add(1);
+        }
+        // Check if the next byte is on the same page (offset < 0xFFF).
+        let next_addr = if self.pe {
+            // Recompute: the linear address for eip+1. If we're not at a
+            // page boundary, this is just addr+1.
+            if (addr & 0xFFF) != 0xFFF {
+                addr + 1
+            } else {
+                self.phys_ip()
+            }
+        } else {
+            // Real mode: no paging, linear = seg<<4 + ip.
+            Memory::phys(self.cs, self.ip)
+        };
+        let hi = self.mem.read_u8(next_addr);
+        if self.pe {
+            self.eip = self.eip.wrapping_add(1);
+        } else {
+            self.ip = self.ip.wrapping_add(1);
+        }
+        lo as u16 | ((hi as u16) << 8)
     }
 
     #[inline]
@@ -450,6 +563,51 @@ impl Cpu {
     /// The segment register used for a memory operand, honouring any override.
     fn operand_seg(&self, default: SegReg) -> SegReg {
         self.seg_override.unwrap_or(default)
+    }
+
+    /// Same as `operand_seg` but public (for use by INVLPG in instructions.rs).
+    pub fn operand_seg_for_exec(&self, default: SegReg) -> SegReg {
+        self.seg_override.unwrap_or(default)
+    }
+
+    /// Compute the offset (without segment translation) of a 16-bit-addressed
+    /// memory operand. Used by INVLPG which needs the linear address.
+    pub fn modrm_offset(&self, m: &ModRm) -> u32 {
+        let base = match m.rm {
+            0 => self.bx.wrapping_add(self.si),
+            1 => self.bx.wrapping_add(self.di),
+            2 => self.bp.wrapping_add(self.si),
+            3 => self.bp.wrapping_add(self.di),
+            4 => self.si,
+            5 => self.di,
+            6 => self.bp,
+            _ => self.bx,
+        };
+        let mut ea = base as u32;
+        if let Some(d8) = m.disp8 { ea = ea.wrapping_add(d8 as u32); }
+        if let Some(d16) = m.disp16 { ea = ea.wrapping_add(d16 as u32); }
+        ea
+    }
+
+    /// Compute the offset (without segment translation) of a 32-bit-addressed
+    /// memory operand. Used by INVLPG which needs the linear address.
+    pub fn modrm_offset32(&self, m: &ModRm) -> u32 {
+        let mut ea: u32 = 0;
+        if let Some(sib) = m.sib {
+            let scale = 1u32 << ((sib >> 6) & 3);
+            let index = (sib >> 3) & 7;
+            let base = sib & 7;
+            if index != 4 {
+                ea = ea.wrapping_add(self.reg32(Reg::reg32(index)).wrapping_mul(scale));
+            }
+            if !(m.mod_field == 0 && base == 5) {
+                ea = ea.wrapping_add(self.reg32(Reg::reg32(base)));
+            }
+        } else if !(m.mod_field == 0 && m.rm == 5) {
+            ea = ea.wrapping_add(self.reg32(Reg::reg32(m.rm)));
+        }
+        if let Some(d32) = m.disp32 { ea = ea.wrapping_add(d32); }
+        ea
     }
 
     /// Compute the physical address of a 16-bit-addressed memory operand.
@@ -708,15 +866,25 @@ impl Cpu {
 
     /// Deliver a pending hardware interrupt, if any. Returns true if an
     /// interrupt was dispatched.
+    ///
+    /// The PIT is ticked every call (so timing stays accurate), but the
+    /// keyboard/IDE IRQ checks and PIC acknowledge are only done every
+    /// `IRQ_CHECK_INTERVAL` instructions to reduce per-instruction overhead.
     pub fn deliver_hardware_interrupt(&mut self) -> bool {
         if self.servicing_irq {
             return false;
         }
-        // Tick the PIT (channel 0 drives IRQ0).
+        // Tick the PIT (channel 0 drives IRQ0) every instruction.
         self.pit.tick(1);
         if self.pit.irq0 {
             self.pit.irq0 = false;
             self.pic.raise_irq(0);
+        }
+        // Only check the other devices and the PIC every N instructions.
+        // This avoids checking the keyboard/IDE/PIC on every single step.
+        const IRQ_CHECK_INTERVAL: u64 = 64;
+        if self.instructions_executed % IRQ_CHECK_INTERVAL != 0 {
+            return false;
         }
         // Keyboard (8042) drives IRQ1.
         if self.kbd.irq1 {
@@ -760,6 +928,9 @@ impl Cpu {
     /// for diagnostics/tests.
     pub fn step(&mut self) -> Inst {
         // Deliver a pending hardware interrupt before the next instruction.
+        // (Batched: we only check for device IRQs every IRQ_CHECK_INTERVAL
+        // instructions to avoid per-instruction overhead. The PIT is still
+        // ticked each time so timing stays accurate.)
         self.deliver_hardware_interrupt();
         // Dispatch any exception raised by the previous instruction (e.g. a
         // page fault recorded during address translation).
@@ -770,6 +941,23 @@ impl Cpu {
         crate::instructions::execute(self, &inst);
         self.instructions_executed += 1;
         self.tsc = self.tsc.wrapping_add(1);
+        // Debug tracing: only when X86EMU_TRACE is set at startup. Uses a
+        // cached file handle instead of opening/closing the file per
+        // instruction.
+        if self.trace_enabled {
+            use std::io::Write;
+            let eip = if self.pe { self.eip } else { self.ip as u32 };
+            let phys = self.phys_ip();
+            let b0 = self.mem.read_u8(phys);
+            let b1 = self.mem.read_u8((phys + 1) & (crate::memory::Memory::SIZE - 1));
+            let b2 = self.mem.read_u8((phys + 2) & (crate::memory::Memory::SIZE - 1));
+            let line = format!("[{}] eip={:08X} bytes={:02X} {:02X} {:02X} eax={:08X} ecx={:08X} edx={:08X} ebx={:08X} esp={:08X} esi={:08X} edi={:08X} cr3={:08X} cr0={:08X}\n",
+                self.instructions_executed, eip, b0, b1, b2,
+                self.eax, self.ecx, self.edx, self.ebx, self.esp, self.esi, self.edi, self.cr3, self.cr0);
+            if let Some(ref mut f) = self.trace_file {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         inst
     }
 

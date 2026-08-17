@@ -33,6 +33,13 @@ pub enum Inst {
     MovMem32Acc { addr: u32 },
     MovRmSeg { m: ModRm, seg: SegReg },
     MovSegRm { seg: SegReg, m: ModRm },
+    // Load segment with pointer: LDS (0xC5) / LES (0xC4) / LSS (0F B2) /
+    // LFS (0F B4) / LGS (0F B5)
+    Lds { m: ModRm },
+    Les { m: ModRm },
+    Lss { m: ModRm },
+    Lfs { m: ModRm },
+    Lgs { m: ModRm },
     AluRm8Reg { op: AluOp, m: ModRm, reg: u8, dir: Dir },
     AluRm16Reg { op: AluOp, m: ModRm, reg: u8, dir: Dir },
     AluRm32Reg { op: AluOp, m: ModRm, reg: u8, dir: Dir },
@@ -78,6 +85,9 @@ pub enum Inst {
     TestRm8Imm { m: ModRm, imm: u8 },
     TestRm16Imm { m: ModRm, imm: u16 },
     TestRm32Imm { m: ModRm, imm: u32 },
+    TestRm8Reg { m: ModRm, reg: u8 },
+    TestRm16Reg { m: ModRm, reg: u8 },
+    TestRm32Reg { m: ModRm, reg: u8 },
     TestAccImm8 { imm: u8 },
     TestAccImm16 { imm: u16 },
     TestAccImm32 { imm: u32 },
@@ -375,6 +385,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
             else { Inst::AluRm16Imm { op: AluOp::from_index(m.reg), m, imm: imm8 as i16 as u16, imm_is8: true } }
         }
 
+        // TEST r/m8, r8 (0x84) / TEST r/m16/32, r (0x85)
+        0x84 => { let m = cpu.fetch_modrm(); Inst::TestRm8Reg { m, reg: m.reg } }
+        0x85 => { let m = cpu.fetch_modrm(); if w32 { Inst::TestRm32Reg { m, reg: m.reg } } else { Inst::TestRm16Reg { m, reg: m.reg } } }
+
         // MOV r/m8, reg8
         0x88 => { let m = cpu.fetch_modrm(); Inst::MovRm8Reg { m, src: m.reg } }
         // MOV r/m16/32, reg
@@ -387,6 +401,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0x8C => { let m = cpu.fetch_modrm(); Inst::MovRmSeg { m, seg: seg_from_index(m.reg) } }
         // MOV sreg, r/m16
         0x8E => { let m = cpu.fetch_modrm(); Inst::MovSegRm { seg: seg_from_index(m.reg), m } }
+
+        // LDS (0xC5) / LES (0xC4): load a far pointer (offset + segment).
+        0xC5 => { let m = cpu.fetch_modrm(); Inst::Lds { m } }
+        0xC4 => { let m = cpu.fetch_modrm(); Inst::Les { m } }
 
         // XCHG AX/EAX, reg (0x90 = NOP when reg is AX)
         0x90 => Inst::Nop,
@@ -541,16 +559,18 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
 
         // String ops: MOVS (0xA4/0xA5), STOS (0xAA/0xAB),
         // LODS (0xAC/0xAD), CMPS (0xA6/0xA7), SCAS (0xAE/0xAF)
+        // Byte forms have w=false; word forms have w=true (element size is
+        // 2 in 16-bit mode, 4 in 32-bit mode, resolved at execute time).
         0xA4 => Inst::Movs { rep, w: false },
-        0xA5 => Inst::Movs { rep, w: !w32 },
+        0xA5 => Inst::Movs { rep, w: true },
         0xA6 => Inst::Cmps { rep, w: false },
-        0xA7 => Inst::Cmps { rep, w: !w32 },
+        0xA7 => Inst::Cmps { rep, w: true },
         0xAA => Inst::Stos { rep, w: false },
-        0xAB => Inst::Stos { rep, w: !w32 },
+        0xAB => Inst::Stos { rep, w: true },
         0xAC => Inst::Lods { rep, w: false },
-        0xAD => Inst::Lods { rep, w: !w32 },
+        0xAD => Inst::Lods { rep, w: true },
         0xAE => Inst::Scas { rep, w: false },
-        0xAF => Inst::Scas { rep, w: !w32 },
+        0xAF => Inst::Scas { rep, w: true },
 
         // Far JMP (0xEA) / far CALL (0x9A)
         0xEA => {
@@ -595,6 +615,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0xAB => { let m = cpu.fetch_modrm(); Inst::Bts { m, bit: m.reg } }
                 0xB3 => { let m = cpu.fetch_modrm(); Inst::Btr { m, bit: m.reg } }
                 0xBB => { let m = cpu.fetch_modrm(); Inst::Btc { m, bit: m.reg } }
+                // Load segment with pointer: LSS (0F B2) / LFS (0F B4) / LGS (0F B5)
+                0xB2 => { let m = cpu.fetch_modrm(); Inst::Lss { m } }
+                0xB4 => { let m = cpu.fetch_modrm(); Inst::Lfs { m } }
+                0xB5 => { let m = cpu.fetch_modrm(); Inst::Lgs { m } }
                 // Group 8 (0F BA /4-/7): bit tests with imm8
                 0xBA => {
                     let m = cpu.fetch_modrm();
@@ -692,6 +716,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let v = cpu.read_rm16(&m);
             cpu.load_seg(seg, v);
         }
+        // ---- Load segment with pointer (LDS/LES/LSS/LFS/LGS) ----
+        // Reads a far pointer (offset, then segment) from the memory operand,
+        // loads the segment register, and stores the offset in the reg field.
+        Inst::Lds { m } => { load_far_pointer(cpu, &m, SegReg::Ds); }
+        Inst::Les { m } => { load_far_pointer(cpu, &m, SegReg::Es); }
+        Inst::Lss { m } => { load_far_pointer(cpu, &m, SegReg::Ss); }
+        Inst::Lfs { m } => { load_far_pointer(cpu, &m, SegReg::Fs); }
+        Inst::Lgs { m } => { load_far_pointer(cpu, &m, SegReg::Gs); }
 
         // ---- ALU r/m, reg ----
         Inst::AluRm8Reg { op, m, reg, dir } => {
@@ -805,11 +837,17 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::PushImm32 { imm } => cpu.push32(imm),
 
         // ---- Control flow ----
-        Inst::JmpRel8 { rel } => { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
+        Inst::JmpRel8 { rel } => {
+            if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
+            else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
+        }
         Inst::JmpRel16 { rel } => { cpu.ip = cpu.ip.wrapping_add(rel as u16); }
         Inst::JmpRel32 { rel } => { cpu.eip = cpu.eip.wrapping_add(rel as u32); }
         Inst::Jcc { cond, rel } => {
-            if cond.test(cpu) { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
+            if cond.test(cpu) {
+                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
+                else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
+            }
         }
         Inst::CallRel16 { rel } => {
             let next = cpu.ip;
@@ -933,6 +971,27 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::TestRm32Imm { m, imm } => {
             let v = cpu.read_rm32(&m);
             let r = v & imm;
+            set_logic_flags32(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestRm8Reg { m, reg } => {
+            let v = cpu.read_rm8(&m);
+            let r = v & cpu.reg8(Reg::reg8(reg));
+            set_logic_flags8(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestRm16Reg { m, reg } => {
+            let v = cpu.read_rm16(&m);
+            let r = v & cpu.reg16(Reg::reg16(reg));
+            set_logic_flags16(cpu, r);
+            cpu.set_flag(CF, false);
+            cpu.set_flag(OF, false);
+        }
+        Inst::TestRm32Reg { m, reg } => {
+            let v = cpu.read_rm32(&m);
+            let r = v & cpu.reg32(Reg::reg32(reg));
             set_logic_flags32(cpu, r);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
@@ -1158,20 +1217,38 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
 
         // ---- LOOP / LOOPZ / LOOPNZ / JCXZ ----
         Inst::Loop { cond, rel } => {
-            let take = match cond {
-                LoopCond::Jcxz => cpu.cx == 0,
-                _ => {
-                    cpu.cx = cpu.cx.wrapping_sub(1);
-                    match cond {
-                        LoopCond::Loop => cpu.cx != 0,
-                        LoopCond::Loopz => cpu.cx != 0 && cpu.get_flag(ZF),
-                        LoopCond::Loopnz => cpu.cx != 0 && !cpu.get_flag(ZF),
-                        _ => false,
+            let take = if cpu.opsize {
+                // 32-bit mode: LOOP uses ECX and branches via EIP.
+                match cond {
+                    LoopCond::Jcxz => cpu.ecx == 0,
+                    _ => {
+                        cpu.ecx = cpu.ecx.wrapping_sub(1);
+                        match cond {
+                            LoopCond::Loop => cpu.ecx != 0,
+                            LoopCond::Loopz => cpu.ecx != 0 && cpu.get_flag(ZF),
+                            LoopCond::Loopnz => cpu.ecx != 0 && !cpu.get_flag(ZF),
+                            _ => false,
+                        }
+                    }
+                }
+            } else {
+                // 16-bit mode: LOOP uses CX and branches via IP.
+                match cond {
+                    LoopCond::Jcxz => cpu.cx == 0,
+                    _ => {
+                        cpu.cx = cpu.cx.wrapping_sub(1);
+                        match cond {
+                            LoopCond::Loop => cpu.cx != 0,
+                            LoopCond::Loopz => cpu.cx != 0 && cpu.get_flag(ZF),
+                            LoopCond::Loopnz => cpu.cx != 0 && !cpu.get_flag(ZF),
+                            _ => false,
+                        }
                     }
                 }
             };
             if take {
-                cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16);
+                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
+                else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
             }
         }
 
@@ -1272,111 +1349,228 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- String ops ----
+        // Element size: byte forms (w=false) are 8-bit; word forms (w=true)
+        // are 16-bit in 16-bit mode and 32-bit in 32-bit mode. The index
+        // registers and REP counter follow the operand size.
         Inst::Movs { rep, w } => {
-            let delta = if cpu.get_flag(DF) { -1i32 } else { 1i32 };
-            let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-            while count > 0 {
-                let src = cpu.translate(SegReg::Ds, cpu.si as u32);
-                let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                if w {
-                    let v = cpu.mem.read_u16(src);
-                    cpu.mem.write_u16(dst, v);
-                } else {
-                    let v = cpu.mem.read_u8(src);
-                    cpu.mem.write_u8(dst, v);
+            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
+            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
+            if cpu.opsize {
+                let mut count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
+                while count > 0 {
+                    let src = cpu.translate(SegReg::Ds, cpu.esi);
+                    let dst = cpu.translate(SegReg::Es, cpu.edi);
+                    if esize == 4 {
+                        let v = cpu.mem.read_u32(src);
+                        cpu.mem.write_u32(dst, v);
+                    } else {
+                        let v = cpu.mem.read_u8(src);
+                        cpu.mem.write_u8(dst, v);
+                    }
+                    cpu.esi = cpu.esi.wrapping_add((delta * esize) as u32);
+                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
+                    count -= 1;
                 }
-                cpu.si = cpu.si.wrapping_add(delta as u16);
-                cpu.di = cpu.di.wrapping_add(delta as u16);
-                count -= 1;
+                if rep != Rep::None { cpu.ecx = 0; }
+            } else {
+                let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
+                while count > 0 {
+                    let src = cpu.translate(SegReg::Ds, cpu.si as u32);
+                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
+                    if esize == 2 {
+                        let v = cpu.mem.read_u16(src);
+                        cpu.mem.write_u16(dst, v);
+                    } else {
+                        let v = cpu.mem.read_u8(src);
+                        cpu.mem.write_u8(dst, v);
+                    }
+                    cpu.si = cpu.si.wrapping_add((delta * esize) as u16);
+                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
+                    count -= 1;
+                }
+                if rep != Rep::None { cpu.cx = 0; }
             }
-            if rep != Rep::None { cpu.cx = 0; }
         }
         Inst::Stos { rep, w } => {
-            let delta = if cpu.get_flag(DF) { -1i32 } else { 1i32 };
-            let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-            while count > 0 {
-                let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                if w {
-                    let v = cpu.reg16(Reg16::Ax);
-                    cpu.mem.write_u16(dst, v);
-                } else {
-                    let v = cpu.reg8(Reg8::Al);
-                    cpu.mem.write_u8(dst, v);
+            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
+            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
+            if cpu.opsize {
+                let mut count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
+                while count > 0 {
+                    let dst = cpu.translate(SegReg::Es, cpu.edi);
+                    if esize == 4 {
+                        let v = cpu.reg32(Reg32::Eax);
+                        cpu.mem.write_u32(dst, v);
+                    } else {
+                        let v = cpu.reg8(Reg8::Al);
+                        cpu.mem.write_u8(dst, v);
+                    }
+                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
+                    count -= 1;
                 }
-                cpu.di = cpu.di.wrapping_add(delta as u16);
-                count -= 1;
+                if rep != Rep::None { cpu.ecx = 0; }
+            } else {
+                let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
+                while count > 0 {
+                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
+                    if esize == 2 {
+                        let v = cpu.reg16(Reg16::Ax);
+                        cpu.mem.write_u16(dst, v);
+                    } else {
+                        let v = cpu.reg8(Reg8::Al);
+                        cpu.mem.write_u8(dst, v);
+                    }
+                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
+                    count -= 1;
+                }
+                if rep != Rep::None { cpu.cx = 0; }
             }
-            if rep != Rep::None { cpu.cx = 0; }
         }
         Inst::Lods { rep, w } => {
-            let delta = if cpu.get_flag(DF) { -1i32 } else { 1i32 };
-            let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-            while count > 0 {
-                let src = cpu.translate(SegReg::Ds, cpu.si as u32);
-                if w {
-                    let v = cpu.mem.read_u16(src);
-                    cpu.set_reg16(Reg16::Ax, v);
-                } else {
-                    let v = cpu.mem.read_u8(src);
-                    cpu.set_reg8(Reg8::Al, v);
+            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
+            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
+            if cpu.opsize {
+                let mut count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
+                while count > 0 {
+                    let src = cpu.translate(SegReg::Ds, cpu.esi);
+                    if esize == 4 {
+                        let v = cpu.mem.read_u32(src);
+                        cpu.set_reg32(Reg32::Eax, v);
+                    } else {
+                        let v = cpu.mem.read_u8(src);
+                        cpu.set_reg8(Reg8::Al, v);
+                    }
+                    cpu.esi = cpu.esi.wrapping_add((delta * esize) as u32);
+                    count -= 1;
                 }
-                cpu.si = cpu.si.wrapping_add(delta as u16);
-                count -= 1;
+                if rep != Rep::None { cpu.ecx = 0; }
+            } else {
+                let mut count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
+                while count > 0 {
+                    let src = cpu.translate(SegReg::Ds, cpu.si as u32);
+                    if esize == 2 {
+                        let v = cpu.mem.read_u16(src);
+                        cpu.set_reg16(Reg16::Ax, v);
+                    } else {
+                        let v = cpu.mem.read_u8(src);
+                        cpu.set_reg8(Reg8::Al, v);
+                    }
+                    cpu.si = cpu.si.wrapping_add((delta * esize) as u16);
+                    count -= 1;
+                }
+                if rep != Rep::None { cpu.cx = 0; }
             }
-            if rep != Rep::None { cpu.cx = 0; }
         }
         Inst::Cmps { rep, w } => {
-            let delta = if cpu.get_flag(DF) { -1i32 } else { 1i32 };
-            loop {
-                let src = cpu.translate(SegReg::Ds, cpu.si as u32);
-                let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                if w {
-                    let a = cpu.mem.read_u16(src);
-                    let b = cpu.mem.read_u16(dst);
-                    alu16(cpu, AluOp::Sub, a, b);
-                } else {
-                    let a = cpu.mem.read_u8(src);
-                    let b = cpu.mem.read_u8(dst);
-                    alu8(cpu, AluOp::Sub, a, b);
-                }
-                cpu.si = cpu.si.wrapping_add(delta as u16);
-                cpu.di = cpu.di.wrapping_add(delta as u16);
-                match rep {
-                    Rep::None => break,
-                    Rep::Repe => {
-                        cpu.cx = cpu.cx.wrapping_sub(1);
-                        if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
+            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
+            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
+            if cpu.opsize {
+                loop {
+                    let src = cpu.translate(SegReg::Ds, cpu.esi);
+                    let dst = cpu.translate(SegReg::Es, cpu.edi);
+                    if esize == 4 {
+                        let a = cpu.mem.read_u32(src);
+                        let b = cpu.mem.read_u32(dst);
+                        alu32(cpu, AluOp::Sub, a, b);
+                    } else {
+                        let a = cpu.mem.read_u8(src);
+                        let b = cpu.mem.read_u8(dst);
+                        alu8(cpu, AluOp::Sub, a, b);
                     }
-                    Rep::Repne => {
-                        cpu.cx = cpu.cx.wrapping_sub(1);
-                        if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
+                    cpu.esi = cpu.esi.wrapping_add((delta * esize) as u32);
+                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
+                    match rep {
+                        Rep::None => break,
+                        Rep::Repe => {
+                            cpu.ecx = cpu.ecx.wrapping_sub(1);
+                            if cpu.ecx == 0 || !cpu.get_flag(ZF) { break; }
+                        }
+                        Rep::Repne => {
+                            cpu.ecx = cpu.ecx.wrapping_sub(1);
+                            if cpu.ecx == 0 || cpu.get_flag(ZF) { break; }
+                        }
+                    }
+                }
+            } else {
+                loop {
+                    let src = cpu.translate(SegReg::Ds, cpu.si as u32);
+                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
+                    if esize == 2 {
+                        let a = cpu.mem.read_u16(src);
+                        let b = cpu.mem.read_u16(dst);
+                        alu16(cpu, AluOp::Sub, a, b);
+                    } else {
+                        let a = cpu.mem.read_u8(src);
+                        let b = cpu.mem.read_u8(dst);
+                        alu8(cpu, AluOp::Sub, a, b);
+                    }
+                    cpu.si = cpu.si.wrapping_add((delta * esize) as u16);
+                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
+                    match rep {
+                        Rep::None => break,
+                        Rep::Repe => {
+                            cpu.cx = cpu.cx.wrapping_sub(1);
+                            if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
+                        }
+                        Rep::Repne => {
+                            cpu.cx = cpu.cx.wrapping_sub(1);
+                            if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
+                        }
                     }
                 }
             }
         }
         Inst::Scas { rep, w } => {
-            let delta = if cpu.get_flag(DF) { -1i32 } else { 1i32 };
-            loop {
-                let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                if w {
-                    let a = cpu.reg16(Reg16::Ax);
-                    let b = cpu.mem.read_u16(dst);
-                    alu16(cpu, AluOp::Sub, a, b);
-                } else {
-                    let a = cpu.reg8(Reg8::Al);
-                    let b = cpu.mem.read_u8(dst);
-                    alu8(cpu, AluOp::Sub, a, b);
-                }
-                cpu.di = cpu.di.wrapping_add(delta as u16);
-                match rep {
-                    Rep::None => break,
-                    Rep::Repe => {
-                        cpu.cx = cpu.cx.wrapping_sub(1);
-                        if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
+            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
+            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
+            if cpu.opsize {
+                loop {
+                    let dst = cpu.translate(SegReg::Es, cpu.edi);
+                    if esize == 4 {
+                        let a = cpu.reg32(Reg32::Eax);
+                        let b = cpu.mem.read_u32(dst);
+                        alu32(cpu, AluOp::Sub, a, b);
+                    } else {
+                        let a = cpu.reg8(Reg8::Al);
+                        let b = cpu.mem.read_u8(dst);
+                        alu8(cpu, AluOp::Sub, a, b);
                     }
-                    Rep::Repne => {
-                        cpu.cx = cpu.cx.wrapping_sub(1);
-                        if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
+                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
+                    match rep {
+                        Rep::None => break,
+                        Rep::Repe => {
+                            cpu.ecx = cpu.ecx.wrapping_sub(1);
+                            if cpu.ecx == 0 || !cpu.get_flag(ZF) { break; }
+                        }
+                        Rep::Repne => {
+                            cpu.ecx = cpu.ecx.wrapping_sub(1);
+                            if cpu.ecx == 0 || cpu.get_flag(ZF) { break; }
+                        }
+                    }
+                }
+            } else {
+                loop {
+                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
+                    if esize == 2 {
+                        let a = cpu.reg16(Reg16::Ax);
+                        let b = cpu.mem.read_u16(dst);
+                        alu16(cpu, AluOp::Sub, a, b);
+                    } else {
+                        let a = cpu.reg8(Reg8::Al);
+                        let b = cpu.mem.read_u8(dst);
+                        alu8(cpu, AluOp::Sub, a, b);
+                    }
+                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
+                    match rep {
+                        Rep::None => break,
+                        Rep::Repe => {
+                            cpu.cx = cpu.cx.wrapping_sub(1);
+                            if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
+                        }
+                        Rep::Repne => {
+                            cpu.cx = cpu.cx.wrapping_sub(1);
+                            if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
+                        }
                     }
                 }
             }
@@ -1765,6 +1959,30 @@ fn parity(v: u8) -> bool {
     v ^= v >> 2;
     v ^= v >> 1;
     (v & 1) == 0
+}
+
+/// Load a far pointer (offset + segment) from a memory operand into the
+/// `reg` field's register and the given segment register. Used by
+/// LDS/LES/LSS/LFS/LGS.
+fn load_far_pointer(cpu: &mut Cpu, m: &ModRm, seg: SegReg) {
+    let addr = if cpu.addrsize {
+        cpu.modrm_addr32(m)
+    } else {
+        cpu.modrm_addr(m)
+    };
+    if cpu.opsize {
+        // 32-bit offset + 16-bit segment.
+        let off = cpu.mem.read_u32(addr);
+        let sel = cpu.mem.read_u16(addr + 4);
+        cpu.set_reg32(Reg::reg32(m.reg), off);
+        cpu.load_seg(seg, sel);
+    } else {
+        // 16-bit offset + 16-bit segment.
+        let off = cpu.mem.read_u16(addr);
+        let sel = cpu.mem.read_u16(addr + 2);
+        cpu.set_reg16(Reg::reg16(m.reg), off);
+        cpu.load_seg(seg, sel);
+    }
 }
 
 /// Compute the effective address (offset only, no segment) of a ModR/M
@@ -2402,6 +2620,128 @@ mod tests {
         assert_eq!(cpu.eax, 0x99);
         assert!(cpu.halted);
         assert_eq!(cpu.esp, 0x0100);
+    }
+
+    #[test]
+    fn loop_uses_eip_in_32bit_mode() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        // Flat 32-bit code segment (D=1) so opsize defaults to 32-bit.
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // mov ecx, 3 ; loop $ (E2 FE) ; hlt
+        // (no 0x66 prefix: opsize already 32-bit in this segment)
+        cpu.mem.load(0x1000, &[
+            0xB9, 0x03, 0x00, 0x00, 0x00, // mov ecx, 3
+            0xE2, 0xFE,                    // loop -2 (back to itself)
+            0xF4,                          // hlt
+        ]);
+        cpu.run(64);
+        assert!(cpu.halted);
+        assert_eq!(cpu.ecx, 0);
+        assert_eq!(cpu.eip, 0x1008);
+    }
+
+    #[test]
+    fn jcc_uses_eip_in_32bit_mode() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // mov eax, 1 ; test eax, eax ; jz +1 (74 01) ; hlt ; hlt
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x85, 0xC0,                    // test eax, eax
+            0x74, 0x01,                    // jz +1 (not taken, ZF=0)
+            0xF4,                          // hlt
+            0xF4,                          // hlt
+        ]);
+        cpu.run(32);
+        assert!(cpu.halted);
+        // mov(5) + test(2) + jz(2) = 0x1009, then hlt advances to 0x100A.
+        assert_eq!(cpu.eip, 0x100A);
+    }
+
+    #[test]
+    fn jmp_rel8_uses_eip_in_32bit_mode() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // jmp +1 (EB 01) over a hlt, landing on a second hlt.
+        cpu.mem.load(0x1000, &[
+            0xEB, 0x01, // jmp +1
+            0xF4,       // hlt (skipped)
+            0xF4,       // hlt (land here)
+        ]);
+        cpu.run(32);
+        assert!(cpu.halted);
+        assert_eq!(cpu.eip, 0x1004);
+    }
+
+    #[test]
+    fn lss_loads_ss_and_offset() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+        };
+        // Far pointer at 0x2000: offset=0x8000, selector=0x10.
+        cpu.mem.write_u32(0x2000, 0x8000);
+        cpu.mem.write_u16(0x2004, 0x10);
+        // lss eax, [0x2000] = 0F B2 05 disp32
+        cpu.eip = 0x1000;
+        cpu.mem.load(0x1000, &[
+            0x0F, 0xB2, 0x05, 0x00, 0x20, 0x00, 0x00, // lss eax, [0x2000]
+            0xF4,
+        ]);
+        cpu.run(32);
+        assert_eq!(cpu.eax, 0x8000);
+        assert_eq!(cpu.ss, 0x10);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn rep_stosd_uses_ecx_in_32bit_mode() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.seg_desc[SegReg::Es as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+        };
+        cpu.ecx = 4;
+        cpu.edi = 0x3000;
+        cpu.eax = 0xDEADBEEF;
+        // rep stosd (F3 AB) ; hlt
+        cpu.eip = 0x1000;
+        cpu.mem.load(0x1000, &[
+            0xF3, 0xAB,
+            0xF4,
+        ]);
+        cpu.run(32);
+        // 4 dwords written at 0x3000..0x3010.
+        for i in 0..4 {
+            assert_eq!(cpu.mem.read_u32(0x3000 + i * 4), 0xDEADBEEF);
+        }
+        assert_eq!(cpu.ecx, 0);
+        assert_eq!(cpu.edi, 0x3010);
+        assert!(cpu.halted);
     }
 
     // ---- Paging tests ----

@@ -9,3 +9,4 @@
 /images/dump*.py
 /images/parse*.py
 /images/findstart.py
+"*.py"  

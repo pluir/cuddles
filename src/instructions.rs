@@ -68,6 +68,14 @@ pub enum Inst {
     JmpRel16 { rel: i16 },
     JmpRel32 { rel: i32 },
     Jcc { cond: Cond, rel: i8 },
+    // 32-bit conditional jump (0F 80-8F): Jcc rel32.
+    Jcc32 { cond: Cond, rel: i32 },
+    // MOVZX r16/32, r/m8 (0F B6) / MOVZX r32, r/m16 (0F B7)
+    Movzx8 { m: ModRm, dst: u8 },
+    Movzx16 { m: ModRm, dst: u8 },
+    // MOVSX r16/32, r/m8 (0F BE) / MOVSX r32, r/m16 (0F BF)
+    Movsx8 { m: ModRm, dst: u8 },
+    Movsx16 { m: ModRm, dst: u8 },
     CallRel16 { rel: i16 },
     CallRel32 { rel: i32 },
     Ret,
@@ -503,6 +511,9 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xE2 => Inst::Loop { cond: LoopCond::Loopnz, rel: cpu.fetch_u8() as i8 },
         0xE3 => Inst::Loop { cond: LoopCond::Jcxz, rel: cpu.fetch_u8() as i8 },
 
+        // WAIT / FWAIT (0x9B): wait for the FPU. No-op (we execute FPU
+        // instructions synchronously).
+        0x9B => Inst::Nop,
         // HLT (0xF4)
         0xF4 => Inst::Hlt,
         // CMC (0xF5)
@@ -645,6 +656,37 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                         3 => Inst::Lidt { m },
                         _ => Inst::Unknown { opcode: 0x0F },
                     }
+                }
+                // 0F 00 group: SLDT (/0), STR (/1), LLDT (/2), LTR (/3).
+                // LLDT/LTR load the local descriptor table / task register;
+                // we don't model them, so consume the ModR/M and treat as
+                // no-ops. SLDT/STR would store them, also no-ops for boot.
+                0x00 => {
+                    let _m = cpu.fetch_modrm();
+                    Inst::Nop
+                }
+                // 0F 80-8F: Jcc rel32 (32-bit conditional jumps). Same
+                // conditions as the 0x70-0x7F rel8 forms.
+                0x80..=0x8F => {
+                    Inst::Jcc32 { cond: Cond::from_jcc(op2 - 0x80), rel: cpu.fetch_u32() as i32 }
+                }
+                // MOVZX r16/32, r/m8 (0F B6) / MOVZX r32, r/m16 (0F B7)
+                0xB6 => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Movzx8 { m, dst: m.reg }
+                }
+                0xB7 => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Movzx16 { m, dst: m.reg }
+                }
+                // MOVSX r16/32, r/m8 (0F BE) / MOVSX r32, r/m16 (0F BF)
+                0xBE => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Movsx8 { m, dst: m.reg }
+                }
+                0xBF => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Movsx16 { m, dst: m.reg }
                 }
                 // CLTS (0x0F 0x06)
                 0x06 => Inst::Clts,
@@ -1013,6 +1055,35 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
                 else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
             }
+        }
+        Inst::Jcc32 { cond, rel } => {
+            // 0F 80-8F: conditional jump with rel32 displacement. In 32-bit
+            // mode it branches via EIP; in 16-bit mode via IP.
+            if cond.test(cpu) {
+                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as u32); }
+                else { cpu.ip = cpu.ip.wrapping_add(rel as u16); }
+            }
+        }
+        // ---- MOVZX / MOVSX ----
+        Inst::Movzx8 { m, dst } => {
+            let v = cpu.read_rm8(&m);
+            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as u32); }
+            else { cpu.set_reg16(Reg::reg16(dst), v as u16); }
+        }
+        Inst::Movzx16 { m, dst } => {
+            let v = cpu.read_rm16(&m);
+            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as u32); }
+            else { cpu.set_reg16(Reg::reg16(dst), v); }
+        }
+        Inst::Movsx8 { m, dst } => {
+            let v = cpu.read_rm8(&m) as i8;
+            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as i32 as u32); }
+            else { cpu.set_reg16(Reg::reg16(dst), v as i16 as u16); }
+        }
+        Inst::Movsx16 { m, dst } => {
+            let v = cpu.read_rm16(&m) as i16;
+            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as i32 as u32); }
+            else { cpu.set_reg16(Reg::reg16(dst), v as u16); }
         }
         Inst::CallRel16 { rel } => {
             let next = cpu.ip;
@@ -3250,6 +3321,82 @@ mod tests {
         cpu.set_reg8(Reg8::Al, 0xAB);
         cpu.run(32);
         assert_eq!(cpu.mem.read_u8(0x12345678), 0xAB);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn jcc32_branches_via_eip_in_32bit_mode() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // mov eax, 1 ; test eax, eax ; jz rel32 (0F 84) not taken ; hlt
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x85, 0xC0,                    // test eax, eax
+            0x0F, 0x84, 0x01, 0x00, 0x00, 0x00, // jz +1 (not taken)
+            0xF4,                          // hlt
+            0xF4,
+        ]);
+        cpu.run(32);
+        assert!(cpu.halted);
+        // mov(5) + test(2) + jz(6) = 0x100D, then hlt advances to 0x100E.
+        assert_eq!(cpu.eip, 0x100E);
+    }
+
+    #[test]
+    fn movzx_zero_extends_8bit() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // movzx eax, al (0F B6 C0) ; hlt
+        cpu.mem.load(0x1000, &[
+            0x0F, 0xB6, 0xC0,
+            0xF4,
+        ]);
+        cpu.set_reg8(Reg8::Al, 0xFF);
+        cpu.run(32);
+        assert_eq!(cpu.eax, 0xFF);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn movsx_sign_extends_8bit() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+        };
+        cpu.eip = 0x1000;
+        // movsx eax, al (0F BE C0) ; hlt
+        cpu.mem.load(0x1000, &[
+            0x0F, 0xBE, 0xC0,
+            0xF4,
+        ]);
+        cpu.set_reg8(Reg8::Al, 0xFF);
+        cpu.run(32);
+        assert_eq!(cpu.eax, 0xFFFF_FFFF);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn wait_and_lldt_are_noops() {
+        let mut cpu = Cpu::new();
+        // wait (9B) ; lldt ax (0F 00 D0) ; hlt
+        load(&mut cpu, &[
+            0x9B,
+            0x0F, 0x00, 0xD0,
+            0xF4,
+        ]);
+        cpu.run(16);
         assert!(cpu.halted);
     }
 

@@ -1,0 +1,18 @@
+warning: variant `MovMem8Acc_32` should have an upper camel case name
+  --> src\instructions.rs:31:5
+   |
+31 |     MovMem8Acc_32 { addr: u32 },
+   |     ^^^^^^^^^^^^^ help: convert the identifier to upper camel case: `MovMem8acc32`
+   |
+   = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variant `MovMem16Acc_32` should have an upper camel case name
+  --> src\instructions.rs:35:5
+   |
+35 |     MovMem16Acc_32 { addr: u32 },
+   |     ^^^^^^^^^^^^^^ help: convert the identifier to upper camel case: `MovMem16acc32`
+
+warning: `x86emu` (lib) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running `target\release\x86emu.exe --kernel-elf images/golden_kernel.bin 2000000`
+EXC vector=0xe eip=0xc01a269b cr0=0x80050023 cr3=0x0030a000 cr2=0xbf7384cf idt_base=0x0 idt_limit=0x0

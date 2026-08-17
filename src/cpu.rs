@@ -117,6 +117,10 @@ pub struct Cpu {
     pub tsc: u64,
     // Set true to stop the run loop (HLT, or a test sentinel).
     pub halted: bool,
+    /// Set true when the CPU triple-faults (an exception fired with no IDT
+    /// installed, or an exception fired while handling another). A real CPU
+    /// resets here; we halt with this flag set.
+    pub triple_fault: bool,
 
     // ---- Prefix / size state for the current instruction ----
     /// True when the 0x66 operand-size override is active (32-bit operands).
@@ -186,6 +190,7 @@ impl Cpu {
             bios: crate::bios::Bios::new(),
             instructions_executed: 0,
             halted: false,
+            triple_fault: false,
             tsc: 0,
             opsize: false,
             addrsize: false,
@@ -763,7 +768,28 @@ impl Cpu {
 
     /// Dispatch an exception through the IDT (protected mode) or IVT
     /// (real mode), pushing an error code first if the exception has one.
+    ///
+    /// If the IDT/IVT is not set up for this vector (e.g. an exception fires
+    /// before the kernel installs its IDT), the CPU triple-faults: it halts
+    /// with `triple_fault = true` instead of dispatching to a garbage entry
+    /// and looping forever (as a real CPU would reset).
     pub fn dispatch_exception(&mut self, vector: u8, error_code: Option<u32>) {
+        // Check the IDT/IVT covers this vector before dispatching.
+        if self.pe {
+            let entry = (vector as u32) * 8;
+            if (entry + 7) as u16 > self.idt_limit {
+                self.triple_fault = true;
+                self.halted = true;
+                return;
+            }
+        } else {
+            let entry = (vector as usize) * 4;
+            if entry + 3 > 0x3FF {
+                self.triple_fault = true;
+                self.halted = true;
+                return;
+            }
+        }
         if let Some(code) = error_code {
             if self.pe {
                 self.push32(code);
@@ -943,5 +969,27 @@ mod tests {
         cpu.run(16);
         assert!(cpu.vga.is_graphics());
         assert_eq!(cpu.vga.framebuffer.len(), 320 * 200);
+    }
+
+    #[test]
+    fn exception_without_idt_triple_faults() {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.ss = 0;
+        cpu.esp = 0x0100;
+        // No IDT installed (idt_base=0, idt_limit=0). A #DE fires.
+        // mov ax, 1 ; mov bx, 0 ; div bx ; hlt
+        cpu.mem.load(0x1000, &[
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x66, 0xBB, 0x00, 0x00, 0x00, 0x00,
+            0x66, 0xF7, 0xF3,
+            0xF4,
+        ]);
+        cpu.cs = 0x08;
+        cpu.eip = 0x1000;
+        cpu.run(32);
+        // The #DE fired but there's no IDT -> triple fault -> halt.
+        assert!(cpu.triple_fault);
+        assert!(cpu.halted);
     }
 }

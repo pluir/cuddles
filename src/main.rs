@@ -280,7 +280,11 @@ fn kernel_elf(args: &[String]) -> ExitCode {
 
     println!("executed {} instructions", ran);
     if cpu.halted {
-        println!("halted");
+        if cpu.triple_fault {
+            println!("halted (TRIPLE FAULT: exception fired with no IDT installed)");
+        } else {
+            println!("halted");
+        }
     } else {
         println!("stopped (instruction limit reached)");
     }

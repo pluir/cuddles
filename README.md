@@ -45,7 +45,11 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
     and `#PF` (page fault, when paging is enabled and a page is not present).
     Exceptions are dispatched through the IVT (real mode) or IDT (protected
     mode) with an optional error code; page faults record the faulting linear
-    address in CR2.
+    address in CR2. If an exception fires but the IDT/IVT is not set up for
+    it (e.g. a fault before the kernel installs its IDT), the CPU
+    **triple-faults**: it halts with `triple_fault = true` instead of
+    dispatching to a garbage entry and looping forever (as a real CPU would
+    reset).
   - Shifts/rotates `SHL/SHR/SAR/ROL/ROR/RCL/RCR` (group 2, imm8 or CL count).
   - Group 3 `TEST/NOT/NEG/MUL/IMUL/DIV/IDIV` (8/16/32-bit, with the
     DX:AX and EDX:EAX 64-bit forms for MUL/DIV).
@@ -209,6 +213,8 @@ Hello from x86emu!
    image.
 6. **Exceptions** — *done*: `#DE`, `#BP`, `#OF`, `#UD` and `#PF`, dispatched
    through the IVT/IDT with optional error codes; page faults record CR2.
+   Exceptions that fire with no IDT installed (or while handling another)
+   **triple-fault** — the CPU halts cleanly instead of looping forever.
    This is the keystone that lets a real OS handle faults instead of the
    emulator silently misbehaving.
 7. **Boot a real OS (Linux, 32-bit)** — *in progress*. Milestone 1 (console
@@ -234,4 +240,9 @@ Hello from x86emu!
    early boot before hitting a page fault (which it can't yet handle because
    it hasn't installed its IDT). The missing instructions it needs
    (`TEST acc,imm`, `RDMSR`/`WRMSR`, bit tests `BT/BTS/BTR/BTC`) have been
-   added. It has not yet reached console output.
+   added. The current blocker is the "IDT problem": the kernel enables
+   paging and then faults before its IDT is installed, so the exception
+   dispatches through the empty IDT and loops forever. This is now handled
+   with **triple-fault detection** — the CPU halts cleanly with a diagnostic
+   instead of looping — which is the correct behavior (a real CPU resets on
+   a triple fault). It has not yet reached console output.

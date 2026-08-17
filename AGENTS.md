@@ -120,7 +120,11 @@ cargo run -- --boot examples/boot.bin
   `phys_ip`, `modrm_addr`, `read_rm*`/`write_rm*`, `push*`/`pop*`) take
   `&mut self`. `Cpu::step` dispatches any pending exception at the top of the
   next instruction via `dispatch_exception`, which pushes the error code (if
-  any) and vectors through the IDT (protected mode) or IVT (real mode).
+  any) and vectors through the IDT (protected mode) or IVT (real mode). If an
+  exception fires but the IDT/IVT is not set up for its vector (e.g. a fault
+  before the kernel installs its IDT), the CPU **triple-faults**: it sets
+  `triple_fault = true` and halts instead of dispatching to a garbage entry
+  and looping forever (a real CPU resets on a triple fault).
 - **The Linux boot loader** (`src/boot.rs`) implements the Linux boot
   protocol (Documentation/x86/boot.rst). `parse_bzimage` reads the setup
   header at file offset `0x1F1` (the boot sector occupies file offset 0,
@@ -165,8 +169,8 @@ cargo run -- --boot examples/boot.bin
 - [x] Paging: page tables, CR0–CR4, virtual → physical translation.
 - [x] Devices (part 1): 8254 PIT and 8259 PIC, hardware interrupts (IRQ0 from the timer), IN/OUT port I/O.
 - [x] Devices (part 2): VGA text/graphics framebuffer, 8042 keyboard controller, DMA, IDE/ATA disk, boot a real OS image.
-- [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes.
-- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. The in-kernel decompressor does not yet produce correct output, so `--kernel-elf` loads the decompressed ELF directly (`images/golden_kernel.bin`); booting that, the kernel now runs real 32-bit code (CPUID/RDTSC/RDMSR, paging setup) before hitting a page fault it can't yet handle (no IDT installed). Missing instructions added: `TEST acc,imm` (0xA8/0xA9), `RDMSR`/`WRMSR` (0x0F 0x32/0x30), bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB, group 8 0x0F 0xBA). Next: keep chasing what breaks until the kernel reaches console output.
+- [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes. Exceptions that fire with no IDT installed (or while handling another) **triple-fault** — the CPU halts cleanly instead of looping forever.
+- [ ] Boot a real OS (Linux, 32-bit): VGA text memory-mapped at `0xB8000` (done), E820/E801/`0x88` memory map via `INT 0x15` (done), `CPUID` (0x0F 0xA2) and `RDTSC` (0x0F 0x31) (done), boot-protocol loader (done: parse bzImage, load kernel at `code32_start`, build `boot_params`, flat GDT, enter protected mode, jump with `ESI = boot_params`). A real 32-bit buildroot kernel is at `images/bzImage`; the loader now uses the correct boot-protocol field offsets and the kernel's decompressor runs end to end and jumps to the decompressed kernel. Missing instructions it needed (flag-control, shift-with-imm8 `0xC0/0xC1`, group-5 `FF`) are added, and the decoder derives default operand/address size from the code segment's D bit. The in-kernel decompressor does not yet produce correct output, so `--kernel-elf` loads the decompressed ELF directly (`images/golden_kernel.bin`); booting that, the kernel now runs real 32-bit code (CPUID/RDTSC/RDMSR, paging setup) before hitting a page fault it can't yet handle (no IDT installed). Missing instructions added: `TEST acc,imm` (0xA8/0xA9), `RDMSR`/`WRMSR` (0x0F 0x32/0x30), bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB, group 8 0x0F 0xBA). The "IDT problem" (an exception firing before the IDT is installed loops forever through the empty IDT) is now handled with **triple-fault detection**: the CPU halts cleanly with a diagnostic instead of looping. Next: keep chasing what breaks until the kernel reaches console output.
 
 ## Common tasks
 

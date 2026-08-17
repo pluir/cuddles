@@ -149,6 +149,18 @@ impl Memory {
         self.write_u8(addr.wrapping_add(7), ((val >> 56) & 0xFF) as u8);
     }
 
+    /// Read an f64 (8 bytes, little-endian) at a physical address.
+    #[inline]
+    pub fn read_f64(&self, addr: usize) -> f64 {
+        f64::from_bits(self.read_u64(addr))
+    }
+
+    /// Write an f64 (8 bytes, little-endian) to a physical address.
+    #[inline]
+    pub fn write_f64(&mut self, addr: usize, val: f64) {
+        self.write_u64(addr, val.to_bits());
+    }
+
     /// Load a block of bytes at a physical address (used to install code/data).
     pub fn load(&mut self, addr: usize, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {

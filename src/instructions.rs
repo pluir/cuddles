@@ -182,8 +182,35 @@ pub enum Inst {
     Cld,
     Std,
     Cmc,
+    // ---- x87 FPU (D8-DF) ----
+    // FNINIT (DB E3)
+    Fninit,
+    // FSTCW m16 (D9 /7) / FLDCW m16 (D9 /5)
+    Fstcw { m: ModRm },
+    Fldcw { m: ModRm },
+    // FSTSW AX (DF E0) / FSTSW m16 (DD /7)
+    FstswAx,
+    Fstsw { m: ModRm },
+    // FST/FSTP ST(i) (DD /0, /1)
+    Fst { m: ModRm },
+    Fstp { m: ModRm },
+    // FLD m32/m64 (D9 /0, DD /0)
+    Fld { m: ModRm },
+    // FILD m16/m32 (DF /0, DB /0)
+    Fild { m: ModRm },
+    // FISTP m16/m32 (DF /3, DB /3)
+    Fistp { m: ModRm },
+    // FADD/FSUB/FMUL/FDIV (D8/DC groups) — simplified: operate on ST0.
+    Fop { op: FpuOp, m: ModRm },
+    // FXSAVE (0F AE /0) / FXRSTOR (0F AE /1)
+    Fxsave { m: ModRm },
+    Fxrstor { m: ModRm },
     Unknown { opcode: u8 },
 }
+
+/// x87 arithmetic operation (simplified: ST0 op m).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FpuOp { Add, Sub, Mul, Div }
 
 /// Shift/rotate operation selected by the `reg` field of group 2.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -657,8 +684,103 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                         _ => Inst::Btc { m, bit: imm },
                     }
                 }
+                // FXSAVE (0F AE /0) / FXRSTOR (0F AE /1)
+                0xAE => {
+                    let m = cpu.fetch_modrm();
+                    match m.reg & 7 {
+                        0 => Inst::Fxsave { m },
+                        _ => Inst::Fxrstor { m },
+                    }
+                }
                 _ => Inst::Unknown { opcode: 0x0F },
             }
+        }
+
+        // ---- x87 FPU (D8-DF) ----
+        // D9: FLD m32 (/0), FSTCW (/7), FLDCW (/5), FST m32 (/2),
+        //     FSTP m32 (/3), FNSTCW (/7), FNSTSW (/7 w/ mod=3,rm=4).
+        0xD9 => {
+            let m = cpu.fetch_modrm();
+            match m.reg & 7 {
+                0 => Inst::Fld { m },
+                2 => Inst::Fst { m },
+                3 => Inst::Fstp { m },
+                5 => Inst::Fldcw { m },
+                7 => {
+                    // mod=3, rm=4 is FNSTSW AX (D9 E0); otherwise FSTCW.
+                    if m.is_reg() && m.rm == 4 { Inst::FstswAx }
+                    else { Inst::Fstcw { m } }
+                }
+                _ => Inst::Fstcw { m },
+            }
+        }
+        // DD: FLD m64 (/0), FST m64 (/2), FSTP m64 (/3), FSTSW m16 (/7).
+        0xDD => {
+            let m = cpu.fetch_modrm();
+            match m.reg & 7 {
+                0 => Inst::Fld { m },
+                2 => Inst::Fst { m },
+                3 => Inst::Fstp { m },
+                7 => Inst::Fstsw { m },
+                _ => Inst::Fst { m },
+            }
+        }
+        // DB: FILD m32 (/0), FISTP m32 (/3), FNINIT (DB E3).
+        0xDB => {
+            let m = cpu.fetch_modrm();
+            match m.reg & 7 {
+                0 => Inst::Fild { m },
+                3 => Inst::Fistp { m },
+                4 => {
+                    // /4 group: FNINIT (DB E3), FNCLEX (DB E2, no-op).
+                    if m.is_reg() && m.rm == 3 { Inst::Fninit }
+                    else { Inst::Fstcw { m } }
+                }
+                7 => {
+                    // DB E0 = FNSTSW AX.
+                    if m.is_reg() && m.rm == 0 { Inst::FstswAx }
+                    else { Inst::Fstcw { m } }
+                }
+                _ => Inst::Fild { m },
+            }
+        }
+        // DF: FILD m16 (/0), FISTP m16 (/3), FSTSW AX (DF E0).
+        0xDF => {
+            let m = cpu.fetch_modrm();
+            match m.reg & 7 {
+                0 => Inst::Fild { m },
+                3 => Inst::Fistp { m },
+                4 => {
+                    // /4 group: FNSTSW AX (DF E0), FSTSW m16 (DD /7 is
+                    // separate; DF E0 is the AX form).
+                    if m.is_reg() && m.rm == 0 { Inst::FstswAx }
+                    else { Inst::Fstsw { m } }
+                }
+                _ => Inst::Fild { m },
+            }
+        }
+        // D8/DC/DA/DE: arithmetic with m32/m64/m16. Simplified to ST0 op m.
+        0xD8 | 0xDC => {
+            let m = cpu.fetch_modrm();
+            let op = match m.reg & 7 {
+                0 => FpuOp::Add,
+                1 => FpuOp::Mul,
+                4 => FpuOp::Sub,
+                6 => FpuOp::Div,
+                _ => FpuOp::Add,
+            };
+            Inst::Fop { op, m }
+        }
+        0xDA | 0xDE => {
+            let m = cpu.fetch_modrm();
+            let op = match m.reg & 7 {
+                0 => FpuOp::Add,
+                1 => FpuOp::Mul,
+                4 => FpuOp::Sub,
+                6 => FpuOp::Div,
+                _ => FpuOp::Add,
+            };
+            Inst::Fop { op, m }
         }
 
         _ => Inst::Unknown { opcode: op },
@@ -1802,6 +1924,132 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::Std => cpu.set_flag(flags::DF, true),
         Inst::Cmc => cpu.set_flag(flags::CF, !cpu.get_flag(flags::CF)),
 
+        // ---- x87 FPU ----
+        Inst::Fninit => cpu.fpu.finit(),
+        Inst::Fstcw { m } => {
+            let v = cpu.fpu.control;
+            if m.is_reg() {
+                // Store to a register is meaningless; treat as no-op.
+            } else if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.write_u16(a, v);
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.write_u16(a, v);
+            }
+        }
+        Inst::Fldcw { m } => {
+            let v = if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.read_u16(a)
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.read_u16(a)
+            };
+            cpu.fpu.control = v;
+        }
+        Inst::FstswAx => {
+            cpu.set_reg16(Reg16::Ax, cpu.fpu.fstsw());
+        }
+        Inst::Fstsw { m } => {
+            let v = cpu.fpu.fstsw();
+            if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.write_u16(a, v);
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.write_u16(a, v);
+            }
+        }
+        Inst::Fst { m } => {
+            let v = cpu.fpu.st_i(0);
+            if m.is_reg() {
+                // FST ST(i): copy ST0 to ST(i).
+                cpu.fpu.set_st_i(m.rm as usize, v);
+            } else if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.write_f64(a, v);
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.write_f64(a, v);
+            }
+        }
+        Inst::Fstp { m } => {
+            let v = cpu.fpu.st_i(0);
+            if m.is_reg() {
+                cpu.fpu.set_st_i(m.rm as usize, v);
+            } else if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.write_f64(a, v);
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.write_f64(a, v);
+            }
+            cpu.fpu.pop();
+        }
+        Inst::Fld { m } => {
+            let v = if m.is_reg() {
+                cpu.fpu.st_i(m.rm as usize)
+            } else if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.read_f64(a)
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.read_f64(a)
+            };
+            cpu.fpu.push(v);
+        }
+        Inst::Fild { m } => {
+            // Integer load: read a 32-bit signed int (or 16-bit) and push.
+            let v = if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.read_u32(a) as i32 as f64
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.read_u16(a) as i16 as f64
+            };
+            cpu.fpu.push(v);
+        }
+        Inst::Fistp { m } => {
+            let v = cpu.fpu.st_i(0) as i32;
+            if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.write_u32(a, v as u32);
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.write_u16(a, v as u16);
+            }
+            cpu.fpu.pop();
+        }
+        Inst::Fop { op, m } => {
+            // Simplified arithmetic: ST0 op m (m read as f64 or int).
+            let rhs = if m.is_reg() {
+                cpu.fpu.st_i(m.rm as usize)
+            } else if cpu.addrsize {
+                let a = cpu.modrm_addr32(&m);
+                cpu.mem.read_f64(a)
+            } else {
+                let a = cpu.modrm_addr(&m);
+                cpu.mem.read_f64(a)
+            };
+            let st0 = cpu.fpu.st_i(0);
+            let result = match op {
+                FpuOp::Add => st0 + rhs,
+                FpuOp::Sub => st0 - rhs,
+                FpuOp::Mul => st0 * rhs,
+                FpuOp::Div => if rhs != 0.0 { st0 / rhs } else { st0 },
+            };
+            cpu.fpu.set_st_i(0, result);
+        }
+        Inst::Fxsave { m } => {
+            let a = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
+            cpu.fpu.fxsave(&mut cpu.mem, a);
+        }
+        Inst::Fxrstor { m } => {
+            let a = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
+            cpu.fpu.fxrstor(&cpu.mem, a);
+        }
+
         Inst::Unknown { opcode } => {
             // Invalid opcode exception (#UD, vector 0x06). No error code.
             cpu.pending_exception = Some((0x06, None));
@@ -2791,6 +3039,101 @@ mod tests {
         assert_eq!(cpu.ecx, 0);
         assert_eq!(cpu.edi, 0x3010);
         assert!(cpu.halted);
+    }
+
+    // ---- x87 FPU tests ----
+
+    #[test]
+    fn fninit_resets_fpu() {
+        let mut cpu = Cpu::new();
+        cpu.fpu.push(3.5);
+        cpu.fpu.control = 0x0000;
+        // fninit (DB E3) ; hlt
+        load(&mut cpu, &[
+            0xDB, 0xE3,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert_eq!(cpu.fpu.control, 0x037F);
+        assert_eq!(cpu.fpu.tag, 0xFFFF); // all empty
+    }
+
+    #[test]
+    fn fstsw_ax_reports_status() {
+        let mut cpu = Cpu::new();
+        cpu.fpu.status = 0x3800;
+        // fnstsw ax (DF E0) ; hlt
+        load(&mut cpu, &[
+            0xDF, 0xE0,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert_eq!(cpu.ax, 0x3800);
+    }
+
+    #[test]
+    fn fld_push_and_fstp_store() {
+        let mut cpu = Cpu::new();
+        cpu.ds = 0;
+        // fld qword [0x1000] (DD 06 disp16) ; fstp qword [0x2000] (DD 1E) ; hlt
+        cpu.mem.write_f64(0x1000, 3.14159);
+        load(&mut cpu, &[
+            0xDD, 0x06, 0x00, 0x10, // fld qword [0x1000]
+            0xDD, 0x1E, 0x00, 0x20, // fstp qword [0x2000]
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert!((cpu.mem.read_f64(0x2000) - 3.14159).abs() < 1e-9);
+        assert_eq!(cpu.fpu.tag, 0xFFFF); // popped back to empty
+    }
+
+    #[test]
+    fn fild_fistp_integer_roundtrip() {
+        let mut cpu = Cpu::new();
+        cpu.ds = 0;
+        // fild dword [0x1000] (DB 06) ; fistp dword [0x2000] (DB 1E) ; hlt
+        cpu.mem.write_u32(0x1000, 42);
+        load(&mut cpu, &[
+            0xDB, 0x06, 0x00, 0x10,
+            0xDB, 0x1E, 0x00, 0x20,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert_eq!(cpu.mem.read_u32(0x2000), 42);
+    }
+
+    #[test]
+    fn fadd_st0_with_memory() {
+        let mut cpu = Cpu::new();
+        cpu.ds = 0;
+        cpu.fpu.push(1.5);
+        cpu.mem.write_f64(0x1000, 2.5);
+        // fadd qword [0x1000] (DC 06) ; hlt
+        load(&mut cpu, &[
+            0xDC, 0x06, 0x00, 0x10,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert!((cpu.fpu.st_i(0) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fxsave_fxrstor_roundtrip() {
+        let mut cpu = Cpu::new();
+        cpu.ds = 0;
+        cpu.fpu.push(1.25);
+        cpu.fpu.push(2.5);
+        // fxsave [0x3000] (0F AE 06 disp16) ; fxrstor [0x3000] (0F AE 0E) ; hlt
+        load(&mut cpu, &[
+            0x0F, 0xAE, 0x06, 0x00, 0x30,
+            0x0F, 0xAE, 0x0E, 0x00, 0x30,
+            0xF4,
+        ]);
+        cpu.run(16);
+        // After fxrstor, the FPU should have the saved registers back.
+        // Two pushes: top=6, so st[7] and st[6] are valid (tag bits 7,6 clear).
+        assert_eq!(cpu.fpu.tag, 0xFF3F);
+        assert!((cpu.fpu.st_i(0) - 2.5).abs() < 1e-9);
     }
 
     // ---- Paging tests ----

@@ -174,6 +174,8 @@ pub struct Cpu {
     pub dma: crate::dma::Dma,
     /// IDE/ATA disk controller.
     pub ide: crate::ide::Ide,
+    /// x87 FPU.
+    pub fpu: crate::fpu::Fpu,
 }
 
 impl Cpu {
@@ -212,6 +214,7 @@ impl Cpu {
             kbd: crate::kbd::Kbd::new(),
             dma: crate::dma::Dma::new(),
             ide: crate::ide::Ide::new(),
+            fpu: crate::fpu::Fpu::new(),
             pending_exception: None,
         }
     }

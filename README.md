@@ -70,6 +70,12 @@ Linux kernel image (buildroot bzImage, extracted from the copy/images
   - Bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB and group 8
     `0x0F 0xBA` /4-/7), 16/32-bit.
   - `TEST AL/AX/EAX, imm` (0xA8/0xA9).
+  - **x87 FPU** (`src/fpu.rs`): the D8-DF escape opcodes — `FNINIT`,
+    `FSTCW`/`FLDCW`, `FSTSW` (AX and m16), `FLD`/`FST`/`FSTP` (m32/m64 and
+    ST(i)), `FILD`/`FISTP` (m16/m32), simplified `FADD/FSUB/FMUL/FDIV`
+    (ST0 op m), and `FXSAVE`/`FXRSTOR` (0x0F 0xAE /0 and /1). The FPU has
+    the control/status/tag words and eight 80-bit data registers (stored as
+    `f64`). Enough for the Linux kernel's early FPU probing.
 - **Linux boot-protocol loader** (`src/boot.rs`): parses a bzImage setup
   header, loads the protected-mode kernel at `code32_start`, builds a
   `boot_params` structure at `0x90000` (setup header, E820 memory map,
@@ -155,6 +161,7 @@ src/
   dma.rs          — 8237 DMA controller (4 channels, page registers)
   ide.rs          — IDE/ATA disk controller (PIO, LBA28, IRQ14)
   boot.rs         — Linux boot-protocol loader (parse bzImage, load kernel, boot_params)
+  fpu.rs          — x87 FPU: control/status/tag words, 8 data registers, D8-DF instructions
   bios.rs         — minimal BIOS: INT 0x10/0x15/0x16/0x13 handlers + text screen
   main.rs         — CLI binary: load a .bin and run it, --boot a boot sector, or --kernel a bzImage
 examples/
@@ -246,4 +253,13 @@ Hello from x86emu!
    dispatches through the empty IDT and loops forever. This is now handled
    with **triple-fault detection** — the CPU halts cleanly with a diagnostic
    instead of looping — which is the correct behavior (a real CPU resets on
-   a triple fault). It has not yet reached console output.
+   a triple fault). The RAM was grown to 256 MiB (with `Memory::SIZE` as the
+   single source of truth that the E820/E801/0x88 map and `boot_params`
+   derive from, so scaling is a one-line change). The kernel now gets
+   through page-table setup, paging enablement, and CPU feature detection
+   (CPUID/RDTSC/RDMSR/CLTS), and the missing instructions it needs have
+   been added: 32-bit `LOOP`/`Jcc`/`JMP rel8` using `eip`, 32-bit string
+   ops using `ecx`/`esi`/`edi`, `TEST r/m,r` (0x84/0x85), `LDS/LES/LSS/
+   LFS/LGS`, 32-bit `MOV moffs` following the address size, and the **x87
+   FPU** (D8-DF) for the kernel's early FPU probing. It has not yet reached
+   console output.

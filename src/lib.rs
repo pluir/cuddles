@@ -19,6 +19,7 @@ pub mod kbd;
 pub mod dma;
 pub mod ide;
 pub mod boot;
+pub mod fpu;
 
 pub use cpu::Cpu;
 pub use memory::Memory;

@@ -4,6 +4,9 @@
 # Downloaded OS images (large binaries, not source)
 /images/*.iso
 /images/*.bin
+# Symbol table extracted from a kernel image (derived; regenerate with
+# tools/kallsyms.py)
+/images/*.syms
 
 # Scratch debugging scripts used while chasing the Linux boot
 /images/dump*.py

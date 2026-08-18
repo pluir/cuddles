@@ -39,6 +39,19 @@ pub struct Pit {
     pub ch2_access: u8,
     pub ch2_lsb_pending: bool,
     pub ch2_lsb: u8,
+    /// Channel 2's GATE input, driven by bit 0 of port 0x61.
+    pub ch2_gate: bool,
+    /// Channel 2's OUT line, visible as bit 5 of port 0x61. In mode 0 it is
+    /// low from the moment a count is loaded and goes high when the count
+    /// reaches terminal, which is the edge the kernel's PIT-based TSC
+    /// calibration spins on.
+    pub ch2_out: bool,
+    /// Bit 1 of port 0x61: the speaker data line. Stored so a read-back
+    /// returns what was written.
+    pub speaker_on: bool,
+    /// Bit 4 of port 0x61 toggles every DRAM refresh cycle. Firmware and
+    /// some timing loops watch it for motion.
+    pub refresh_toggle: bool,
     // IRQ0 output, asserted when channel 0 wraps. The PIC latches the edge.
     pub irq0: bool,
     // State set by the most recent control word.
@@ -57,6 +70,8 @@ impl Pit {
             ch1_lsb_pending: false, ch1_lsb: 0,
             ch2_count: 0, ch2_reload: 0, ch2_mode: 3, ch2_access: 3,
             ch2_lsb_pending: false, ch2_lsb: 0,
+            ch2_gate: false, ch2_out: false, speaker_on: false,
+            refresh_toggle: false,
             irq0: false,
             active_channel: 0, active_access: 3, active_mode: 3, active_bcd: false,
         }
@@ -135,19 +150,37 @@ impl Pit {
 
     fn write_ch2(&mut self, val: u8) {
         match self.ch2_access {
-            1 => { self.ch2_reload = (self.ch2_reload & 0xFF00) | val as u16; self.ch2_count = self.ch2_reload; }
-            2 => { self.ch2_reload = (self.ch2_reload & 0x00FF) | ((val as u16) << 8); self.ch2_count = self.ch2_reload; }
+            1 => { self.ch2_reload = (self.ch2_reload & 0xFF00) | val as u16; self.ch2_count = self.ch2_reload; self.ch2_out = false; }
+            2 => { self.ch2_reload = (self.ch2_reload & 0x00FF) | ((val as u16) << 8); self.ch2_count = self.ch2_reload; self.ch2_out = false; }
             _ => {
                 if self.ch2_lsb_pending {
                     self.ch2_reload = (self.ch2_lsb as u16) | ((val as u16) << 8);
                     self.ch2_count = self.ch2_reload;
                     self.ch2_lsb_pending = false;
+                    // Loading a new count restarts the countdown with OUT low.
+                    self.ch2_out = false;
                 } else {
                     self.ch2_lsb = val;
                     self.ch2_lsb_pending = true;
                 }
             }
         }
+    }
+
+    /// Port 0x61 (system control port B) read: the speaker/gate bits back,
+    /// the refresh toggle, and channel 2's OUT line.
+    pub fn read_port61(&mut self) -> u8 {
+        self.refresh_toggle = !self.refresh_toggle;
+        (self.ch2_gate as u8)
+            | ((self.speaker_on as u8) << 1)
+            | ((self.refresh_toggle as u8) << 4)
+            | ((self.ch2_out as u8) << 5)
+    }
+
+    /// Port 0x61 write: bit 0 gates channel 2, bit 1 enables the speaker.
+    pub fn write_port61(&mut self, val: u8) {
+        self.ch2_gate = val & 1 != 0;
+        self.speaker_on = val & 2 != 0;
     }
 
     /// Read a data byte from a channel (ports 0x40-0x42). Returns the
@@ -213,9 +246,17 @@ impl Pit {
             self.ch1_count = self.ch1_count.saturating_sub(cycles as u16);
             if self.ch1_count == 0 { self.ch1_count = self.ch1_reload; }
         }
-        if self.ch2_count > 0 {
-            self.ch2_count = self.ch2_count.saturating_sub(cycles as u16);
-            if self.ch2_count == 0 { self.ch2_count = self.ch2_reload; }
+        // Channel 2 counts only while its gate is high. Reaching terminal
+        // count raises OUT and, in mode 0, leaves it there until a new count
+        // is written -- the level the calibration loop is waiting for.
+        if self.ch2_gate && !self.ch2_out {
+            let c = self.ch2_count as u64;
+            if c <= cycles {
+                self.ch2_count = 0;
+                self.ch2_out = true;
+            } else {
+                self.ch2_count = (c - cycles) as u16;
+            }
         }
     }
 }

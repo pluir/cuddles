@@ -12,6 +12,7 @@ pub mod instructions;
 pub mod bios;
 pub mod protected;
 pub mod paging;
+pub mod cmos;
 pub mod pit;
 pub mod pic;
 pub mod vga;

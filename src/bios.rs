@@ -74,8 +74,8 @@ impl Bios {
             0x13 => { // write string: ES:BP = string, CX = length, DH/DL = row/col
                 let row = cpu.reg8(Reg8::Dh) as usize;
                 let col = cpu.reg8(Reg8::Dl) as usize;
-                let len = cpu.cx as usize;
-                let base = Memory::phys(cpu.es, cpu.bp);
+                let len = cpu.cx() as usize;
+                let base = Memory::phys(cpu.es, cpu.bp());
                 for i in 0..len {
                     let ch = cpu.mem.read_u8(base + i);
                     self.put_char_at(cpu, row, col + i, ch);
@@ -166,7 +166,7 @@ impl Bios {
             return;
         }
         let (base, len, typ) = ENTRIES[cont];
-        let buf = Memory::phys(cpu.es, cpu.di);
+        let buf = Memory::phys(cpu.es, cpu.di());
         cpu.mem.write_u64(buf, base);
         cpu.mem.write_u64(buf + 8, len);
         cpu.mem.write_u32(buf + 16, typ);
@@ -181,13 +181,13 @@ impl Bios {
         // Extended memory below 16 MiB in KB (15 MiB = 15360 KB), and above
         // 16 MiB in 64 KiB units, derived from `Memory::SIZE`.
         let ext_kb: u16 = 15 * 1024;
-        cpu.ax = ext_kb;
-        cpu.cx = ext_kb;
+        cpu.set_ax(ext_kb);
+        cpu.set_cx(ext_kb);
         // (SIZE - 16 MiB) / 64 KiB units.
         let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
         let units = (above_16m / (64 << 10)) as u16;
-        cpu.bx = units;
-        cpu.dx = units;
+        cpu.set_bx(units);
+        cpu.set_dx(units);
     }
 
     fn mem88(&mut self, cpu: &mut Cpu) {
@@ -195,7 +195,7 @@ impl Bios {
         // 16-bit value, so it saturates at 65535 KB (~64 MiB); real BIOSes
         // report 0xFFFF when extended memory exceeds that. Linux uses E820 /
         // E801 for the full map.
-        cpu.ax = 0xFFFF;
+        cpu.set_ax(0xFFFF);
     }
 
     // ---- INT 0x16: keyboard services (AH = function) ----
@@ -234,7 +234,7 @@ impl Bios {
                 let sector = cpu.reg8(Reg8::Cl) as usize; // 1-based
                 let head = cpu.reg8(Reg8::Dh) as usize;
                 let lba = ((cyl * 2 + head) * 18 + (sector - 1)) * 512;
-                let buf = Memory::phys(cpu.es, cpu.bx);
+                let buf = Memory::phys(cpu.es, cpu.bx());
                 if cpu.ide.present && lba + count * 512 <= cpu.ide.disk.len() {
                     for i in 0..count * 512 {
                         cpu.mem.write_u8(buf + i, cpu.ide.disk[lba + i]);
@@ -250,7 +250,7 @@ impl Bios {
                 let sector = cpu.reg8(Reg8::Cl) as usize;
                 let head = cpu.reg8(Reg8::Dh) as usize;
                 let lba = ((cyl * 2 + head) * 18 + (sector - 1)) * 512;
-                let buf = Memory::phys(cpu.es, cpu.bx);
+                let buf = Memory::phys(cpu.es, cpu.bx());
                 if cpu.ide.present && lba + count * 512 <= cpu.ide.disk.len() {
                     for i in 0..count * 512 {
                         cpu.ide.disk[lba + i] = cpu.mem.read_u8(buf + i);
@@ -314,7 +314,7 @@ mod tests {
     fn disk_read_sector() {
         let mut cpu = Cpu::new();
         cpu.es = 0;
-        cpu.bx = 0x1000;
+        cpu.set_bx(0x1000);
         // Disk: sector 2 (offset 512) holds a marker.
         let mut disk = vec![0u8; 512 * 3];
         disk[512..512 + 4].copy_from_slice(b"DATA");
@@ -334,7 +334,7 @@ mod tests {
     fn e820_reports_memory_map() {
         let mut cpu = Cpu::new();
         cpu.es = 0;
-        cpu.di = 0x2000;
+        cpu.set_di(0x2000);
         // E820 call: eax=0x0000E820, edx='SMAP', ebx=0 (first entry),
         // ecx=24 (buffer size), es:di = buffer. The program sets eax/edx
         // via movs; ebx/ecx are pre-set here.
@@ -365,7 +365,7 @@ mod tests {
     fn e820_iterates_entries() {
         let mut cpu = Cpu::new();
         cpu.es = 0;
-        cpu.di = 0x2000;
+        cpu.set_di(0x2000);
         cpu.edx = 0x534D_4150;
         cpu.ebx = 3; // fourth entry (extended memory)
         cpu.ecx = 24;
@@ -395,13 +395,13 @@ mod tests {
         ]);
         cpu.run(16);
         // 15 MiB of extended memory below 16 MiB = 15360 KB in both AX and CX.
-        assert_eq!(cpu.ax, 15 * 1024);
-        assert_eq!(cpu.cx, 15 * 1024);
+        assert_eq!(cpu.ax(), 15 * 1024);
+        assert_eq!(cpu.cx(), 15 * 1024);
         // Memory above 16 MiB: (SIZE - 16 MiB) / 64 KiB units.
         let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
         let units = (above_16m / (64 << 10)) as u16;
-        assert_eq!(cpu.bx, units);
-        assert_eq!(cpu.dx, units);
+        assert_eq!(cpu.bx(), units);
+        assert_eq!(cpu.dx(), units);
     }
 
     #[test]
@@ -414,7 +414,7 @@ mod tests {
         ]);
         cpu.run(16);
         // 0x88 saturates at 0xFFFF KB (16-bit return) for >64 MiB extended.
-        assert_eq!(cpu.ax, 0xFFFF);
+        assert_eq!(cpu.ax(), 0xFFFF);
     }
 
     #[test]

@@ -61,8 +61,55 @@ pub enum Inst {
     PopReg16 { dst: Reg16 },
     PushReg32 { src: Reg32 },
     PopReg32 { dst: Reg32 },
+    // Two- and three-operand IMUL: 0F AF (r <- r * r/m) and 69/6B
+    // (r <- r/m * imm). Both set CF/OF when the full product does not fit
+    // in the destination; the stored result is the truncated low half.
+    ImulRegRm16 { m: ModRm, dst: u8 },
+    ImulRegRm32 { m: ModRm, dst: u8 },
+    ImulRegRmImm16 { m: ModRm, dst: u8, imm: i16 },
+    ImulRegRmImm32 { m: ModRm, dst: u8, imm: i32 },
+    // Double-precision shifts: SHLD (0F A4/A5) and SHRD (0F AC/AD).
+    Shld { m: ModRm, reg: u8, count: ShiftCount, w32: bool },
+    Shrd { m: ModRm, reg: u8, count: ShiftCount, w32: bool },
+    // SETcc r/m8 (0F 90-9F): store 1 if the condition holds, else 0.
+    Setcc { cond: Cond, m: ModRm },
+    // LEAVE (0xC9): tear down a stack frame — ESP = EBP, then pop EBP.
+    // Bit scan forward/reverse (0F BC / 0F BD).
+    Bsf { m: ModRm, dst: u8, w32: bool },
+    Bsr { m: ModRm, dst: u8, w32: bool },
+    // XCHG r/m, r (0x86 byte / 0x87 word-dword).
+    XchgRmReg { m: ModRm, reg: u8, width: u32 },
+    // CMPXCHG r/m, r (0F B0 byte / 0F B1 word-dword).
+    Cmpxchg { m: ModRm, reg: u8, width: u32 },
+    // XADD r/m, r (0F C0 byte / 0F C1 word-dword).
+    Xadd { m: ModRm, reg: u8, width: u32 },
+    // CMPXCHG8B m64 (0F C7 /1).
+    Cmpxchg8b { m: ModRm },
+    // BSWAP r32 (0F C8+r).
+    Bswap { reg: u8 },
+    // CMOVcc r, r/m (0F 40-4F).
+    Cmovcc { cond: Cond, m: ModRm, dst: u8, w32: bool },
+    // PUSH/POP a segment register. The one-byte forms cover ES/CS/SS/DS
+    // (0x06/0x0E/0x16/0x1E push, 0x07/0x17/0x1F pop -- there is no POP CS);
+    // FS/GS use the two-byte forms 0F A0/A1 and 0F A8/A9.
+    PushSeg { seg: SegReg },
+    PopSeg { seg: SegReg },
+    // MOV r32, DRx (0F 21) / MOV DRx, r32 (0F 23).
+    MovDr { dr: u8, reg: u8 },
+    MovToDr { dr: u8, reg: u8 },
+    // 0F 00 group: LLDT (/2), LTR (/3), SLDT (/0), STR (/1).
+    Lldt { m: ModRm },
+    Ltr { m: ModRm },
+    Sldt { m: ModRm },
+    Str { m: ModRm },
+    Leave { w32: bool },
+    // POP r/m16 / r/m32 (0x8F /0).
+    PopRm16 { m: ModRm },
+    PopRm32 { m: ModRm },
+    // PUSHA/PUSHAD (0x60) and POPA/POPAD (0x61).
+    Pusha { w32: bool },
+    Popa { w32: bool },
     PushImm16 { imm: u16 },
-    PushImm8 { imm: u8 },
     PushImm32 { imm: u32 },
     JmpRel8 { rel: i8 },
     JmpRel16 { rel: i16 },
@@ -80,6 +127,8 @@ pub enum Inst {
     CallRel32 { rel: i32 },
     Ret,
     Ret32,
+    // RET imm16 (0xC2): return, then drop `imm` bytes of arguments.
+    RetImm { imm: u16, w32: bool },
     XchgAxReg { reg: Reg16 },
     XchgEaxReg { reg: Reg32 },
     Int { vector: u8 },
@@ -89,10 +138,11 @@ pub enum Inst {
     Iret32,
     Pushf,
     Popf,
-    // Shifts / rotates (group 2, 0xD0-0xD3)
-    Shift { op: ShiftOp, m: ModRm, w: bool, count: ShiftCount },
+    // Shifts / rotates (group 2, 0xD0-0xD3). `width` is 8, 16 or 32 — a
+    // bool here is what let the 32-bit form silently run as an 8-bit shift.
+    Shift { op: ShiftOp, m: ModRm, width: u32, count: ShiftCount },
     // Shifts / rotates with imm8 count (group 2, 0xC0-0xC1)
-    ShiftImm { op: ShiftOp, m: ModRm, w: bool, imm: u8 },
+    ShiftImm { op: ShiftOp, m: ModRm, width: u32, imm: u8 },
     // Group 3 (0xF6/0xF7): TEST / NOT / NEG / MUL / IMUL / DIV / IDIV
     TestRm8Imm { m: ModRm, imm: u8 },
     TestRm16Imm { m: ModRm, imm: u16 },
@@ -138,6 +188,9 @@ pub enum Inst {
     Retf,
     Retf32,
     // Group 5 (0xFF): INC / DEC / CALL / JMP / PUSH r/m
+    // INC/DEC r/m8 (group 4, 0xFE /0 and /1).
+    IncRm8 { m: ModRm },
+    DecRm8 { m: ModRm },
     IncRm16 { m: ModRm },
     IncRm32 { m: ModRm },
     DecRm16 { m: ModRm },
@@ -171,10 +224,10 @@ pub enum Inst {
     Rdmsr,
     Wrmsr,
     // Bit tests: BT/BTS/BTR/BTC (0F A3/AB/B3/BB, and group 8 0F BA /4-/7)
-    Bt { m: ModRm, bit: u8 },
-    Bts { m: ModRm, bit: u8 },
-    Btr { m: ModRm, bit: u8 },
-    Btc { m: ModRm, bit: u8 },
+    Bt { m: ModRm, bit: BitOffset },
+    Bts { m: ModRm, bit: BitOffset },
+    Btr { m: ModRm, bit: BitOffset },
+    Btc { m: ModRm, bit: BitOffset },
     // IN / OUT (0xE4-0xE7, 0xEC-0xEF)
     InAlImm { port: u8 },
     InAxImm { port: u8 },
@@ -202,10 +255,10 @@ pub enum Inst {
     FstswAx,
     Fstsw { m: ModRm },
     // FST/FSTP ST(i) (DD /0, /1)
-    Fst { m: ModRm },
-    Fstp { m: ModRm },
+    Fst { m: ModRm, w64: bool },
+    Fstp { m: ModRm, w64: bool },
     // FLD m32/m64 (D9 /0, DD /0)
-    Fld { m: ModRm },
+    Fld { m: ModRm, w64: bool },
     // FILD m16/m32 (DF /0, DB /0)
     Fild { m: ModRm },
     // FISTP m16/m32 (DF /3, DB /3)
@@ -215,12 +268,23 @@ pub enum Inst {
     // FXSAVE (0F AE /0) / FXRSTOR (0F AE /1)
     Fxsave { m: ModRm },
     Fxrstor { m: ModRm },
-    Unknown { opcode: u8 },
+    Unknown { opcode: u16 },
 }
 
 /// x87 arithmetic operation (simplified: ST0 op m).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FpuOp { Add, Sub, Mul, Div }
+
+/// Where a bit-test instruction's bit offset comes from.
+///
+/// The register form (0F A3/AB/B3/BB) takes the *value* of the register named
+/// by the ModR/M reg field, not the field itself; reading the index instead
+/// makes every `test_bit()` in the kernel answer from the wrong bit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BitOffset {
+    Imm(u8),
+    Reg(u8),
+}
 
 /// Shift/rotate operation selected by the `reg` field of group 2.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -237,7 +301,7 @@ impl ShiftOp {
 
 /// Shift count source: immediate 1, or the CL register.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ShiftCount { One, Cl }
+pub enum ShiftCount { One, Cl, Imm(u8) }
 
 /// REP prefix state for string instructions.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,6 +387,11 @@ pub fn decode(cpu: &mut Cpu) -> Inst {
     loop {
         let peek = cpu.peek_u8();
         match peek {
+            // LOCK. This is a uniprocessor emulator with no concurrent bus
+            // master, so the prefix is consumed and the instruction runs
+            // normally -- but it must be consumed, or `lock cmpxchg` decodes
+            // 0xF0 as an opcode and faults.
+            0xF0 => { cpu.fetch_u8(); }
             0xF3 => { rep = Rep::Repe; cpu.fetch_u8(); }
             0xF2 => { rep = Rep::Repne; cpu.fetch_u8(); }
             0x66 => { cpu.opsize = !cpu.opsize; cpu.fetch_u8(); }
@@ -406,8 +475,64 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0x50..=0x57 => { if w32 { Inst::PushReg32 { src: Reg::reg32(op - 0x50) } } else { Inst::PushReg16 { src: Reg::reg16(op - 0x50) } } }
         0x58..=0x5F => { if w32 { Inst::PopReg32 { dst: Reg::reg32(op - 0x58) } } else { Inst::PopReg16 { dst: Reg::reg16(op - 0x58) } } }
 
+        // IMUL r, r/m, imm (0x69 imm16/32, 0x6B imm8 sign-extended)
+        0x69 => {
+            let m = cpu.fetch_modrm();
+            if w32 {
+                let imm = cpu.fetch_u32() as i32;
+                Inst::ImulRegRmImm32 { m, dst: m.reg, imm }
+            } else {
+                let imm = cpu.fetch_u16() as i16;
+                Inst::ImulRegRmImm16 { m, dst: m.reg, imm }
+            }
+        }
+        0x6B => {
+            let m = cpu.fetch_modrm();
+            let imm = cpu.fetch_u8() as i8;
+            if w32 { Inst::ImulRegRmImm32 { m, dst: m.reg, imm: imm as i32 } }
+            else { Inst::ImulRegRmImm16 { m, dst: m.reg, imm: imm as i16 } }
+        }
+
+        // LEAVE (0xC9)
+        0xC9 => Inst::Leave { w32 },
+        // RET imm16 (0xC2)
+        0xC2 => { let imm = cpu.fetch_u16(); Inst::RetImm { imm, w32 } }
+
+        // PUSH/POP segment register (one-byte forms). POP CS does not exist.
+        0x06 => Inst::PushSeg { seg: SegReg::Es },
+        0x07 => Inst::PopSeg { seg: SegReg::Es },
+        0x0E => Inst::PushSeg { seg: SegReg::Cs },
+        0x16 => Inst::PushSeg { seg: SegReg::Ss },
+        0x17 => Inst::PopSeg { seg: SegReg::Ss },
+        0x1E => Inst::PushSeg { seg: SegReg::Ds },
+        0x1F => Inst::PopSeg { seg: SegReg::Ds },
+
+        // XCHG r/m, r (0x86 / 0x87)
+        0x86 => { let m = cpu.fetch_modrm(); Inst::XchgRmReg { m, reg: m.reg, width: 8 } }
+        0x87 => { let m = cpu.fetch_modrm(); Inst::XchgRmReg { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+
+        // POP r/m (0x8F). Only /0 is defined; other /reg values are invalid.
+        0x8F => {
+            let m = cpu.fetch_modrm();
+            if m.reg & 7 == 0 {
+                if w32 { Inst::PopRm32 { m } } else { Inst::PopRm16 { m } }
+            } else {
+                Inst::Unknown { opcode: 0x008F }
+            }
+        }
+
+        // PUSHA/PUSHAD (0x60), POPA/POPAD (0x61)
+        0x60 => Inst::Pusha { w32 },
+        0x61 => Inst::Popa { w32 },
+
         // PUSH imm8 (0x6A) / PUSH imm16 (0x68) / PUSH imm32 (0x68 w/ 66)
-        0x6A => Inst::PushImm8 { imm: cpu.fetch_u8() },
+        // PUSH imm8: the immediate is sign-extended to the *operand size*,
+        // so in 32-bit mode this pushes four bytes, not two.
+        0x6A => {
+            let imm = cpu.fetch_u8();
+            if w32 { Inst::PushImm32 { imm: imm as i8 as i32 as u32 } }
+            else { Inst::PushImm16 { imm: imm as i8 as i16 as u16 } }
+        }
         0x68 => { if w32 { Inst::PushImm32 { imm: cpu.fetch_u32() } } else { Inst::PushImm16 { imm: cpu.fetch_u16() } } }
 
         // Jcc rel8 (0x70-0x7F)
@@ -490,14 +615,14 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
 
         // Group 2 shifts/rotates: 0xD0 (r/m8, 1), 0xD1 (r/m16/32, 1),
         // 0xD2 (r/m8, CL), 0xD3 (r/m16/32, CL)
-        0xD0 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, w: false, count: ShiftCount::One } }
-        0xD1 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, w: !w32, count: ShiftCount::One } }
-        0xD2 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, w: false, count: ShiftCount::Cl } }
-        0xD3 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, w: !w32, count: ShiftCount::Cl } }
+        0xD0 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: 8, count: ShiftCount::One } }
+        0xD1 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, count: ShiftCount::One } }
+        0xD2 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: 8, count: ShiftCount::Cl } }
+        0xD3 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, count: ShiftCount::Cl } }
         // Group 2 shifts/rotates with imm8 count: 0xC0 (r/m8, imm8),
         // 0xC1 (r/m16/32, imm8)
-        0xC0 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, w: false, imm } }
-        0xC1 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, w: !w32, imm } }
+        0xC0 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, width: 8, imm } }
+        0xC1 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, imm } }
 
         // CALL rel16/32 (0xE8)
         0xE8 => { if w32 { Inst::CallRel32 { rel: cpu.fetch_u32() as i32 } } else { Inst::CallRel16 { rel: cpu.fetch_u16() as i16 } } }
@@ -568,6 +693,16 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         }
 
         // Group 5 (0xFF): INC / DEC / CALL / JMP / PUSH r/m
+        // Group 4 (0xFE): INC /0 and DEC /1 on a byte operand.
+        0xFE => {
+            let m = cpu.fetch_modrm();
+            match m.reg & 7 {
+                0 => Inst::IncRm8 { m },
+                1 => Inst::DecRm8 { m },
+                _ => Inst::Unknown { opcode: 0x00FE },
+            }
+        }
+
         0xFF => {
             let m = cpu.fetch_modrm();
             match m.reg & 7 {
@@ -576,7 +711,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 2 => { if w32 { Inst::CallRm32 { m } } else { Inst::CallRm16 { m } } }
                 4 => { if w32 { Inst::JmpRm32 { m } } else { Inst::JmpRm16 { m } } }
                 6 => { if w32 { Inst::PushRm32 { m } } else { Inst::PushRm16 { m } } }
-                _ => Inst::Unknown { opcode: 0xFF },
+                _ => Inst::Unknown { opcode: 0x00FF },
             }
         }
 
@@ -656,16 +791,23 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                         2 => Inst::Lgdt { m },
                         3 => Inst::Lidt { m },
                         7 => Inst::Invlpg { m },
-                        _ => Inst::Unknown { opcode: 0x0F },
+                        _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
                     }
                 }
                 // 0F 00 group: SLDT (/0), STR (/1), LLDT (/2), LTR (/3).
-                // LLDT/LTR load the local descriptor table / task register;
-                // we don't model them, so consume the ModR/M and treat as
-                // no-ops. SLDT/STR would store them, also no-ops for boot.
+                // LTR is load-bearing once user mode exists: the TSS it names
+                // holds the ring-0 stack an interrupt from CPL 3 switches to.
                 0x00 => {
-                    let _m = cpu.fetch_modrm();
-                    Inst::Nop
+                    let m = cpu.fetch_modrm();
+                    match m.reg & 7 {
+                        0 => Inst::Sldt { m },
+                        1 => Inst::Str { m },
+                        2 => Inst::Lldt { m },
+                        3 => Inst::Ltr { m },
+                        // /4 VERR and /5 VERW: segment access checks this
+                        // emulator does not enforce, so they do nothing.
+                        _ => Inst::Nop,
+                    }
                 }
                 // 0F 80-8F: Jcc rel32 (32-bit conditional jumps). Same
                 // conditions as the 0x70-0x7F rel8 forms.
@@ -709,10 +851,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0x32 => Inst::Rdmsr,
                 0x30 => Inst::Wrmsr,
                 // Bit tests: BT/BTS/BTR/BTC with register operand
-                0xA3 => { let m = cpu.fetch_modrm(); Inst::Bt { m, bit: m.reg } }
-                0xAB => { let m = cpu.fetch_modrm(); Inst::Bts { m, bit: m.reg } }
-                0xB3 => { let m = cpu.fetch_modrm(); Inst::Btr { m, bit: m.reg } }
-                0xBB => { let m = cpu.fetch_modrm(); Inst::Btc { m, bit: m.reg } }
+                0xA3 => { let m = cpu.fetch_modrm(); Inst::Bt { m, bit: BitOffset::Reg(m.reg) } }
+                0xAB => { let m = cpu.fetch_modrm(); Inst::Bts { m, bit: BitOffset::Reg(m.reg) } }
+                0xB3 => { let m = cpu.fetch_modrm(); Inst::Btr { m, bit: BitOffset::Reg(m.reg) } }
+                0xBB => { let m = cpu.fetch_modrm(); Inst::Btc { m, bit: BitOffset::Reg(m.reg) } }
                 // Load segment with pointer: LSS (0F B2) / LFS (0F B4) / LGS (0F B5)
                 0xB2 => { let m = cpu.fetch_modrm(); Inst::Lss { m } }
                 0xB4 => { let m = cpu.fetch_modrm(); Inst::Lfs { m } }
@@ -722,21 +864,93 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                     let m = cpu.fetch_modrm();
                     let imm = cpu.fetch_u8();
                     match m.reg & 7 {
-                        4 => Inst::Bt { m, bit: imm },
-                        5 => Inst::Bts { m, bit: imm },
-                        6 => Inst::Btr { m, bit: imm },
-                        _ => Inst::Btc { m, bit: imm },
+                        4 => Inst::Bt { m, bit: BitOffset::Imm(imm) },
+                        5 => Inst::Bts { m, bit: BitOffset::Imm(imm) },
+                        6 => Inst::Btr { m, bit: BitOffset::Imm(imm) },
+                        _ => Inst::Btc { m, bit: BitOffset::Imm(imm) },
                     }
                 }
-                // FXSAVE (0F AE /0) / FXRSTOR (0F AE /1)
+                // IMUL r16/32, r/m (0F AF)
+                0xAF => {
+                    let m = cpu.fetch_modrm();
+                    if w32 { Inst::ImulRegRm32 { m, dst: m.reg } }
+                    else { Inst::ImulRegRm16 { m, dst: m.reg } }
+                }
+                // SHLD/SHRD, by imm8 (0F A4 / 0F AC) or by CL (0F A5 / 0F AD)
+                0xA4 => {
+                    let m = cpu.fetch_modrm();
+                    let imm = cpu.fetch_u8();
+                    Inst::Shld { m, reg: m.reg, count: ShiftCount::Imm(imm), w32 }
+                }
+                0xA5 => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Shld { m, reg: m.reg, count: ShiftCount::Cl, w32 }
+                }
+                0xAC => {
+                    let m = cpu.fetch_modrm();
+                    let imm = cpu.fetch_u8();
+                    Inst::Shrd { m, reg: m.reg, count: ShiftCount::Imm(imm), w32 }
+                }
+                0xAD => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Shrd { m, reg: m.reg, count: ShiftCount::Cl, w32 }
+                }
+                // PUSH/POP FS and GS (0F A0/A1, 0F A8/A9)
+                0xA0 => Inst::PushSeg { seg: SegReg::Fs },
+                0xA1 => Inst::PopSeg { seg: SegReg::Fs },
+                0xA8 => Inst::PushSeg { seg: SegReg::Gs },
+                0xA9 => Inst::PopSeg { seg: SegReg::Gs },
+                // MOV r32, DRx (0F 21) / MOV DRx, r32 (0F 23)
+                0x21 => { let m = cpu.fetch_modrm(); Inst::MovDr { dr: m.reg & 7, reg: m.rm & 7 } }
+                0x23 => { let m = cpu.fetch_modrm(); Inst::MovToDr { dr: m.reg & 7, reg: m.rm & 7 } }
+                // Bit scan forward / reverse (0F BC / 0F BD)
+                0xBC => { let m = cpu.fetch_modrm(); Inst::Bsf { m, dst: m.reg, w32 } }
+                0xBD => { let m = cpu.fetch_modrm(); Inst::Bsr { m, dst: m.reg, w32 } }
+                // CMPXCHG (0F B0 / 0F B1)
+                0xB0 => { let m = cpu.fetch_modrm(); Inst::Cmpxchg { m, reg: m.reg, width: 8 } }
+                0xB1 => { let m = cpu.fetch_modrm(); Inst::Cmpxchg { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+                // XADD (0F C0 / 0F C1)
+                0xC0 => { let m = cpu.fetch_modrm(); Inst::Xadd { m, reg: m.reg, width: 8 } }
+                0xC1 => { let m = cpu.fetch_modrm(); Inst::Xadd { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+                // CMPXCHG8B m64 (0F C7 /1)
+                0xC7 => {
+                    let m = cpu.fetch_modrm();
+                    if m.reg & 7 == 1 { Inst::Cmpxchg8b { m } }
+                    else { Inst::Unknown { opcode: 0x0FC7 } }
+                }
+                // BSWAP r32 (0F C8+r)
+                0xC8..=0xCF => Inst::Bswap { reg: op2 - 0xC8 },
+                // CMOVcc r, r/m (0F 40-4F)
+                0x40..=0x4F => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Cmovcc { cond: Cond::from_jcc(op2 & 0xF), m, dst: m.reg, w32 }
+                }
+                // Multi-byte NOP (0F 1F /0) and the prefetch/NOP hints
+                // (0F 18-1F): they take a ModR/M and do nothing. GCC pads
+                // with these, so they turn up in ordinary kernel text.
+                0x18..=0x1F => { let _ = cpu.fetch_modrm(); Inst::Nop }
+                // UD2 (0F 0B): an intentional invalid opcode. The kernel's
+                // BUG() macro is exactly this, so it must raise #UD.
+                0x0B => Inst::Unknown { opcode: 0x0F0B },
+                // SETcc r/m8 (0F 90-9F)
+                0x90..=0x9F => {
+                    let m = cpu.fetch_modrm();
+                    Inst::Setcc { cond: Cond::from_jcc(op2 & 0xF), m }
+                }
+                // Group 15 (0F AE): FXSAVE /0, FXRSTOR /1, LDMXCSR /2,
+                // STMXCSR /3, LFENCE /5, MFENCE /6, CLFLUSH /7. The fences
+                // and the cache flush are no-ops on an in-order emulator
+                // with no cache -- but they must decode, because the kernel
+                // patches MFENCE in as its memory barrier.
                 0xAE => {
                     let m = cpu.fetch_modrm();
                     match m.reg & 7 {
                         0 => Inst::Fxsave { m },
-                        _ => Inst::Fxrstor { m },
+                        1 => Inst::Fxrstor { m },
+                        _ => Inst::Nop,
                     }
                 }
-                _ => Inst::Unknown { opcode: 0x0F },
+                _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
             }
         }
 
@@ -746,9 +960,9 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xD9 => {
             let m = cpu.fetch_modrm();
             match m.reg & 7 {
-                0 => Inst::Fld { m },
-                2 => Inst::Fst { m },
-                3 => Inst::Fstp { m },
+                0 => Inst::Fld { m, w64: false },
+                2 => Inst::Fst { m, w64: false },
+                3 => Inst::Fstp { m, w64: false },
                 5 => Inst::Fldcw { m },
                 7 => {
                     // mod=3, rm=4 is FNSTSW AX (D9 E0); otherwise FSTCW.
@@ -762,11 +976,11 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xDD => {
             let m = cpu.fetch_modrm();
             match m.reg & 7 {
-                0 => Inst::Fld { m },
-                2 => Inst::Fst { m },
-                3 => Inst::Fstp { m },
+                0 => Inst::Fld { m, w64: true },
+                2 => Inst::Fst { m, w64: true },
+                3 => Inst::Fstp { m, w64: true },
                 7 => Inst::Fstsw { m },
-                _ => Inst::Fst { m },
+                _ => Inst::Fst { m, w64: true },
             }
         }
         // DB: FILD m32 (/0), FISTP m32 (/3), FNINIT (DB E3).
@@ -827,8 +1041,14 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
             Inst::Fop { op, m }
         }
 
-        _ => Inst::Unknown { opcode: op },
+        _ => Inst::Unknown { opcode: op as u16 },
     }
+}
+
+/// Merge a software-written EFLAGS value onto the current one: only the
+/// writable bits move, and the reserved bits keep their architectural values.
+fn write_flags(old: u32, new: u32) -> u32 {
+    (new & flags::WRITABLE) | flags::ALWAYS_SET | (old & !flags::WRITABLE & !flags::ALWAYS_SET)
 }
 
 fn seg_from_index(i: u8) -> SegReg {
@@ -878,43 +1098,43 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::MovReg16Imm { dst, imm } => cpu.set_reg16(dst, imm),
         Inst::MovReg32Imm { dst, imm } => cpu.set_reg32(dst, imm),
         Inst::MovAccMem8 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr as u32);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
         Inst::MovAccMem8Addr32 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
         Inst::MovMem8Acc { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr as u32);
+            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
         Inst::MovMem8AccAddr32 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate_write(SegReg::Ds, addr);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
         Inst::MovAccMem16 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr as u32);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
         Inst::MovAccMem16Addr32 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
         Inst::MovMem16Acc { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr as u32);
+            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
         Inst::MovMem16AccAddr32 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate_write(SegReg::Ds, addr);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
         Inst::MovAccMem32 { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
             cpu.set_reg32(Reg32::Eax, cpu.mem.read_u32(phys));
         }
         Inst::MovMem32Acc { addr } => {
-            let phys = cpu.translate(SegReg::Ds, addr);
+            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr);
             cpu.mem.write_u32(phys, cpu.reg32(Reg32::Eax));
         }
         Inst::MovRmSeg { m, seg } => {
@@ -943,7 +1163,10 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 Dir::RegRm => (regv, rmv, false),
             };
             let result = alu8(cpu, op, a, b);
-            if store { cpu.write_rm8(&m, result); } else { cpu.set_reg8(Reg::reg8(reg), result); }
+            // CMP sets flags only — it must never write its result back.
+            if op != AluOp::Cmp {
+                if store { cpu.write_rm8(&m, result); } else { cpu.set_reg8(Reg::reg8(reg), result); }
+            }
         }
         Inst::AluRm16Reg { op, m, reg, dir } => {
             let regv = cpu.reg16(Reg::reg16(reg));
@@ -953,7 +1176,10 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 Dir::RegRm => (regv, rmv, false),
             };
             let result = alu16(cpu, op, a, b);
-            if store { cpu.write_rm16(&m, result); } else { cpu.set_reg16(Reg::reg16(reg), result); }
+            // CMP sets flags only — it must never write its result back.
+            if op != AluOp::Cmp {
+                if store { cpu.write_rm16(&m, result); } else { cpu.set_reg16(Reg::reg16(reg), result); }
+            }
         }
         Inst::AluRm32Reg { op, m, reg, dir } => {
             let regv = cpu.reg32(Reg::reg32(reg));
@@ -963,7 +1189,10 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 Dir::RegRm => (regv, rmv, false),
             };
             let result = alu32(cpu, op, a, b);
-            if store { cpu.write_rm32(&m, result); } else { cpu.set_reg32(Reg::reg32(reg), result); }
+            // CMP sets flags only — it must never write its result back.
+            if op != AluOp::Cmp {
+                if store { cpu.write_rm32(&m, result); } else { cpu.set_reg32(Reg::reg32(reg), result); }
+            }
         }
 
         // ---- ALU r/m, imm ----
@@ -1037,12 +1266,51 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- PUSH / POP ----
+        // PUSHA/PUSHAD: push all eight general registers in index order,
+        // with the *original* SP/ESP (captured before the first push).
+        Inst::Pusha { w32 } => {
+            if w32 {
+                let esp = cpu.esp;
+                cpu.push32(cpu.eax); cpu.push32(cpu.ecx);
+                cpu.push32(cpu.edx); cpu.push32(cpu.ebx);
+                cpu.push32(esp);     cpu.push32(cpu.ebp);
+                cpu.push32(cpu.esi); cpu.push32(cpu.edi);
+            } else {
+                let sp = cpu.sp();
+                cpu.push16(cpu.ax()); cpu.push16(cpu.cx());
+                cpu.push16(cpu.dx()); cpu.push16(cpu.bx());
+                cpu.push16(sp);     cpu.push16(cpu.bp());
+                cpu.push16(cpu.si()); cpu.push16(cpu.di());
+            }
+        }
+        // POPA/POPAD: pop in reverse order. The stored SP/ESP slot is
+        // discarded (the stack pointer is restored by the pops themselves).
+        Inst::Popa { w32 } => {
+            if w32 {
+                let edi = cpu.pop32(); let esi = cpu.pop32();
+                let ebp = cpu.pop32(); let _esp = cpu.pop32();
+                let ebx = cpu.pop32(); let edx = cpu.pop32();
+                let ecx = cpu.pop32(); let eax = cpu.pop32();
+                cpu.set_reg32(Reg32::Edi, edi); cpu.set_reg32(Reg32::Esi, esi);
+                cpu.set_reg32(Reg32::Ebp, ebp);
+                cpu.set_reg32(Reg32::Ebx, ebx); cpu.set_reg32(Reg32::Edx, edx);
+                cpu.set_reg32(Reg32::Ecx, ecx); cpu.set_reg32(Reg32::Eax, eax);
+            } else {
+                let di = cpu.pop16(); let si = cpu.pop16();
+                let bp = cpu.pop16(); let _sp = cpu.pop16();
+                let bx = cpu.pop16(); let dx = cpu.pop16();
+                let cx = cpu.pop16(); let ax = cpu.pop16();
+                cpu.set_reg16(Reg16::Di, di); cpu.set_reg16(Reg16::Si, si);
+                cpu.set_reg16(Reg16::Bp, bp);
+                cpu.set_reg16(Reg16::Bx, bx); cpu.set_reg16(Reg16::Dx, dx);
+                cpu.set_reg16(Reg16::Cx, cx); cpu.set_reg16(Reg16::Ax, ax);
+            }
+        }
         Inst::PushReg16 { src } => cpu.push16(cpu.reg16(src)),
         Inst::PopReg16 { dst } => { let v = cpu.pop16(); cpu.set_reg16(dst, v); }
         Inst::PushReg32 { src } => cpu.push32(cpu.reg32(src)),
         Inst::PopReg32 { dst } => { let v = cpu.pop32(); cpu.set_reg32(dst, v); }
         Inst::PushImm16 { imm } => cpu.push16(imm),
-        Inst::PushImm8 { imm } => cpu.push16(imm as i8 as i16 as u16),
         Inst::PushImm32 { imm } => cpu.push32(imm),
 
         // ---- Control flow ----
@@ -1098,6 +1366,18 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.eip = cpu.eip.wrapping_add(rel as u32);
         }
         Inst::Ret => { cpu.ip = cpu.pop16(); }
+        Inst::RetImm { imm, w32 } => {
+            // The stack adjustment happens after the return address is popped.
+            if w32 {
+                let target = cpu.pop32();
+                cpu.esp = cpu.esp.wrapping_add(imm as u32);
+                cpu.eip = target;
+            } else {
+                let target = cpu.pop16();
+                cpu.set_sp(cpu.sp().wrapping_add(imm));
+                cpu.ip = target;
+            }
+        }
         Inst::Ret32 => { cpu.eip = cpu.pop32(); }
         Inst::XchgAxReg { reg } => {
             let ax = cpu.reg16(Reg16::Ax);
@@ -1112,6 +1392,13 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_reg32(reg, ax);
         }
         Inst::Int { vector } => {
+            // Record system calls from user mode: the sequence of calls ld.so
+            // makes is the quickest way to see which path it took.
+            if cpu.debug_enabled && vector == 0x80 && cpu.cpl() == 3
+                && cpu.syscall_log.len() < 512 {
+                let n = cpu.instructions_executed;
+                cpu.syscall_log.push((n, cpu.eax, cpu.ebx, cpu.ecx, cpu.edx));
+            }
             // BIOS services (INT 0x10/0x16/0x13) are handled natively in Rust.
             let mut bios = std::mem::take(&mut cpu.bios);
             let handled = bios.handle(cpu, vector);
@@ -1124,7 +1411,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 // Real-mode interrupt through the IVT.
                 let ip = cpu.ip;
                 let cs = cpu.cs;
-                let flags = cpu.flags;
+                let flags = cpu.flags as u16;
                 cpu.push16(flags);
                 cpu.push16(cs);
                 cpu.push16(ip);
@@ -1150,45 +1437,64 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::Iret => {
             cpu.ip = cpu.pop16();
             cpu.cs = cpu.pop16();
-            cpu.flags = cpu.pop16();
+            let f = cpu.pop16();
+            // A 16-bit IRET restores only the low half; the high half of
+            // EFLAGS is left as it was.
+            cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f as u32);
             cpu.servicing_irq = false;
         }
         Inst::Iret32 => {
-            cpu.eip = cpu.pop32();
-            cpu.cs = cpu.pop32() as u16;
-            cpu.flags = cpu.pop32() as u16;
+            let eip = cpu.pop32();
+            let cs = cpu.pop32() as u16;
+            let f = cpu.pop32();
+            // Returning to a less privileged level: the frame carries the
+            // user stack as well, and it must be restored before CS changes
+            // the CPL out from under the pops.
+            if (cs & 3) as u8 > cpu.cpl() {
+                let esp = cpu.pop32();
+                let ss = cpu.pop32() as u16;
+                cpu.load_seg(SegReg::Ss, ss);
+                cpu.esp = esp;
+            }
+            cpu.eip = eip;
+            cpu.load_seg(SegReg::Cs, cs);
+            cpu.flags = write_flags(cpu.flags, f);
             cpu.servicing_irq = false;
+            cpu.invalidate_phys_ip();
         }
-        Inst::Pushf => cpu.push16(cpu.flags),
-        Inst::Popf => { cpu.flags = cpu.pop16(); }
+        // PUSHF/PUSHFD and POPF/POPFD follow the operand size. In 32-bit mode
+        // these move the whole of EFLAGS — which is how Linux probes the AC
+        // and ID bits — so a 16-bit-only implementation both loses those bits
+        // and moves ESP by the wrong amount.
+        Inst::Pushf => {
+            if cpu.opsize {
+                // VM and RF read back as zero in the pushed image.
+                cpu.push32(cpu.flags & !(flags::VM | flags::RF));
+            } else {
+                cpu.push16(cpu.flags as u16);
+            }
+        }
+        Inst::Popf => {
+            if cpu.opsize {
+                let f = cpu.pop32();
+                cpu.flags = write_flags(cpu.flags, f);
+            } else {
+                let f = cpu.pop16();
+                cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f as u32);
+            }
+        }
 
         // ---- Shifts / rotates (group 2) ----
-        Inst::Shift { op, m, w, count } => {
+        Inst::Shift { op, m, width, count } => {
             let n = match count {
                 ShiftCount::One => 1,
                 ShiftCount::Cl => cpu.reg8(Reg8::Cl) as u32,
+                ShiftCount::Imm(i) => i as u32,
             };
-            if w {
-                let v = cpu.read_rm16(&m);
-                let r = shift16(cpu, op, v, n);
-                cpu.write_rm16(&m, r);
-            } else {
-                let v = cpu.read_rm8(&m);
-                let r = shift8(cpu, op, v, n);
-                cpu.write_rm8(&m, r);
-            }
+            do_shift(cpu, op, &m, width, n);
         }
-        Inst::ShiftImm { op, m, w, imm } => {
-            let n = imm as u32;
-            if w {
-                let v = cpu.read_rm16(&m);
-                let r = shift16(cpu, op, v, n);
-                cpu.write_rm16(&m, r);
-            } else {
-                let v = cpu.read_rm8(&m);
-                let r = shift8(cpu, op, v, n);
-                cpu.write_rm8(&m, r);
-            }
+        Inst::ShiftImm { op, m, width, imm } => {
+            do_shift(cpu, op, &m, width, imm as u32);
         }
 
         // ---- Group 3: TEST / NOT / NEG / MUL / IMUL / DIV / IDIV ----
@@ -1472,13 +1778,13 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             } else {
                 // 16-bit mode: LOOP uses CX and branches via IP.
                 match cond {
-                    LoopCond::Jcxz => cpu.cx == 0,
+                    LoopCond::Jcxz => cpu.cx() == 0,
                     _ => {
-                        cpu.cx = cpu.cx.wrapping_sub(1);
+                        cpu.set_cx(cpu.cx().wrapping_sub(1));
                         match cond {
-                            LoopCond::Loop => cpu.cx != 0,
-                            LoopCond::Loopz => cpu.cx != 0 && cpu.get_flag(ZF),
-                            LoopCond::Loopnz => cpu.cx != 0 && !cpu.get_flag(ZF),
+                            LoopCond::Loop => cpu.cx() != 0,
+                            LoopCond::Loopz => cpu.cx() != 0 && cpu.get_flag(ZF),
+                            LoopCond::Loopnz => cpu.cx() != 0 && !cpu.get_flag(ZF),
                             _ => false,
                         }
                     }
@@ -1523,6 +1829,30 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- Group 5 (0xFF): INC / DEC / CALL / JMP / PUSH r/m ----
+        // INC/DEC preserve CF -- that is the whole reason they exist
+        // alongside ADD/SUB by 1 -- so it is saved and restored around the
+        // flag computation.
+        Inst::IncRm8 { m } => {
+            let v = cpu.read_rm8(&m);
+            let result = v.wrapping_add(1);
+            cpu.write_rm8(&m, result);
+            let cf = cpu.get_flag(CF);
+            set_logic_flags8(cpu, result);
+            set_add_carry(cpu, v as u16, 1, result as u16, false);
+            cpu.set_flag(OF, v == 0x7F);
+            cpu.set_flag(AF, (v & 0x0F) == 0x0F);
+            cpu.set_flag(CF, cf);
+        }
+        Inst::DecRm8 { m } => {
+            let v = cpu.read_rm8(&m);
+            let result = v.wrapping_sub(1);
+            cpu.write_rm8(&m, result);
+            let cf = cpu.get_flag(CF);
+            set_logic_flags8(cpu, result);
+            cpu.set_flag(OF, v == 0x80);
+            cpu.set_flag(AF, (v & 0x0F) == 0x00);
+            cpu.set_flag(CF, cf);
+        }
         Inst::IncRm16 { m } => {
             let v = cpu.read_rm16(&m);
             let result = v.wrapping_add(1);
@@ -1585,6 +1915,189 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let v = cpu.read_rm32(&m);
             cpu.push32(v);
         }
+        // BSF/BSR: ZF is set when the source is zero, and the destination is
+        // then architecturally undefined - we leave it alone.
+        Inst::Bsf { m, dst, w32 } => {
+            if w32 {
+                let v = cpu.read_rm32(&m);
+                cpu.set_flag(flags::ZF, v == 0);
+                if v != 0 { cpu.set_reg32(Reg::reg32(dst), v.trailing_zeros()); }
+            } else {
+                let v = cpu.read_rm16(&m);
+                cpu.set_flag(flags::ZF, v == 0);
+                if v != 0 { cpu.set_reg16(Reg::reg16(dst), v.trailing_zeros() as u16); }
+            }
+        }
+        Inst::Bsr { m, dst, w32 } => {
+            if w32 {
+                let v = cpu.read_rm32(&m);
+                cpu.set_flag(flags::ZF, v == 0);
+                if v != 0 { cpu.set_reg32(Reg::reg32(dst), 31 - v.leading_zeros()); }
+            } else {
+                let v = cpu.read_rm16(&m);
+                cpu.set_flag(flags::ZF, v == 0);
+                if v != 0 { cpu.set_reg16(Reg::reg16(dst), (15 - v.leading_zeros()) as u16); }
+            }
+        }
+        // XCHG r/m, r. No flags.
+        Inst::XchgRmReg { m, reg, width } => match width {
+            8 => {
+                let a = cpu.read_rm8(&m);
+                let b = cpu.reg8(Reg::reg8(reg));
+                cpu.write_rm8(&m, b);
+                cpu.set_reg8(Reg::reg8(reg), a);
+            }
+            16 => {
+                let a = cpu.read_rm16(&m);
+                let b = cpu.reg16(Reg::reg16(reg));
+                cpu.write_rm16(&m, b);
+                cpu.set_reg16(Reg::reg16(reg), a);
+            }
+            _ => {
+                let a = cpu.read_rm32(&m);
+                let b = cpu.reg32(Reg::reg32(reg));
+                cpu.write_rm32(&m, b);
+                cpu.set_reg32(Reg::reg32(reg), a);
+            }
+        },
+        // CMPXCHG: compare the accumulator with the destination. On a match
+        // the source register is stored; otherwise the accumulator takes the
+        // destination's value. Flags are those of `CMP acc, dest`.
+        Inst::Cmpxchg { m, reg, width } => match width {
+            8 => {
+                let dest = cpu.read_rm8(&m);
+                let acc = cpu.reg8(Reg8::Al);
+                alu8(cpu, AluOp::Cmp, acc, dest);
+                if acc == dest { let v = cpu.reg8(Reg::reg8(reg)); cpu.write_rm8(&m, v); }
+                else { cpu.set_reg8(Reg8::Al, dest); }
+            }
+            16 => {
+                let dest = cpu.read_rm16(&m);
+                let acc = cpu.reg16(Reg16::Ax);
+                alu16(cpu, AluOp::Cmp, acc, dest);
+                if acc == dest { let v = cpu.reg16(Reg::reg16(reg)); cpu.write_rm16(&m, v); }
+                else { cpu.set_reg16(Reg16::Ax, dest); }
+            }
+            _ => {
+                let dest = cpu.read_rm32(&m);
+                let acc = cpu.reg32(Reg32::Eax);
+                alu32(cpu, AluOp::Cmp, acc, dest);
+                if acc == dest { let v = cpu.reg32(Reg::reg32(reg)); cpu.write_rm32(&m, v); }
+                else { cpu.set_reg32(Reg32::Eax, dest); }
+            }
+        },
+        // XADD: the destination gets the sum, the source register gets the
+        // destination's old value. Flags are those of ADD.
+        Inst::Xadd { m, reg, width } => match width {
+            8 => {
+                let dest = cpu.read_rm8(&m);
+                let src = cpu.reg8(Reg::reg8(reg));
+                let sum = alu8(cpu, AluOp::Add, dest, src);
+                cpu.set_reg8(Reg::reg8(reg), dest);
+                cpu.write_rm8(&m, sum);
+            }
+            16 => {
+                let dest = cpu.read_rm16(&m);
+                let src = cpu.reg16(Reg::reg16(reg));
+                let sum = alu16(cpu, AluOp::Add, dest, src);
+                cpu.set_reg16(Reg::reg16(reg), dest);
+                cpu.write_rm16(&m, sum);
+            }
+            _ => {
+                let dest = cpu.read_rm32(&m);
+                let src = cpu.reg32(Reg::reg32(reg));
+                let sum = alu32(cpu, AluOp::Add, dest, src);
+                cpu.set_reg32(Reg::reg32(reg), dest);
+                cpu.write_rm32(&m, sum);
+            }
+        },
+        // CMPXCHG8B: compare EDX:EAX with the 64-bit destination; on a
+        // match store ECX:EBX, otherwise load the destination into EDX:EAX.
+        // Only ZF reports the outcome.
+        Inst::Cmpxchg8b { m } => {
+            let addr = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
+            let lo = cpu.mem.read_u32(addr);
+            let hi = cpu.mem.read_u32(addr + 4);
+            if lo == cpu.eax && hi == cpu.edx {
+                cpu.set_flag(flags::ZF, true);
+                let (bl, ch) = (cpu.ebx, cpu.ecx);
+                cpu.mem.write_u32(addr, bl);
+                cpu.mem.write_u32(addr + 4, ch);
+            } else {
+                cpu.set_flag(flags::ZF, false);
+                cpu.set_reg32(Reg32::Eax, lo);
+                cpu.set_reg32(Reg32::Edx, hi);
+            }
+        }
+        Inst::Bswap { reg } => {
+            let v = cpu.reg32(Reg::reg32(reg));
+            cpu.set_reg32(Reg::reg32(reg), v.swap_bytes());
+        }
+        // CMOVcc: the load happens only when the condition holds. (A real CPU
+        // reads the memory operand either way, but nothing observable here
+        // depends on that, and skipping the read avoids a spurious fault.)
+        Inst::Cmovcc { cond, m, dst, w32 } => {
+            if cond.test(cpu) {
+                if w32 {
+                    let v = cpu.read_rm32(&m);
+                    cpu.set_reg32(Reg::reg32(dst), v);
+                } else {
+                    let v = cpu.read_rm16(&m);
+                    cpu.set_reg16(Reg::reg16(dst), v);
+                }
+            }
+        }
+        // PUSH/POP a segment register. The pushed value occupies the full
+        // operand size, but only the low 16 bits carry the selector.
+        Inst::PushSeg { seg } => {
+            let v = cpu.seg(seg);
+            if cpu.opsize { cpu.push32(v as u32); } else { cpu.push16(v); }
+        }
+        Inst::PopSeg { seg } => {
+            let v = if cpu.opsize { cpu.pop32() as u16 } else { cpu.pop16() };
+            cpu.load_seg(seg, v);
+        }
+        // Debug registers. Nothing here implements hardware breakpoints, so
+        // they are plain storage: the kernel writes DR7 = 0 and DR0-3 = 0 at
+        // startup and expects the reads to agree, which this satisfies.
+        Inst::MovDr { dr, reg } => {
+            let v = cpu.dr[dr as usize];
+            cpu.set_reg32(Reg::reg32(reg), v);
+        }
+        Inst::MovToDr { dr, reg } => {
+            cpu.dr[dr as usize] = cpu.reg32(Reg::reg32(reg));
+        }
+        Inst::Lldt { m } => {
+            let sel = cpu.read_rm16(&m);
+            cpu.load_ldt(sel);
+        }
+        Inst::Ltr { m } => {
+            let sel = cpu.read_rm16(&m);
+            cpu.load_tr(sel);
+        }
+        Inst::Sldt { m } => { let v = cpu.ldt_selector; cpu.write_rm16(&m, v); }
+        Inst::Str { m } => { let v = cpu.tr_selector; cpu.write_rm16(&m, v); }
+        Inst::Leave { w32 } => {
+            if w32 {
+                cpu.set_reg32(Reg32::Esp, cpu.ebp);
+                let v = cpu.pop32();
+                cpu.set_reg32(Reg32::Ebp, v);
+            } else {
+                cpu.set_reg16(Reg16::Sp, cpu.bp());
+                let v = cpu.pop16();
+                cpu.set_reg16(Reg16::Bp, v);
+            }
+        }
+        // POP r/m: the stack pop happens first, so a memory destination that
+        // is addressed through ESP sees the *updated* stack pointer.
+        Inst::PopRm16 { m } => {
+            let v = cpu.pop16();
+            cpu.write_rm16(&m, v);
+        }
+        Inst::PopRm32 { m } => {
+            let v = cpu.pop32();
+            cpu.write_rm32(&m, v);
+        }
 
         // ---- String ops ----
         // Element size: byte forms (w=false) are 8-bit; word forms (w=true)
@@ -1594,260 +2107,146 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // Optimization: compute the physical address once, then increment
         // it directly for each element. Only re-translate on page boundary
         // crossings (which are rare within a REP loop).
+        // ---- String instructions ----
+        //
+        // All five share one shape, and one rule that is easy to miss and
+        // expensive to get wrong: **a REP loop must be restartable.** If an
+        // element faults, the instruction aborts with SI/DI/CX still pointing
+        // at that element, so that when the handler returns and the
+        // instruction re-runs it picks up exactly where it stopped. Running
+        // the loop to completion through a fault instead writes every
+        // remaining element to whatever address translation returned, and the
+        // restart then copies nothing -- which is how a `clear_user` over a
+        // not-yet-present page left a program's BSS full of file data.
+        //
+        // The index registers follow the *address* size and the element the
+        // *operand* size; they are not the same thing when a 0x66 prefix is
+        // in play.
         Inst::Movs { rep, w } => {
-            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
-            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
-            if cpu.opsize {
-                let count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
-                let step = (delta * esize) as i32;
-                let mut src_lin = cpu.esi as i32;
-                let mut dst_lin = cpu.edi as i32;
-                for _ in 0..count {
-                    let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                    let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                    if esize == 4 {
-                        let v = cpu.mem.read_u32(src);
-                        cpu.mem.write_u32(dst, v);
-                    } else {
-                        let v = cpu.mem.read_u8(src);
-                        cpu.mem.write_u8(dst, v);
-                    }
-                    src_lin = src_lin.wrapping_add(step);
-                    dst_lin = dst_lin.wrapping_add(step);
+            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let step = string_step(cpu, esize);
+            let a32 = cpu.addrsize;
+            let (mut si, mut di) = (string_si(cpu, a32), string_di(cpu, a32));
+            let mut cnt = string_count(cpu, a32, rep);
+            while cnt > 0 {
+                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                let dst = cpu.translate_write(SegReg::Es, di);
+                if cpu.pending_exception.is_some() { break; }
+                match esize {
+                    4 => { let v = cpu.mem.read_u32(src); cpu.mem.write_u32(dst, v); }
+                    2 => { let v = cpu.mem.read_u16(src); cpu.mem.write_u16(dst, v); }
+                    _ => { let v = cpu.mem.read_u8(src); cpu.mem.write_u8(dst, v); }
                 }
-                cpu.esi = src_lin as u32;
-                cpu.edi = dst_lin as u32;
-                if rep != Rep::None { cpu.ecx = 0; }
-            } else {
-                let count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-                let step = (delta * esize) as i16;
-                let mut src_lin = cpu.si as i32;
-                let mut dst_lin = cpu.di as i32;
-                for _ in 0..count {
-                    let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                    let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                    if esize == 2 {
-                        let v = cpu.mem.read_u16(src);
-                        cpu.mem.write_u16(dst, v);
-                    } else {
-                        let v = cpu.mem.read_u8(src);
-                        cpu.mem.write_u8(dst, v);
-                    }
-                    src_lin = src_lin.wrapping_add(step as i32);
-                    dst_lin = dst_lin.wrapping_add(step as i32);
-                }
-                cpu.si = src_lin as u16;
-                cpu.di = dst_lin as u16;
-                if rep != Rep::None { cpu.cx = 0; }
+                si = string_advance(si, step, a32);
+                di = string_advance(di, step, a32);
+                cnt -= 1;
             }
+            string_set_si(cpu, a32, si);
+            string_set_di(cpu, a32, di);
+            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
         }
         Inst::Stos { rep, w } => {
-            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
-            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
-            if cpu.opsize {
-                let count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
-                let step = (delta * esize) as i32;
-                let mut dst_lin = cpu.edi as i32;
-                if esize == 4 {
-                    let v = cpu.reg32(Reg32::Eax);
-                    for _ in 0..count {
-                        let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                        cpu.mem.write_u32(dst, v);
-                        dst_lin = dst_lin.wrapping_add(step);
-                    }
-                } else {
-                    let v = cpu.reg8(Reg8::Al);
-                    for _ in 0..count {
-                        let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                        cpu.mem.write_u8(dst, v);
-                        dst_lin = dst_lin.wrapping_add(step);
-                    }
+            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let step = string_step(cpu, esize);
+            let a32 = cpu.addrsize;
+            let mut di = string_di(cpu, a32);
+            let mut cnt = string_count(cpu, a32, rep);
+            while cnt > 0 {
+                let dst = cpu.translate_write(SegReg::Es, di);
+                if cpu.pending_exception.is_some() { break; }
+                match esize {
+                    4 => { let v = cpu.reg32(Reg32::Eax); cpu.mem.write_u32(dst, v); }
+                    2 => { let v = cpu.reg16(Reg16::Ax); cpu.mem.write_u16(dst, v); }
+                    _ => { let v = cpu.reg8(Reg8::Al); cpu.mem.write_u8(dst, v); }
                 }
-                cpu.edi = dst_lin as u32;
-                if rep != Rep::None { cpu.ecx = 0; }
-            } else {
-                let count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-                let step = (delta * esize) as i16;
-                let mut dst_lin = cpu.di as i32;
-                if esize == 2 {
-                    let v = cpu.reg16(Reg16::Ax);
-                    for _ in 0..count {
-                        let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                        cpu.mem.write_u16(dst, v);
-                        dst_lin = dst_lin.wrapping_add(step as i32);
-                    }
-                } else {
-                    let v = cpu.reg8(Reg8::Al);
-                    for _ in 0..count {
-                        let dst = cpu.translate(SegReg::Es, dst_lin as u32);
-                        cpu.mem.write_u8(dst, v);
-                        dst_lin = dst_lin.wrapping_add(step as i32);
-                    }
-                }
-                cpu.di = dst_lin as u16;
-                if rep != Rep::None { cpu.cx = 0; }
+                di = string_advance(di, step, a32);
+                cnt -= 1;
             }
+            string_set_di(cpu, a32, di);
+            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
         }
         Inst::Lods { rep, w } => {
-            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
-            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
-            if cpu.opsize {
-                let count = match rep { Rep::None => 1, _ => cpu.ecx as i32 };
-                let step = (delta * esize) as i32;
-                let mut src_lin = cpu.esi as i32;
-                if esize == 4 {
-                    for _ in 0..count {
-                        let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                        let v = cpu.mem.read_u32(src);
-                        cpu.set_reg32(Reg32::Eax, v);
-                        src_lin = src_lin.wrapping_add(step);
-                    }
-                } else {
-                    for _ in 0..count {
-                        let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                        let v = cpu.mem.read_u8(src);
-                        cpu.set_reg8(Reg8::Al, v);
-                        src_lin = src_lin.wrapping_add(step);
-                    }
+            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let step = string_step(cpu, esize);
+            let a32 = cpu.addrsize;
+            let mut si = string_si(cpu, a32);
+            let mut cnt = string_count(cpu, a32, rep);
+            while cnt > 0 {
+                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                if cpu.pending_exception.is_some() { break; }
+                match esize {
+                    4 => { let v = cpu.mem.read_u32(src); cpu.set_reg32(Reg32::Eax, v); }
+                    2 => { let v = cpu.mem.read_u16(src); cpu.set_reg16(Reg16::Ax, v); }
+                    _ => { let v = cpu.mem.read_u8(src); cpu.set_reg8(Reg8::Al, v); }
                 }
-                cpu.esi = src_lin as u32;
-                if rep != Rep::None { cpu.ecx = 0; }
-            } else {
-                let count = match rep { Rep::None => 1, _ => cpu.cx as i32 };
-                let step = (delta * esize) as i16;
-                let mut src_lin = cpu.si as i32;
-                if esize == 2 {
-                    for _ in 0..count {
-                        let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                        let v = cpu.mem.read_u16(src);
-                        cpu.set_reg16(Reg16::Ax, v);
-                        src_lin = src_lin.wrapping_add(step as i32);
-                    }
-                } else {
-                    for _ in 0..count {
-                        let src = cpu.translate(SegReg::Ds, src_lin as u32);
-                        let v = cpu.mem.read_u8(src);
-                        cpu.set_reg8(Reg8::Al, v);
-                        src_lin = src_lin.wrapping_add(step as i32);
-                    }
-                }
-                cpu.si = src_lin as u16;
-                if rep != Rep::None { cpu.cx = 0; }
+                si = string_advance(si, step, a32);
+                cnt -= 1;
             }
+            string_set_si(cpu, a32, si);
+            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
         }
         Inst::Cmps { rep, w } => {
-            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
-            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
-            if cpu.opsize {
-                loop {
-                    let src = cpu.translate(SegReg::Ds, cpu.esi);
-                    let dst = cpu.translate(SegReg::Es, cpu.edi);
-                    if esize == 4 {
-                        let a = cpu.mem.read_u32(src);
-                        let b = cpu.mem.read_u32(dst);
-                        alu32(cpu, AluOp::Sub, a, b);
-                    } else {
-                        let a = cpu.mem.read_u8(src);
-                        let b = cpu.mem.read_u8(dst);
-                        alu8(cpu, AluOp::Sub, a, b);
+            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let step = string_step(cpu, esize);
+            let a32 = cpu.addrsize;
+            let (mut si, mut di) = (string_si(cpu, a32), string_di(cpu, a32));
+            let mut cnt = string_count(cpu, a32, rep);
+            while cnt > 0 {
+                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                let dst = cpu.translate(SegReg::Es, di);
+                if cpu.pending_exception.is_some() { break; }
+                match esize {
+                    4 => {
+                        let (a, b) = (cpu.mem.read_u32(src), cpu.mem.read_u32(dst));
+                        alu32(cpu, AluOp::Cmp, a, b);
                     }
-                    cpu.esi = cpu.esi.wrapping_add((delta * esize) as u32);
-                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
-                    match rep {
-                        Rep::None => break,
-                        Rep::Repe => {
-                            cpu.ecx = cpu.ecx.wrapping_sub(1);
-                            if cpu.ecx == 0 || !cpu.get_flag(ZF) { break; }
-                        }
-                        Rep::Repne => {
-                            cpu.ecx = cpu.ecx.wrapping_sub(1);
-                            if cpu.ecx == 0 || cpu.get_flag(ZF) { break; }
-                        }
+                    2 => {
+                        let (a, b) = (cpu.mem.read_u16(src), cpu.mem.read_u16(dst));
+                        alu16(cpu, AluOp::Cmp, a, b);
+                    }
+                    _ => {
+                        let (a, b) = (cpu.mem.read_u8(src), cpu.mem.read_u8(dst));
+                        alu8(cpu, AluOp::Cmp, a, b);
                     }
                 }
-            } else {
-                loop {
-                    let src = cpu.translate(SegReg::Ds, cpu.si as u32);
-                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                    if esize == 2 {
-                        let a = cpu.mem.read_u16(src);
-                        let b = cpu.mem.read_u16(dst);
-                        alu16(cpu, AluOp::Sub, a, b);
-                    } else {
-                        let a = cpu.mem.read_u8(src);
-                        let b = cpu.mem.read_u8(dst);
-                        alu8(cpu, AluOp::Sub, a, b);
-                    }
-                    cpu.si = cpu.si.wrapping_add((delta * esize) as u16);
-                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
-                    match rep {
-                        Rep::None => break,
-                        Rep::Repe => {
-                            cpu.cx = cpu.cx.wrapping_sub(1);
-                            if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
-                        }
-                        Rep::Repne => {
-                            cpu.cx = cpu.cx.wrapping_sub(1);
-                            if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
-                        }
-                    }
-                }
+                si = string_advance(si, step, a32);
+                di = string_advance(di, step, a32);
+                cnt -= 1;
+                if !string_repeat(cpu, rep, cnt) { break; }
             }
+            string_set_si(cpu, a32, si);
+            string_set_di(cpu, a32, di);
+            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
         }
         Inst::Scas { rep, w } => {
-            let delta: i32 = if cpu.get_flag(DF) { -1 } else { 1 };
-            let esize: i32 = if w { if cpu.opsize { 4 } else { 2 } } else { 1 };
-            if cpu.opsize {
-                loop {
-                    let dst = cpu.translate(SegReg::Es, cpu.edi);
-                    if esize == 4 {
-                        let a = cpu.reg32(Reg32::Eax);
-                        let b = cpu.mem.read_u32(dst);
-                        alu32(cpu, AluOp::Sub, a, b);
-                    } else {
-                        let a = cpu.reg8(Reg8::Al);
-                        let b = cpu.mem.read_u8(dst);
-                        alu8(cpu, AluOp::Sub, a, b);
+            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let step = string_step(cpu, esize);
+            let a32 = cpu.addrsize;
+            let mut di = string_di(cpu, a32);
+            let mut cnt = string_count(cpu, a32, rep);
+            while cnt > 0 {
+                let dst = cpu.translate(SegReg::Es, di);
+                if cpu.pending_exception.is_some() { break; }
+                match esize {
+                    4 => {
+                        let (a, b) = (cpu.reg32(Reg32::Eax), cpu.mem.read_u32(dst));
+                        alu32(cpu, AluOp::Cmp, a, b);
                     }
-                    cpu.edi = cpu.edi.wrapping_add((delta * esize) as u32);
-                    match rep {
-                        Rep::None => break,
-                        Rep::Repe => {
-                            cpu.ecx = cpu.ecx.wrapping_sub(1);
-                            if cpu.ecx == 0 || !cpu.get_flag(ZF) { break; }
-                        }
-                        Rep::Repne => {
-                            cpu.ecx = cpu.ecx.wrapping_sub(1);
-                            if cpu.ecx == 0 || cpu.get_flag(ZF) { break; }
-                        }
+                    2 => {
+                        let (a, b) = (cpu.reg16(Reg16::Ax), cpu.mem.read_u16(dst));
+                        alu16(cpu, AluOp::Cmp, a, b);
+                    }
+                    _ => {
+                        let (a, b) = (cpu.reg8(Reg8::Al), cpu.mem.read_u8(dst));
+                        alu8(cpu, AluOp::Cmp, a, b);
                     }
                 }
-            } else {
-                loop {
-                    let dst = cpu.translate(SegReg::Es, cpu.di as u32);
-                    if esize == 2 {
-                        let a = cpu.reg16(Reg16::Ax);
-                        let b = cpu.mem.read_u16(dst);
-                        alu16(cpu, AluOp::Sub, a, b);
-                    } else {
-                        let a = cpu.reg8(Reg8::Al);
-                        let b = cpu.mem.read_u8(dst);
-                        alu8(cpu, AluOp::Sub, a, b);
-                    }
-                    cpu.di = cpu.di.wrapping_add((delta * esize) as u16);
-                    match rep {
-                        Rep::None => break,
-                        Rep::Repe => {
-                            cpu.cx = cpu.cx.wrapping_sub(1);
-                            if cpu.cx == 0 || !cpu.get_flag(ZF) { break; }
-                        }
-                        Rep::Repne => {
-                            cpu.cx = cpu.cx.wrapping_sub(1);
-                            if cpu.cx == 0 || cpu.get_flag(ZF) { break; }
-                        }
-                    }
-                }
+                di = string_advance(di, step, a32);
+                cnt -= 1;
+                if !string_repeat(cpu, rep, cnt) { break; }
             }
+            string_set_di(cpu, a32, di);
+            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
         }
 
         // ---- LGDT / LIDT ----
@@ -1925,7 +2324,15 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                     cpu.cr3 = v;
                     cpu.flush_tlb();
                 }
-                _ => cpu.cr4 = v,
+                _ => {
+                    // Writing CR4 flushes the TLB. Linux's
+                    // `__flush_tlb_global()` is *literally* a CR4 write with
+                    // PGE toggled off and back on -- the flush is the whole
+                    // point of the sequence, and without it every global
+                    // mapping keeps a stale translation.
+                    cpu.cr4 = v;
+                    cpu.flush_tlb();
+                }
             }
         }
 
@@ -1946,12 +2353,26 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                     cpu.set_reg32(Reg32::Ecx, 0x6C65746E); // "ntel"
                 }
                 1 => {
-                    // Family 6, model 0, stepping 0. Feature flags: FPU,
-                    // TSC, MSR, CX8, SEP, CMOV, PGE, MMX, FXSR, SSE, SSE2.
+                    // Family 6, model 0, stepping 0.
                     cpu.set_reg32(Reg32::Eax, 0x00000600);
-                    cpu.set_reg32(Reg32::Ebx, 0x00000000);
-                    cpu.set_reg32(Reg32::Ecx, 0x00000000);
-                    cpu.set_reg32(Reg32::Edx, 0x178BFBFF);
+                    // EBX: brand index 0, CLFLUSH line size 8 (x8 = 64
+                    // bytes), one logical processor, APIC id 0. The line
+                    // size is not decoration: Linux takes it as the cache
+                    // alignment, and a zero there makes ALIGN(x, 0) collapse
+                    // to 0 -- which reaches reciprocal_value() as a divide
+                    // by zero before the slab allocator is even up.
+                    cpu.set_reg32(Reg32::Ebx, 0x0001_0800);
+                    cpu.set_reg32(Reg32::Ecx, 0x0000_0000);
+                    // Feature flags, deliberately only the ones implemented
+                    // here: FPU(0), PSE(3), TSC(4), MSR(5), CX8(8), PGE(13),
+                    // CMOV(15), CLFSH(19), FXSR(24).
+                    //
+                    // Left OFF on purpose, because claiming them would make
+                    // the kernel issue instructions this CPU does not have:
+                    // PAE(6), APIC(9), SEP(11) -- so system calls arrive as
+                    // int 0x80 rather than SYSENTER -- MTRR(12), PAT(16),
+                    // MMX(23), SSE(25) and SSE2(26).
+                    cpu.set_reg32(Reg32::Edx, 0x0108_A139);
                 }
                 _ => {
                     // Unknown leaf: report 0.
@@ -1982,60 +2403,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- Bit tests: BT / BTS / BTR / BTC ----
-        Inst::Bt { m, bit } => {
-            if cpu.opsize {
-                let v = cpu.read_rm32(&m);
-                let b = (bit & 31) as u32;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-            } else {
-                let v = cpu.read_rm16(&m);
-                let b = (bit & 15) as u16;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-            }
-        }
-        Inst::Bts { m, bit } => {
-            if cpu.opsize {
-                let v = cpu.read_rm32(&m);
-                let b = (bit & 31) as u32;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm32(&m, v | (1 << b));
-            } else {
-                let v = cpu.read_rm16(&m);
-                let b = (bit & 15) as u16;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm16(&m, v | (1 << b));
-            }
-        }
-        Inst::Btr { m, bit } => {
-            if cpu.opsize {
-                let v = cpu.read_rm32(&m);
-                let b = (bit & 31) as u32;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm32(&m, v & !(1 << b));
-            } else {
-                let v = cpu.read_rm16(&m);
-                let b = (bit & 15) as u16;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm16(&m, v & !(1 << b));
-            }
-        }
-        Inst::Btc { m, bit } => {
-            if cpu.opsize {
-                let v = cpu.read_rm32(&m);
-                let b = (bit & 31) as u32;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm32(&m, v ^ (1 << b));
-            } else {
-                let v = cpu.read_rm16(&m);
-                let b = (bit & 15) as u16;
-                cpu.set_flag(flags::CF, (v >> b) & 1 != 0);
-                cpu.write_rm16(&m, v ^ (1 << b));
-            }
-        }
+        Inst::Bt { m, bit } => bit_op(cpu, &m, bit, BitOp::Test),
+        Inst::Bts { m, bit } => bit_op(cpu, &m, bit, BitOp::Set),
+        Inst::Btr { m, bit } => bit_op(cpu, &m, bit, BitOp::Reset),
+        Inst::Btc { m, bit } => bit_op(cpu, &m, bit, BitOp::Complement),
 
         // ---- IN / OUT ----
         Inst::InAlImm { port } => {
-            let v = cpu.port_in(port);
+            let v = cpu.port_in(port as u16);
             cpu.set_reg8(Reg8::Al, v);
         }
         Inst::InAxImm { port } => {
@@ -2043,16 +2418,16 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_reg16(Reg16::Ax, v);
         }
         Inst::InAlDx => {
-            let v = cpu.port_in(cpu.dx as u8);
+            let v = cpu.port_in(cpu.dx());
             cpu.set_reg8(Reg8::Al, v);
         }
         Inst::InAxDx => {
-            let v = cpu.port_in16(cpu.dx as u16);
+            let v = cpu.port_in16(cpu.dx() as u16);
             cpu.set_reg16(Reg16::Ax, v);
         }
         Inst::OutImmAl { port } => {
             let v = cpu.reg8(Reg8::Al);
-            cpu.port_out(port, v);
+            cpu.port_out(port as u16, v);
         }
         Inst::OutImmAx { port } => {
             let v = cpu.reg16(Reg16::Ax);
@@ -2060,11 +2435,11 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
         Inst::OutDxAl => {
             let v = cpu.reg8(Reg8::Al);
-            cpu.port_out(cpu.dx as u8, v);
+            cpu.port_out(cpu.dx(), v);
         }
         Inst::OutDxAx => {
             let v = cpu.reg16(Reg16::Ax);
-            cpu.port_out16(cpu.dx as u16, v);
+            cpu.port_out16(cpu.dx() as u16, v);
         }
 
         // ---- Flag-control instructions ----
@@ -2083,10 +2458,10 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             if m.is_reg() {
                 // Store to a register is meaningless; treat as no-op.
             } else if cpu.addrsize {
-                let a = cpu.modrm_addr32(&m);
+                let a = cpu.modrm_addr32_write(&m);
                 cpu.mem.write_u16(a, v);
             } else {
-                let a = cpu.modrm_addr(&m);
+                let a = cpu.modrm_addr_write(&m);
                 cpu.mem.write_u16(a, v);
             }
         }
@@ -2106,48 +2481,39 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::Fstsw { m } => {
             let v = cpu.fpu.fstsw();
             if cpu.addrsize {
-                let a = cpu.modrm_addr32(&m);
+                let a = cpu.modrm_addr32_write(&m);
                 cpu.mem.write_u16(a, v);
             } else {
-                let a = cpu.modrm_addr(&m);
+                let a = cpu.modrm_addr_write(&m);
                 cpu.mem.write_u16(a, v);
             }
         }
-        Inst::Fst { m } => {
+        Inst::Fst { m, w64 } => {
             let v = cpu.fpu.st_i(0);
             if m.is_reg() {
                 // FST ST(i): copy ST0 to ST(i).
                 cpu.fpu.set_st_i(m.rm as usize, v);
-            } else if cpu.addrsize {
-                let a = cpu.modrm_addr32(&m);
-                cpu.mem.write_f64(a, v);
             } else {
-                let a = cpu.modrm_addr(&m);
-                cpu.mem.write_f64(a, v);
+                let a = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
+                if w64 { cpu.mem.write_f64(a, v); } else { cpu.mem.write_f32(a, v as f32); }
             }
         }
-        Inst::Fstp { m } => {
+        Inst::Fstp { m, w64 } => {
             let v = cpu.fpu.st_i(0);
             if m.is_reg() {
                 cpu.fpu.set_st_i(m.rm as usize, v);
-            } else if cpu.addrsize {
-                let a = cpu.modrm_addr32(&m);
-                cpu.mem.write_f64(a, v);
             } else {
-                let a = cpu.modrm_addr(&m);
-                cpu.mem.write_f64(a, v);
+                let a = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
+                if w64 { cpu.mem.write_f64(a, v); } else { cpu.mem.write_f32(a, v as f32); }
             }
             cpu.fpu.pop();
         }
-        Inst::Fld { m } => {
+        Inst::Fld { m, w64 } => {
             let v = if m.is_reg() {
                 cpu.fpu.st_i(m.rm as usize)
-            } else if cpu.addrsize {
-                let a = cpu.modrm_addr32(&m);
-                cpu.mem.read_f64(a)
             } else {
-                let a = cpu.modrm_addr(&m);
-                cpu.mem.read_f64(a)
+                let a = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
+                if w64 { cpu.mem.read_f64(a) } else { cpu.mem.read_f32(a) as f64 }
             };
             cpu.fpu.push(v);
         }
@@ -2194,7 +2560,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.fpu.set_st_i(0, result);
         }
         Inst::Fxsave { m } => {
-            let a = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
+            let a = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
             cpu.fpu.fxsave(&mut cpu.mem, a);
         }
         Inst::Fxrstor { m } => {
@@ -2202,31 +2568,162 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.fpu.fxrstor(&cpu.mem, a);
         }
 
+        // Two/three-operand IMUL. CF = OF = 1 when the truncated result
+        // differs from the full signed product (i.e. it did not fit).
+        Inst::ImulRegRm16 { m, dst } => {
+            let a = cpu.read_rm16(&m) as i16 as i32;
+            let b = cpu.reg16(Reg::reg16(dst)) as i16 as i32;
+            imul_store16(cpu, dst, a * b);
+        }
+        Inst::ImulRegRm32 { m, dst } => {
+            let a = cpu.read_rm32(&m) as i32 as i64;
+            let b = cpu.reg32(Reg::reg32(dst)) as i32 as i64;
+            imul_store32(cpu, dst, a * b);
+        }
+        Inst::ImulRegRmImm16 { m, dst, imm } => {
+            let a = cpu.read_rm16(&m) as i16 as i32;
+            imul_store16(cpu, dst, a * imm as i32);
+        }
+        Inst::ImulRegRmImm32 { m, dst, imm } => {
+            let a = cpu.read_rm32(&m) as i32 as i64;
+            imul_store32(cpu, dst, a * imm as i64);
+        }
+
+        // SHLD/SHRD: shift the destination, feeding in bits from the source
+        // register. A count of 0 is a no-op that leaves every flag alone; a
+        // count >= the operand width is architecturally undefined, and like
+        // real hardware we mask it to 5 bits and let it fall out.
+        Inst::Shld { m, reg, count, w32 } => {
+            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) } & 0x1F;
+            if n != 0 {
+                if w32 {
+                    let d = cpu.read_rm32(&m);
+                    let src = cpu.reg32(Reg::reg32(reg));
+                    let res = (d << n) | (src >> (32 - n));
+                    let cf = (d >> (32 - n)) & 1 != 0;
+                    cpu.write_rm32(&m, res);
+                    set_shift_flags32(cpu, res, cf, (d ^ res) >> 31 & 1 != 0);
+                } else {
+                    let d = cpu.read_rm16(&m);
+                    let src = cpu.reg16(Reg::reg16(reg));
+                    // A 16-bit SHLD with count > 16 feeds in bits that a real
+                    // CPU leaves undefined; do the shift in 32 bits so the
+                    // in-range cases are exact.
+                    let wide = ((d as u32) << 16) | src as u32;
+                    let res = ((wide << n) >> 16) as u16;
+                    let cf = (d >> (16 - n.min(16))) & 1 != 0;
+                    cpu.write_rm16(&m, res);
+                    set_shift_flags16(cpu, res, cf, (d ^ res) >> 15 & 1 != 0);
+                }
+            }
+        }
+        Inst::Shrd { m, reg, count, w32 } => {
+            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) } & 0x1F;
+            if n != 0 {
+                if w32 {
+                    let d = cpu.read_rm32(&m);
+                    let src = cpu.reg32(Reg::reg32(reg));
+                    let res = (d >> n) | (src << (32 - n));
+                    let cf = (d >> (n - 1)) & 1 != 0;
+                    cpu.write_rm32(&m, res);
+                    set_shift_flags32(cpu, res, cf, (d ^ res) >> 31 & 1 != 0);
+                } else {
+                    let d = cpu.read_rm16(&m);
+                    let src = cpu.reg16(Reg::reg16(reg));
+                    let wide = ((src as u32) << 16) | d as u32;
+                    let res = (wide >> n) as u16;
+                    let cf = (d >> (n - 1).min(15)) & 1 != 0;
+                    cpu.write_rm16(&m, res);
+                    set_shift_flags16(cpu, res, cf, (d ^ res) >> 15 & 1 != 0);
+                }
+            }
+        }
+
+        // SETcc: write 1 or 0 to an 8-bit destination. The operand is always
+        // byte-sized regardless of the operand-size prefix.
+        Inst::Setcc { cond, m } => {
+            let v = if cond.test(cpu) { 1u8 } else { 0u8 };
+            cpu.write_rm8(&m, v);
+        }
+
         Inst::Unknown { opcode } => {
             // Invalid opcode exception (#UD, vector 0x06). No error code.
+            // Record the opcode so a debug run can list every instruction the
+            // decoder is missing in one pass (see `Cpu::unknown_ops`).
+            cpu.note_unknown_opcode(opcode);
             cpu.pending_exception = Some((0x06, None));
-            cpu.dx = opcode as u16;
         }
     }
 }
 
 /// Dispatch a protected-mode interrupt through the IDT.
 pub(crate) fn protected_int(cpu: &mut Cpu, vector: u8) {
-    // IDT entry: 8 bytes. offset = (bytes 0-1) | (bytes 6-7 << 16).
+    protected_int_err(cpu, vector, None)
+}
+
+/// Dispatch a protected-mode interrupt or exception through the IDT.
+///
+/// The frame order is not a detail: the CPU pushes EFLAGS, CS and EIP, and
+/// then — for the exceptions that have one — the **error code last**, so it
+/// ends up on top of the stack. Linux's `error_code` entry stub reads the
+/// frame at fixed offsets from ESP, so pushing the error code first shifts
+/// every field by one slot and the kernel reports the fault at the CS
+/// selector's "address" with the real EIP as the error code.
+pub(crate) fn protected_int_err(cpu: &mut Cpu, vector: u8, error_code: Option<u32>) {
+    // IDT entry: 8 bytes. offset = (bytes 0-1) | (bytes 6-7 << 16), the
+    // segment selector is bytes 2-3, and byte 5 holds the type/attributes.
     let entry = cpu.idt_base.wrapping_add((vector as u32) * 8);
     let addr = Memory::phys32(entry);
     let off_lo = cpu.mem.read_u16(addr) as u32;
     let off_hi = cpu.mem.read_u16(addr + 6) as u32;
     let target = off_lo | (off_hi << 16);
     let selector = cpu.mem.read_u16(addr + 2);
-    // Push a 32-bit interrupt frame: FLAGS, CS, EIP.
-    cpu.push32(cpu.flags as u32);
-    cpu.push32(cpu.cs as u32);
-    cpu.push32(cpu.eip);
-    cpu.set_flag(flags::IF, false);
+    let gate_type = cpu.mem.read_u8(addr + 5) & 0x0F;
+
+    // A gate to a more privileged code segment switches stacks. The new SS
+    // and ESP come from the TSS, and the *old* SS:ESP are pushed below the
+    // usual frame -- without which the kernel's entry code reads a frame two
+    // dwords short and IRET has nothing to return to user mode on.
+    let target_dpl = cpu.descriptor_for(selector).dpl();
+    let switching = target_dpl < cpu.cpl();
+
+    // Everything pushed is the state as it was *before* the gate.
+    let old_cs = cpu.cs;
+    let old_eip = cpu.eip;
+    let old_flags = cpu.flags;
+    let (old_ss, old_esp) = (cpu.ss, cpu.esp);
+
+    if switching {
+        cpu.ring_switches += 1;
+        let (ss0, esp0) = cpu.tss_stack0();
+        cpu.load_seg(SegReg::Ss, ss0);
+        cpu.esp = esp0;
+    }
+    // Enter the handler's privilege level BEFORE writing the frame. The
+    // pushes are part of the gate transition and happen at the new CPL: done
+    // the other way round, a frame written on the ring-0 stack while CS still
+    // says ring 3 is a user write to supervisor memory, and paging rejects it.
+    cpu.load_seg(SegReg::Cs, selector);
+    if switching {
+        cpu.push32(old_ss as u32);
+        cpu.push32(old_esp);
+    }
+    cpu.push32(old_flags);
+    cpu.push32(old_cs as u32);
+    cpu.push32(old_eip);
+    if let Some(code) = error_code {
+        cpu.push32(code);
+    }
+    // An interrupt gate (type 6/14) clears IF on entry; a trap gate (7/15)
+    // leaves it alone, which is how Linux keeps interrupts enabled inside
+    // handlers like int3 and the system-call entry.
+    if gate_type == 0x6 || gate_type == 0xE {
+        cpu.set_flag(flags::IF, false);
+    }
     cpu.set_flag(flags::TF, false);
-    cpu.cs = selector;
+    cpu.set_flag(flags::RF, false);
     cpu.eip = target;
+    cpu.invalidate_phys_ip();
 }
 
 // ---- ALU flag computation ----
@@ -2348,6 +2845,47 @@ fn alu32(cpu: &mut Cpu, op: AluOp, a: u32, b: u32) -> u32 {
     }
 }
 
+/// Store a two/three-operand IMUL result into a 16-bit register. CF and OF
+/// are set when the full signed product did not fit in 16 bits; SF/ZF/PF are
+/// architecturally undefined but we set them from the truncated result, which
+/// is what real CPUs do.
+fn imul_store16(cpu: &mut Cpu, dst: u8, full: i32) {
+    use flags::*;
+    let r = full as u16;
+    cpu.set_reg16(Reg::reg16(dst), r);
+    let overflow = full != (r as i16) as i32;
+    cpu.set_flag(CF, overflow);
+    cpu.set_flag(OF, overflow);
+    set_logic_flags16(cpu, r);
+}
+
+/// 32-bit counterpart of `imul_store16`.
+fn imul_store32(cpu: &mut Cpu, dst: u8, full: i64) {
+    use flags::*;
+    let r = full as u32;
+    cpu.set_reg32(Reg::reg32(dst), r);
+    let overflow = full != (r as i32) as i64;
+    cpu.set_flag(CF, overflow);
+    cpu.set_flag(OF, overflow);
+    set_logic_flags32(cpu, r);
+}
+
+/// Flags after a 16-bit double-precision shift (SHLD/SHRD).
+fn set_shift_flags16(cpu: &mut Cpu, r: u16, cf: bool, of: bool) {
+    use flags::*;
+    cpu.set_flag(CF, cf);
+    cpu.set_flag(OF, of);
+    set_logic_flags16(cpu, r);
+}
+
+/// Flags after a 32-bit double-precision shift (SHLD/SHRD).
+fn set_shift_flags32(cpu: &mut Cpu, r: u32, cf: bool, of: bool) {
+    use flags::*;
+    cpu.set_flag(CF, cf);
+    cpu.set_flag(OF, of);
+    set_logic_flags32(cpu, r);
+}
+
 fn set_logic_flags8(cpu: &mut Cpu, r: u8) {
     use flags::*;
     cpu.set_flag(SF, (r as i8) < 0);
@@ -2456,14 +2994,14 @@ fn lea_offset(m: &ModRm, cpu: &Cpu) -> u32 {
         ea
     } else {
         let base = match m.rm {
-            0 => cpu.bx.wrapping_add(cpu.si),
-            1 => cpu.bx.wrapping_add(cpu.di),
-            2 => cpu.bp.wrapping_add(cpu.si),
-            3 => cpu.bp.wrapping_add(cpu.di),
-            4 => cpu.si,
-            5 => cpu.di,
-            6 => cpu.bp,
-            _ => cpu.bx,
+            0 => cpu.bx().wrapping_add(cpu.si()),
+            1 => cpu.bx().wrapping_add(cpu.di()),
+            2 => cpu.bp().wrapping_add(cpu.si()),
+            3 => cpu.bp().wrapping_add(cpu.di()),
+            4 => cpu.si(),
+            5 => cpu.di(),
+            6 => cpu.bp(),
+            _ => cpu.bx(),
         };
         let mut ea = base as u32;
         if let Some(d8) = m.disp8 { ea = ea.wrapping_add(d8 as u32); }
@@ -2473,133 +3011,269 @@ fn lea_offset(m: &ModRm, cpu: &Cpu) -> u32 {
 }
 
 /// Perform an 8-bit shift/rotate, setting flags, and return the result.
-fn shift8(cpu: &mut Cpu, op: ShiftOp, v: u8, n: u32) -> u8 {
+/// Perform a shift/rotate of `width` bits (8, 16 or 32), set the flags, and
+/// return the result in the low `width` bits.
+///
+/// One implementation for all three widths: doing it per-width is how the
+/// 32-bit case came to be missing entirely, with `D1`/`D3` in 32-bit mode
+/// silently shifting only the low byte.
+///
+/// Rules worth stating, because they are easy to get subtly wrong:
+/// - The count is masked to 5 bits on 386+ **for every operand size**, so a
+///   16-bit shift by 20 shifts a 16-bit value 20 places (result 0) rather
+///   than wrapping the count. Rust's `wrapping_shl` masks the count to the
+///   type's width, which is *not* the same thing — so the shift is done in
+///   `u64` and truncated.
+/// - A count of 0 changes nothing, flags included.
+/// - RCL/RCR rotate through a `width + 1`-bit quantity (the operand plus CF),
+///   so their effective count is taken modulo `width + 1` for 8- and 16-bit
+///   operands. For 32-bit the 5-bit mask already keeps it in range.
+/// - OF is architecturally defined only for a count of 1; we leave it clear
+///   otherwise, which is what the shape `n == 1 && ..` below expresses.
+fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
     use flags::*;
     let n = n & 0x1F;
     if n == 0 { return v; }
+    let mask: u64 = if width == 32 { 0xFFFF_FFFF } else { (1u64 << width) - 1 };
+    let msb: u32 = 1u32 << (width - 1);
+    let v64 = v as u64 & mask;
+
     match op {
         ShiftOp::Shl => {
-            let r = v.wrapping_shl(n);
-            let cf = if n <= 8 { (v >> (8 - n)) & 1 != 0 } else { false };
+            let wide = v64 << n.min(63);
+            let r = (wide & mask) as u32;
+            let cf = n <= width && (v64 >> (width - n.min(width))) & 1 != 0;
             cpu.set_flag(CF, cf);
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x80) != 0);
+            set_logic_flags_width(cpu, r, width);
+            // OF (count 1) = MSB of the result XOR the new CF.
+            cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != cf));
             r
         }
         ShiftOp::Shr => {
-            let r = v.wrapping_shr(n);
-            let cf = if n <= 8 { (v >> (n - 1)) & 1 != 0 } else { false };
+            let r = if n >= width { 0 } else { (v64 >> n) as u32 };
+            let cf = n <= width && (v64 >> (n - 1)) & 1 != 0;
             cpu.set_flag(CF, cf);
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && (v & 0x80) != 0);
+            set_logic_flags_width(cpu, r, width);
+            // OF (count 1) = MSB of the *original* operand.
+            cpu.set_flag(OF, n == 1 && (v & msb) != 0);
             r
         }
         ShiftOp::Sar => {
-            let r = ((v as i8) >> n) as u8;
-            let cf = if n <= 8 { (v >> (n - 1)) & 1 != 0 } else { false };
+            // Sign-extend to i64, shift, truncate. A count at or past the
+            // width saturates to all-sign-bits, which the min() gives us.
+            let sv = sign_extend(v, width);
+            let r = ((sv >> n.min(width - 1)) as u64 & mask) as u32;
+            let cf = ((sv >> (n - 1).min(width - 1)) & 1) != 0;
             cpu.set_flag(CF, cf);
-            set_logic_flags8(cpu, r);
+            set_logic_flags_width(cpu, r, width);
             cpu.set_flag(OF, false);
             r
         }
         ShiftOp::Rol => {
-            let r = v.rotate_left(n);
-            cpu.set_flag(CF, r & 1 != 0);
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x80) != 0);
+            let k = n % width;
+            let r = if k == 0 { v } else { (((v64 << k) | (v64 >> (width - k))) & mask) as u32 };
+            let cf = r & 1 != 0;
+            cpu.set_flag(CF, cf);
+            cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != cf));
             r
         }
         ShiftOp::Ror => {
-            let r = v.rotate_right(n);
-            cpu.set_flag(CF, (r & 0x80) != 0);
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x80) != 0);
+            let k = n % width;
+            let r = if k == 0 { v } else { (((v64 >> k) | (v64 << (width - k))) & mask) as u32 };
+            let cf = r & msb != 0;
+            cpu.set_flag(CF, cf);
+            // OF (count 1) = XOR of the two most significant result bits.
+            let second = (r >> (width - 2)) & 1 != 0;
+            cpu.set_flag(OF, n == 1 && (cf != second));
             r
         }
-        ShiftOp::Rcl => {
-            let mut wide = (v as u16) | ((cpu.get_flag(CF) as u16) << 8);
-            wide = wide.rotate_left(n);
-            cpu.set_flag(CF, (wide >> 8) & 1 != 0);
-            let r = wide as u8;
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x80) != 0);
-            r
-        }
-        ShiftOp::Rcr => {
-            let mut wide = (v as u16) | ((cpu.get_flag(CF) as u16) << 8);
-            wide = wide.rotate_right(n);
-            cpu.set_flag(CF, (wide >> 8) & 1 != 0);
-            let r = wide as u8;
-            set_logic_flags8(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x80) != 0);
+        ShiftOp::Rcl | ShiftOp::Rcr => {
+            // Rotate through carry: a (width + 1)-bit quantity.
+            let bits = width + 1;
+            let k = n % bits;
+            let wide = v64 | ((cpu.get_flag(CF) as u64) << width);
+            let full: u64 = (1u64 << bits) - 1;
+            let rot = if k == 0 {
+                wide
+            } else if op == ShiftOp::Rcl {
+                ((wide << k) | (wide >> (bits - k))) & full
+            } else {
+                ((wide >> k) | (wide << (bits - k))) & full
+            };
+            let r = (rot & mask) as u32;
+            let cf = (rot >> width) & 1 != 0;
+            cpu.set_flag(CF, cf);
+            if op == ShiftOp::Rcl {
+                cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != cf));
+            } else {
+                let second = (r >> (width - 2)) & 1 != 0;
+                cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != second));
+            }
+            // Rotates leave SF/ZF/PF alone.
             r
         }
     }
 }
 
+/// Sign-extend the low `width` bits of `v` to i64.
+fn sign_extend(v: u32, width: u32) -> i64 {
+    match width {
+        8 => v as u8 as i8 as i64,
+        16 => v as u16 as i16 as i64,
+        _ => v as i32 as i64,
+    }
+}
+
+/// SF/ZF/PF for a result of the given width.
+fn set_logic_flags_width(cpu: &mut Cpu, r: u32, width: u32) {
+    match width {
+        8 => set_logic_flags8(cpu, r as u8),
+        16 => set_logic_flags16(cpu, r as u16),
+        _ => set_logic_flags32(cpu, r),
+    }
+}
+
+/// What a bit-test instruction does to the bit it selects.
+#[derive(Clone, Copy, PartialEq)]
+enum BitOp { Test, Set, Reset, Complement }
+
+/// BT/BTS/BTR/BTC. CF takes the bit's old value; the other flags are
+/// architecturally undefined and left alone.
+///
+/// The addressing rule differs by operand kind, and the difference matters:
+/// with a **register** destination the offset wraps within the operand
+/// (mod 16 or 32), but with a **memory** destination it is a signed bit index
+/// into an array that may run far past the addressed word -- which is exactly
+/// how the kernel's bitmaps (`test_bit`, `set_bit`) are addressed.
+fn bit_op(cpu: &mut Cpu, m: &ModRm, bit: BitOffset, op: BitOp) {
+    let width: i64 = if cpu.opsize { 32 } else { 16 };
+    let offset: i64 = match bit {
+        BitOffset::Imm(i) => i as i64,
+        BitOffset::Reg(r) => {
+            if cpu.opsize { cpu.reg32(Reg::reg32(r)) as i32 as i64 }
+            else { cpu.reg16(Reg::reg16(r)) as i16 as i64 }
+        }
+    };
+
+    if m.is_reg() {
+        // Register destination: the offset is taken modulo the width.
+        let b = offset.rem_euclid(width) as u32;
+        let (old, new) = if cpu.opsize {
+            let v = cpu.reg32(Reg::reg32(m.rm));
+            (v >> b & 1 != 0, apply_bit(v, b, op))
+        } else {
+            let v = cpu.reg16(Reg::reg16(m.rm)) as u32;
+            (v >> b & 1 != 0, apply_bit(v, b, op))
+        };
+        cpu.set_flag(flags::CF, old);
+        if op != BitOp::Test {
+            if cpu.opsize { cpu.set_reg32(Reg::reg32(m.rm), new); }
+            else { cpu.set_reg16(Reg::reg16(m.rm), new as u16); }
+        }
+        return;
+    }
+
+    // Memory destination: step whole operands along the bit string. The
+    // displacement is signed, so a negative offset reaches backwards.
+    let bytes = width / 8;
+    let word = offset.div_euclid(width);
+    let b = offset.rem_euclid(width) as u32;
+    let disp = (word * bytes) as i32;
+    let base = if cpu.addrsize { cpu.modrm_addr32_access_pub(m, op != BitOp::Test) }
+               else { cpu.modrm_addr_access_pub(m, op != BitOp::Test) };
+    let addr = base.wrapping_add(disp as isize as usize);
+
+    let (old, new) = if cpu.opsize {
+        let v = cpu.mem.read_u32(addr);
+        (v >> b & 1 != 0, apply_bit(v, b, op))
+    } else {
+        let v = cpu.mem.read_u16(addr) as u32;
+        (v >> b & 1 != 0, apply_bit(v, b, op))
+    };
+    cpu.set_flag(flags::CF, old);
+    if op != BitOp::Test {
+        if cpu.opsize { cpu.mem.write_u32(addr, new); }
+        else { cpu.mem.write_u16(addr, new as u16); }
+    }
+}
+
+fn apply_bit(v: u32, b: u32, op: BitOp) -> u32 {
+    match op {
+        BitOp::Test => v,
+        BitOp::Set => v | (1 << b),
+        BitOp::Reset => v & !(1 << b),
+        BitOp::Complement => v ^ (1 << b),
+    }
+}
+
+/// Signed step for a string instruction: forward, or backward when DF is set.
+fn string_step(cpu: &Cpu, esize: u32) -> i32 {
+    if cpu.get_flag(flags::DF) { -(esize as i32) } else { esize as i32 }
+}
+
+/// Advance a string index register, wrapping at the address size.
+fn string_advance(v: u32, step: i32, a32: bool) -> u32 {
+    let n = v.wrapping_add(step as u32);
+    if a32 { n } else { n & 0xFFFF }
+}
+
+fn string_si(cpu: &Cpu, a32: bool) -> u32 { if a32 { cpu.esi } else { cpu.si() as u32 } }
+fn string_di(cpu: &Cpu, a32: bool) -> u32 { if a32 { cpu.edi } else { cpu.di() as u32 } }
+fn string_set_si(cpu: &mut Cpu, a32: bool, v: u32) {
+    // `_raw`: this write records *where the fault stopped*, so it has to land
+    // even though a fault is pending.
+    if a32 { cpu.set_reg32_raw(Reg32::Esi, v); }
+    else { cpu.set_reg16_raw(Reg16::Si, v as u16); }
+}
+fn string_set_di(cpu: &mut Cpu, a32: bool, v: u32) {
+    if a32 { cpu.set_reg32_raw(Reg32::Edi, v); }
+    else { cpu.set_reg16_raw(Reg16::Di, v as u16); }
+}
+
+/// Iteration count: the count register under a REP prefix, one without.
+/// A REP with a zero count does nothing at all, which the `while cnt > 0`
+/// loops express directly.
+fn string_count(cpu: &Cpu, a32: bool, rep: Rep) -> u32 {
+    if rep == Rep::None { 1 } else if a32 { cpu.ecx } else { cpu.cx() as u32 }
+}
+fn string_set_count(cpu: &mut Cpu, a32: bool, v: u32) {
+    if a32 { cpu.set_reg32_raw(Reg32::Ecx, v); }
+    else { cpu.set_reg16_raw(Reg16::Cx, v as u16); }
+}
+
+/// Should a REPE/REPNE comparison keep going? REP alone always continues
+/// (the count test is the loop condition); the conditional forms also stop
+/// on ZF.
+fn string_repeat(cpu: &Cpu, rep: Rep, remaining: u32) -> bool {
+    match rep {
+        Rep::None => false,
+        _ if remaining == 0 => false,
+        Rep::Repe => cpu.get_flag(flags::ZF),
+        Rep::Repne => !cpu.get_flag(flags::ZF),
+    }
+}
+
+/// Read the r/m operand at `width` bits, shift it, and write it back.
+fn do_shift(cpu: &mut Cpu, op: ShiftOp, m: &ModRm, width: u32, n: u32) {
+    match width {
+        8 => { let v = cpu.read_rm8(m); let r = shift8(cpu, op, v, n); cpu.write_rm8(m, r); }
+        16 => { let v = cpu.read_rm16(m); let r = shift16(cpu, op, v, n); cpu.write_rm16(m, r); }
+        _ => { let v = cpu.read_rm32(m); let r = shift32(cpu, op, v, n); cpu.write_rm32(m, r); }
+    }
+}
+
+fn shift8(cpu: &mut Cpu, op: ShiftOp, v: u8, n: u32) -> u8 {
+    shift_width(cpu, op, v as u32, n, 8) as u8
+}
+
 /// Perform a 16-bit shift/rotate, setting flags, and return the result.
 fn shift16(cpu: &mut Cpu, op: ShiftOp, v: u16, n: u32) -> u16 {
-    use flags::*;
-    let n = n & 0x1F;
-    if n == 0 { return v; }
-    match op {
-        ShiftOp::Shl => {
-            let r = v.wrapping_shl(n);
-            let cf = if n <= 16 { (v >> (16 - n)) & 1 != 0 } else { false };
-            cpu.set_flag(CF, cf);
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x8000) != 0);
-            r
-        }
-        ShiftOp::Shr => {
-            let r = v.wrapping_shr(n);
-            let cf = if n <= 16 { (v >> (n - 1)) & 1 != 0 } else { false };
-            cpu.set_flag(CF, cf);
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && (v & 0x8000) != 0);
-            r
-        }
-        ShiftOp::Sar => {
-            let r = ((v as i16) >> n) as u16;
-            let cf = if n <= 16 { (v >> (n - 1)) & 1 != 0 } else { false };
-            cpu.set_flag(CF, cf);
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, false);
-            r
-        }
-        ShiftOp::Rol => {
-            let r = v.rotate_left(n);
-            cpu.set_flag(CF, r & 1 != 0);
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x8000) != 0);
-            r
-        }
-        ShiftOp::Ror => {
-            let r = v.rotate_right(n);
-            cpu.set_flag(CF, (r & 0x8000) != 0);
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x8000) != 0);
-            r
-        }
-        ShiftOp::Rcl => {
-            let mut wide = (v as u32) | ((cpu.get_flag(CF) as u32) << 16);
-            wide = wide.rotate_left(n);
-            cpu.set_flag(CF, (wide >> 16) & 1 != 0);
-            let r = wide as u16;
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x8000) != 0);
-            r
-        }
-        ShiftOp::Rcr => {
-            let mut wide = (v as u32) | ((cpu.get_flag(CF) as u32) << 16);
-            wide = wide.rotate_right(n);
-            cpu.set_flag(CF, (wide >> 16) & 1 != 0);
-            let r = wide as u16;
-            set_logic_flags16(cpu, r);
-            cpu.set_flag(OF, n == 1 && ((v ^ r) & 0x8000) != 0);
-            r
-        }
-    }
+    shift_width(cpu, op, v as u32, n, 16) as u16
+}
+
+/// Perform a 32-bit shift/rotate, setting flags, and return the result.
+fn shift32(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32) -> u32 {
+    shift_width(cpu, op, v, n, 32)
 }
 
 use crate::memory::Memory;
@@ -2624,7 +3298,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x1236);
+        assert_eq!(cpu.ax(), 0x1236);
         assert!(cpu.halted);
     }
 
@@ -2638,7 +3312,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0xFFFF);
+        assert_eq!(cpu.ax(), 0xFFFF);
         assert!(cpu.get_flag(flags::CF));
         assert!(cpu.get_flag(flags::SF));
     }
@@ -2663,7 +3337,7 @@ mod tests {
     fn call_ret_roundtrip() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         load(&mut cpu, &[
             0xE8, 0x01, 0x00,
             0xF4,
@@ -2671,7 +3345,7 @@ mod tests {
             0xC3,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0099);
+        assert_eq!(cpu.ax(), 0x0099);
         assert!(cpu.halted);
     }
 
@@ -2685,7 +3359,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x4242);
+        assert_eq!(cpu.ax(), 0x4242);
     }
 
     #[test]
@@ -2697,7 +3371,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0);
+        assert_eq!(cpu.ax(), 0);
         assert!(cpu.get_flag(flags::ZF));
         assert!(!cpu.get_flag(flags::CF));
     }
@@ -2712,7 +3386,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0000);
+        assert_eq!(cpu.ax(), 0x0000);
         assert!(cpu.get_flag(flags::ZF));
         assert!(cpu.get_flag(flags::CF));
     }
@@ -2721,7 +3395,7 @@ mod tests {
     fn int_iret_through_ivt() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         cpu.mem.write_u16(0x84, 0x0100);
         cpu.mem.write_u16(0x86, 0x0000);
         cpu.mem.load(0x100, &[
@@ -2733,16 +3407,16 @@ mod tests {
             0xF4,
         ]);
         cpu.run(32);
-        assert_eq!(cpu.ax, 0x0099);
+        assert_eq!(cpu.ax(), 0x0099);
         assert!(cpu.halted);
-        assert_eq!(cpu.sp, 0x0100);
+        assert_eq!(cpu.sp(), 0x0100);
     }
 
     #[test]
     fn pushf_popf_roundtrip() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         cpu.set_flag(flags::CF, true);
         cpu.set_flag(flags::ZF, true);
         load(&mut cpu, &[
@@ -2751,8 +3425,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert!(cpu.ax & flags::CF != 0);
-        assert!(cpu.ax & flags::ZF != 0);
+        assert!(cpu.ax() as u32 & flags::CF != 0);
+        assert!(cpu.ax() as u32 & flags::ZF != 0);
     }
 
     #[test]
@@ -2764,7 +3438,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0000);
+        assert_eq!(cpu.ax(), 0x0000);
         assert!(cpu.get_flag(flags::CF));
         assert!(cpu.get_flag(flags::ZF));
     }
@@ -2779,7 +3453,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x2000);
+        assert_eq!(cpu.ax(), 0x2000);
     }
 
     #[test]
@@ -2829,7 +3503,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0002);
+        assert_eq!(cpu.ax(), 0x0002);
     }
 
     #[test]
@@ -2842,8 +3516,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0000);
-        assert_eq!(cpu.dx, 0x0001);
+        assert_eq!(cpu.ax(), 0x0000);
+        assert_eq!(cpu.dx(), 0x0001);
         assert!(cpu.get_flag(flags::CF));
     }
 
@@ -2857,8 +3531,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0003);
-        assert_eq!(cpu.dx, 0x0004);
+        assert_eq!(cpu.ax(), 0x0003);
+        assert_eq!(cpu.dx(), 0x0004);
     }
 
     #[test]
@@ -2866,9 +3540,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.ds = 0;
         cpu.es = 0;
-        cpu.si = 0x0100;
-        cpu.di = 0x0200;
-        cpu.cx = 3;
+        cpu.set_si(0x0100);
+        cpu.set_di(0x0200);
+        cpu.set_cx(3);
         cpu.mem.write_u8(0x100, 0x41);
         cpu.mem.write_u8(0x101, 0x42);
         cpu.mem.write_u8(0x102, 0x43);
@@ -2880,35 +3554,35 @@ mod tests {
         assert_eq!(cpu.mem.read_u8(0x200), 0x41);
         assert_eq!(cpu.mem.read_u8(0x201), 0x42);
         assert_eq!(cpu.mem.read_u8(0x202), 0x43);
-        assert_eq!(cpu.cx, 0);
-        assert_eq!(cpu.si, 0x0103);
-        assert_eq!(cpu.di, 0x0203);
+        assert_eq!(cpu.cx(), 0);
+        assert_eq!(cpu.si(), 0x0103);
+        assert_eq!(cpu.di(), 0x0203);
     }
 
     #[test]
     fn loop_decrements_cx() {
         let mut cpu = Cpu::new();
-        cpu.cx = 3;
+        cpu.set_cx(3);
         load(&mut cpu, &[
             0xE2, 0xFE,
             0xF4,
         ]);
         cpu.run(64);
         assert!(cpu.halted);
-        assert_eq!(cpu.cx, 0);
+        assert_eq!(cpu.cx(), 0);
     }
 
     #[test]
     fn lea_loads_effective_address() {
         let mut cpu = Cpu::new();
-        cpu.bx = 0x0100;
-        cpu.si = 0x0020;
+        cpu.set_bx(0x0100);
+        cpu.set_si(0x0020);
         load(&mut cpu, &[
             0x8D, 0x00,
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x0120);
+        assert_eq!(cpu.ax(), 0x0120);
     }
 
     #[test]
@@ -2920,7 +3594,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.dx, 0xFFFF);
+        assert_eq!(cpu.dx(), 0xFFFF);
     }
 
     #[test]
@@ -2932,7 +3606,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0xFFFB);
+        assert_eq!(cpu.ax(), 0xFFFB);
         assert!(cpu.get_flag(flags::CF));
     }
 
@@ -2948,7 +3622,7 @@ mod tests {
         ]);
         cpu.run(16);
         assert_eq!(cpu.eax, 0x12345678);
-        assert_eq!(cpu.ax, 0x5678);
+        assert_eq!(cpu.ax(), 0x5678);
     }
 
     #[test]
@@ -3021,12 +3695,13 @@ mod tests {
         // Build a GDT at 0x2000 with a data descriptor at index 1:
         // base=0x10000, limit=0xFFFFF, granularity, present, data.
         // Descriptor bytes (little-endian u64):
-        //   limit15:0 = 0xFFFF
-        //   base23:16 = 0x00
-        //   type/attr = 0x92 (present, data read/write)
-        //   limit19:16 = 0xF, G=1, D=1
-        //   base31:24 = 0x00
-        let desc: u64 = 0x00CF_9200_0001_FFFF;
+        //   bits 0-15   limit 15:0 = 0xFFFF
+        //   bits 16-31  base 15:0  = 0x0000
+        //   bits 32-39  base 23:16 = 0x01
+        //   bits 40-47  type/attr  = 0x92 (present, data read/write)
+        //   bits 48-55  limit 19:16 = 0xF, G=1, D=1
+        //   bits 56-63  base 31:24 = 0x00
+        let desc: u64 = 0x00CF_9201_0000_FFFF;
         cpu.mem.write_u64(0x2008, desc);
         cpu.gdt_base = 0x2000;
         cpu.gdt_limit = 0x17;
@@ -3220,7 +3895,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.ax, 0x3800);
+        assert_eq!(cpu.ax(), 0x3800);
     }
 
     #[test]
@@ -3536,14 +4211,16 @@ mod tests {
     fn divide_by_zero_raises_de() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         // Install an IVT entry for vector 0x00 (#DE) -> handler at 0x0000:0x0300.
         cpu.mem.write_u16(0x00 * 4, 0x0300);
         cpu.mem.write_u16(0x00 * 4 + 2, 0x0000);
-        // Handler: mov ax, 0xDEAD ; iret
+        // Handler: mov ax, 0xDEAD ; hlt. It deliberately does not IRET --
+        // #DE is a fault, so the saved address is the DIV itself and
+        // returning without fixing the divisor would just re-run it.
         cpu.mem.load(0x0300, &[
             0xB8, 0xAD, 0xDE,
-            0xCF,
+            0xF4,
         ]);
         // mov ax, 0x0001 ; mov bx, 0x0000 ; div bx ; hlt
         cpu.ip = 0x1000;
@@ -3555,17 +4232,18 @@ mod tests {
         ]);
         cpu.run(32);
         // The #DE handler ran: AX = 0xDEAD.
-        assert_eq!(cpu.ax, 0xDEAD);
+        assert_eq!(cpu.ax(), 0xDEAD);
         assert!(cpu.halted);
-        // Stack restored after the exception frame.
-        assert_eq!(cpu.sp, 0x0100);
+        // The frame's return address is the DIV, not the instruction after
+        // it: a fault is restartable.
+        assert_eq!(cpu.mem.read_u16(0x00FA), 0x1006);
     }
 
     #[test]
     fn int3_raises_bp() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         // IVT entry for vector 0x03 (#BP) -> handler at 0x0000:0x0300.
         cpu.mem.write_u16(0x03 * 4, 0x0300);
         cpu.mem.write_u16(0x03 * 4 + 2, 0x0000);
@@ -3580,7 +4258,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(32);
-        assert_eq!(cpu.ax, 0x1234);
+        assert_eq!(cpu.ax(), 0x1234);
         assert!(cpu.halted);
     }
 
@@ -3588,7 +4266,7 @@ mod tests {
     fn into_raises_of_when_overflow_set() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         // IVT entry for vector 0x04 (#OF) -> handler at 0x0000:0x0300.
         cpu.mem.write_u16(0x04 * 4, 0x0300);
         cpu.mem.write_u16(0x04 * 4 + 2, 0x0000);
@@ -3604,7 +4282,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(32);
-        assert_eq!(cpu.ax, 0x7777);
+        assert_eq!(cpu.ax(), 0x7777);
         assert!(cpu.halted);
     }
 
@@ -3612,14 +4290,14 @@ mod tests {
     fn invalid_opcode_raises_ud() {
         let mut cpu = Cpu::new();
         cpu.ss = 0;
-        cpu.sp = 0x0100;
+        cpu.set_sp(0x0100);
         // IVT entry for vector 0x06 (#UD) -> handler at 0x0000:0x0300.
         cpu.mem.write_u16(0x06 * 4, 0x0300);
         cpu.mem.write_u16(0x06 * 4 + 2, 0x0000);
-        // Handler: mov ax, 0xBEEF ; iret
+        // Handler: mov ax, 0xBEEF ; hlt (#UD is a fault -- see the #DE test).
         cpu.mem.load(0x0300, &[
             0xB8, 0xEF, 0xBE,
-            0xCF,
+            0xF4,
         ]);
         // 0x0F 0xFF is an invalid opcode (not implemented) ; hlt
         load(&mut cpu, &[
@@ -3627,8 +4305,11 @@ mod tests {
             0xF4,
         ]);
         cpu.run(32);
-        assert_eq!(cpu.ax, 0xBEEF);
+        assert_eq!(cpu.ax(), 0xBEEF);
         assert!(cpu.halted);
+        // The saved address is the invalid instruction itself (loaded at
+        // CS:IP = 0:0 by the test helper), not the byte after it.
+        assert_eq!(cpu.mem.read_u16(0x00FA), 0x0000);
     }
 
     #[test]
@@ -3648,11 +4329,12 @@ mod tests {
         cpu.mem.write_u16(entry, 0x5000);
         cpu.mem.write_u16(entry + 2, 0x08);
         cpu.mem.write_u16(entry + 6, 0x0000);
-        // Handler at 0x5000: mov eax, 0xCAFE ; iret (32-bit, matching the
-        // 32-bit frame protected_int pushes)
+        // Handler at 0x5000: mov eax, 0xCAFE ; hlt. No IRET: #PF pushes an
+        // error code on top of the frame, so a handler has to drop it before
+        // returning -- and returning at all would re-run the faulting load.
         cpu.mem.load(0x5000, &[
             0x66, 0xB8, 0xFE, 0xCA, 0x00, 0x00,
-            0x66, 0xCF,
+            0xF4,
         ]);
         // Page directory at 0x2000. Identity-map the low 4 MiB (PDE[0] ->
         // page table at 0x3000, PT[0..5] -> pages 0x0000..0x5000) so the
@@ -3679,5 +4361,780 @@ mod tests {
         // CR2 holds the faulting linear address.
         assert_eq!(cpu.cr2, 0x0040_0000);
         assert!(cpu.halted);
+        // The frame is EFLAGS, CS, EIP, error code -- error code on TOP, at
+        // the lowest address, which is where a handler reads it from.
+        assert_eq!(cpu.mem.read_u32(0x00F0), 0x0000_0000); // error code: not present, read
+        assert_eq!(cpu.mem.read_u32(0x00F4), 0x1000);      // EIP: the faulting load
+        assert_eq!(cpu.mem.read_u32(0x00F8), 0x08);        // CS
+    }
+
+    // ---- Tests for the instructions and behaviours added while getting a
+    // ---- real Linux kernel to boot. Each of these pins a bug that was found
+    // ---- the hard way, from a kernel that crashed thousands of instructions
+    // ---- later with no obvious connection to the cause.
+
+    /// Set up a CPU in flat 32-bit protected mode with code at 0x1000 and a
+    /// stack at 0x8000, the shape almost every 32-bit test wants.
+    fn flat32() -> Cpu {
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cs = 0x08;
+        cpu.ss = 0x10;
+        let code = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true };
+        let data = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true };
+        cpu.seg_desc[SegReg::Cs as usize] = code;
+        for s in [SegReg::Ds, SegReg::Es, SegReg::Ss, SegReg::Fs, SegReg::Gs] {
+            cpu.seg_desc[s as usize] = data;
+        }
+        cpu.eip = 0x1000;
+        cpu.esp = 0x8000;
+        cpu
+    }
+
+    fn run32(bytes: &[u8]) -> Cpu {
+        let mut cpu = flat32();
+        cpu.mem.load(0x1000, bytes);
+        cpu.run(200);
+        cpu
+    }
+
+    #[test]
+    fn cmp_sets_flags_without_writing_the_destination() {
+        // CMP is SUB that throws the result away. Writing it back corrupts a
+        // register on every comparison -- and the kernel compares constantly.
+        let cpu = run32(&[
+            0xB8, 0x0A, 0x00, 0x00, 0x00, // mov eax, 10
+            0xBB, 0x03, 0x00, 0x00, 0x00, // mov ebx, 3
+            0x39, 0xD8,                   // cmp eax, ebx
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 10, "CMP must not modify its destination");
+        assert_eq!(cpu.ebx, 3);
+        assert!(!cpu.get_flag(flags::ZF));
+        assert!(!cpu.get_flag(flags::CF));
+    }
+
+    #[test]
+    fn cmp_reg_form_also_leaves_the_register_alone() {
+        let cpu = run32(&[
+            0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+            0xBB, 0x0A, 0x00, 0x00, 0x00, // mov ebx, 10
+            0x3B, 0xC3,                   // cmp eax, ebx  (Dir::RegRm)
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 3);
+        assert!(cpu.get_flag(flags::CF), "3 - 10 borrows");
+    }
+
+    #[test]
+    fn shifts_are_32_bit_wide_in_a_32_bit_segment() {
+        // D1/D3 in a D=1 segment shift the whole 32-bit register. Treating
+        // them as byte shifts leaves the top 24 bits untouched, which turns
+        // a `value >>= 4` loop into an infinite one.
+        let cpu = run32(&[
+            0xBA, 0x00, 0x00, 0x1A, 0xE1, // mov edx, 0xE11A0000
+            0xB1, 0x04,                   // mov cl, 4
+            0xD3, 0xEA,                   // shr edx, cl
+            0xF4,
+        ]);
+        assert_eq!(cpu.edx, 0x0E11_A000);
+    }
+
+    #[test]
+    fn shift_by_one_and_by_immediate_agree() {
+        let cpu = run32(&[
+            0xB8, 0x00, 0x00, 0x00, 0x80, // mov eax, 0x80000000
+            0xD1, 0xE8,                   // shr eax, 1
+            0xBB, 0x00, 0x00, 0x00, 0x80, // mov ebx, 0x80000000
+            0xC1, 0xEB, 0x01,             // shr ebx, 1
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 0x4000_0000);
+        assert_eq!(cpu.ebx, 0x4000_0000);
+    }
+
+    #[test]
+    fn shift_count_past_the_operand_width_clears_it() {
+        // The count is masked to 5 bits for every operand size, so a 16-bit
+        // shift by 20 really does shift a 16-bit value 20 places.
+        let mut cpu = flat32();
+        cpu.mem.load(0x1000, &[
+            0x66, 0xB8, 0xFF, 0xFF, // mov ax, 0xFFFF
+            0xB1, 0x14,             // mov cl, 20
+            0x66, 0xD3, 0xE0,       // shl ax, cl
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.ax(), 0);
+    }
+
+    #[test]
+    fn sar_replicates_the_sign_bit() {
+        let cpu = run32(&[
+            0xB8, 0x00, 0x00, 0x00, 0x80, // mov eax, 0x80000000
+            0xC1, 0xF8, 0x04,             // sar eax, 4
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 0xF800_0000);
+    }
+
+    #[test]
+    fn rotate_through_carry_by_more_than_one() {
+        // RCL rotates through a 33-bit quantity; doing it as a plain 32-bit
+        // rotate loses the carry bit for any count above 1.
+        let cpu = run32(&[
+            0xF8,                         // clc
+            0xB8, 0x01, 0x00, 0x00, 0x80, // mov eax, 0x80000001
+            0xC1, 0xD0, 0x02,             // rcl eax, 2
+            0xF4,
+        ]);
+        // Worked through as a 33-bit rotate: (CF:EAX) = 0_80000001 rotated
+        // left twice gives 0_00000005, so EAX = 5 and CF comes back clear.
+        // A plain 32-bit rotate would give 6 and lose the carry.
+        assert_eq!(cpu.eax, 0x0000_0005);
+        assert!(!cpu.get_flag(flags::CF));
+    }
+
+    #[test]
+    fn pusha_and_popa_round_trip() {
+        let cpu = run32(&[
+            0xB8, 0x11, 0x11, 0x11, 0x11, // mov eax, 0x11111111
+            0xBB, 0x22, 0x22, 0x22, 0x22, // mov ebx, 0x22222222
+            0xB9, 0x33, 0x33, 0x33, 0x33, // mov ecx, 0x33333333
+            0x60,                         // pushad
+            0x31, 0xC0,                   // xor eax, eax
+            0x31, 0xDB,                   // xor ebx, ebx
+            0x31, 0xC9,                   // xor ecx, ecx
+            0x61,                         // popad
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 0x1111_1111);
+        assert_eq!(cpu.ebx, 0x2222_2222);
+        assert_eq!(cpu.ecx, 0x3333_3333);
+        assert_eq!(cpu.esp, 0x8000, "POPAD must restore the stack pointer");
+    }
+
+    #[test]
+    fn pop_rm_writes_memory() {
+        let cpu = run32(&[
+            0x68, 0xEF, 0xBE, 0xAD, 0xDE, // push 0xDEADBEEF
+            0x8F, 0x05, 0x00, 0x30, 0x00, 0x00, // pop dword [0x3000]
+            0xF4,
+        ]);
+        assert_eq!(cpu.mem.read_u32(0x3000), 0xDEAD_BEEF);
+        assert_eq!(cpu.esp, 0x8000);
+    }
+
+    #[test]
+    fn push_imm8_pushes_four_bytes_in_32_bit_mode() {
+        // A two-byte push here misaligns the stack for everything after it.
+        let cpu = run32(&[
+            0x6A, 0xFF, // push -1
+            0xF4,
+        ]);
+        assert_eq!(cpu.esp, 0x7FFC);
+        assert_eq!(cpu.mem.read_u32(0x7FFC), 0xFFFF_FFFF, "sign-extended");
+    }
+
+    #[test]
+    fn setcc_writes_one_or_zero() {
+        let cpu = run32(&[
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+            0x83, 0xF8, 0x05,             // cmp eax, 5
+            0x0F, 0x94, 0xC3,             // sete bl
+            0x0F, 0x95, 0xC7,             // setne bh
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx & 0xFF, 1);
+        assert_eq!((cpu.ebx >> 8) & 0xFF, 0);
+    }
+
+    #[test]
+    fn imul_three_operand_and_two_operand() {
+        let cpu = run32(&[
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0x6B, 0xD8, 0x06,             // imul ebx, eax, 6
+            0xB9, 0x03, 0x00, 0x00, 0x00, // mov ecx, 3
+            0x0F, 0xAF, 0xC8,             // imul ecx, eax
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx, 42);
+        assert_eq!(cpu.ecx, 21);
+    }
+
+    #[test]
+    fn imul_sets_carry_when_the_product_does_not_fit() {
+        let cpu = run32(&[
+            0xB8, 0x00, 0x00, 0x00, 0x40, // mov eax, 0x40000000
+            0x6B, 0xC0, 0x04,             // imul eax, eax, 4
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 0, "low half of the product");
+        assert!(cpu.get_flag(flags::CF));
+        assert!(cpu.get_flag(flags::OF));
+    }
+
+    #[test]
+    fn shrd_and_shld_move_bits_between_registers() {
+        let cpu = run32(&[
+            0xB8, 0xFF, 0xFF, 0x0F, 0x00, // mov eax, 0x000FFFFF
+            0xBA, 0x00, 0x00, 0x1A, 0xE1, // mov edx, 0xE11A0000
+            0xB1, 0x04,                   // mov cl, 4
+            0x0F, 0xAD, 0xD0,             // shrd eax, edx, cl
+            0xF4,
+        ]);
+        // eax >> 4, with edx's low nibble shifted into the top.
+        assert_eq!(cpu.eax, 0x0000_FFFF);
+    }
+
+    #[test]
+    fn bsf_and_bsr_find_the_end_bits() {
+        let cpu = run32(&[
+            0xB8, 0x00, 0x01, 0x00, 0x01, // mov eax, 0x01000100
+            0x0F, 0xBC, 0xD8,             // bsf ebx, eax
+            0x0F, 0xBD, 0xC8,             // bsr ecx, eax
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx, 8);
+        assert_eq!(cpu.ecx, 24);
+        assert!(!cpu.get_flag(flags::ZF));
+    }
+
+    #[test]
+    fn bsf_of_zero_sets_zf_and_leaves_the_destination() {
+        let cpu = run32(&[
+            0xBB, 0x99, 0x00, 0x00, 0x00, // mov ebx, 0x99
+            0x31, 0xC0,                   // xor eax, eax
+            0x0F, 0xBC, 0xD8,             // bsf ebx, eax
+            0xF4,
+        ]);
+        assert!(cpu.get_flag(flags::ZF));
+        assert_eq!(cpu.ebx, 0x99);
+    }
+
+    #[test]
+    fn bit_test_uses_the_registers_value_not_its_number() {
+        // BT with a register offset takes the *value* in that register. Using
+        // the ModR/M reg field instead makes every `test_bit()` answer from
+        // whichever bit the register number happens to name -- which had the
+        // kernel believing every interrupt vector was already claimed.
+        let cpu = run32(&[
+            0xB8, 0x00, 0x00, 0x00, 0x80, // mov eax, 0x80000000
+            0xBA, 0x1F, 0x00, 0x00, 0x00, // mov edx, 31
+            0x0F, 0xA3, 0xD0,             // bt eax, edx
+            0xF4,
+        ]);
+        assert!(cpu.get_flag(flags::CF), "bit 31 of 0x80000000 is set");
+    }
+
+    #[test]
+    fn bit_test_on_memory_indexes_a_bit_string() {
+        // With a memory operand the offset is not masked to the operand size:
+        // it selects a dword further along, which is how kernel bitmaps work.
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 0);
+        cpu.mem.write_u32(0x3004, 0x0000_0004); // bit 34 overall
+        cpu.mem.load(0x1000, &[
+            0xBA, 0x22, 0x00, 0x00, 0x00,             // mov edx, 34
+            0x0F, 0xA3, 0x15, 0x00, 0x30, 0x00, 0x00, // bt [0x3000], edx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert!(cpu.get_flag(flags::CF));
+    }
+
+    #[test]
+    fn bts_on_memory_sets_the_right_bit() {
+        let mut cpu = flat32();
+        cpu.mem.load(0x1000, &[
+            0xBA, 0x21, 0x00, 0x00, 0x00,             // mov edx, 33
+            0x0F, 0xAB, 0x15, 0x00, 0x30, 0x00, 0x00, // bts [0x3000], edx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.mem.read_u32(0x3000), 0);
+        assert_eq!(cpu.mem.read_u32(0x3004), 0x0000_0002);
+    }
+
+    #[test]
+    fn xchg_swaps_register_and_memory() {
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 0xAAAA_AAAA);
+        cpu.mem.load(0x1000, &[
+            0xB8, 0xBB, 0xBB, 0xBB, 0xBB,       // mov eax, 0xBBBBBBBB
+            0x87, 0x05, 0x00, 0x30, 0x00, 0x00, // xchg [0x3000], eax
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.eax, 0xAAAA_AAAA);
+        assert_eq!(cpu.mem.read_u32(0x3000), 0xBBBB_BBBB);
+    }
+
+    #[test]
+    fn cmpxchg_swaps_only_on_a_match() {
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 5);
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x05, 0x00, 0x00, 0x00,       // mov eax, 5   (expected)
+            0xBB, 0x63, 0x00, 0x00, 0x00,       // mov ebx, 99  (new)
+            0x0F, 0xB1, 0x1D, 0x00, 0x30, 0x00, 0x00, // cmpxchg [0x3000], ebx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert!(cpu.get_flag(flags::ZF));
+        assert_eq!(cpu.mem.read_u32(0x3000), 99);
+    }
+
+    #[test]
+    fn cmpxchg_loads_the_accumulator_on_a_mismatch() {
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 7);
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x05, 0x00, 0x00, 0x00,
+            0xBB, 0x63, 0x00, 0x00, 0x00,
+            0x0F, 0xB1, 0x1D, 0x00, 0x30, 0x00, 0x00,
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert!(!cpu.get_flag(flags::ZF));
+        assert_eq!(cpu.eax, 7, "accumulator takes the destination's value");
+        assert_eq!(cpu.mem.read_u32(0x3000), 7, "destination unchanged");
+    }
+
+    #[test]
+    fn xadd_exchanges_and_adds() {
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 10);
+        cpu.mem.load(0x1000, &[
+            0xBB, 0x05, 0x00, 0x00, 0x00,             // mov ebx, 5
+            0x0F, 0xC1, 0x1D, 0x00, 0x30, 0x00, 0x00, // xadd [0x3000], ebx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.ebx, 10, "source register gets the old destination");
+        assert_eq!(cpu.mem.read_u32(0x3000), 15);
+    }
+
+    #[test]
+    fn cmpxchg8b_compares_and_swaps_64_bits() {
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 0x1111_1111);
+        cpu.mem.write_u32(0x3004, 0x2222_2222);
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x11, 0x11, 0x11, 0x11,       // mov eax, 0x11111111
+            0xBA, 0x22, 0x22, 0x22, 0x22,       // mov edx, 0x22222222
+            0xBB, 0x44, 0x44, 0x44, 0x44,       // mov ebx, 0x44444444
+            0xB9, 0x33, 0x33, 0x33, 0x33,       // mov ecx, 0x33333333
+            0x0F, 0xC7, 0x0D, 0x00, 0x30, 0x00, 0x00, // cmpxchg8b [0x3000]
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert!(cpu.get_flag(flags::ZF));
+        assert_eq!(cpu.mem.read_u32(0x3000), 0x4444_4444);
+        assert_eq!(cpu.mem.read_u32(0x3004), 0x3333_3333);
+    }
+
+    #[test]
+    fn bswap_reverses_byte_order() {
+        let cpu = run32(&[
+            0xB8, 0x78, 0x56, 0x34, 0x12, // mov eax, 0x12345678
+            0x0F, 0xC8,                   // bswap eax
+            0xF4,
+        ]);
+        assert_eq!(cpu.eax, 0x7856_3412);
+    }
+
+    #[test]
+    fn cmovcc_moves_only_when_the_condition_holds() {
+        let cpu = run32(&[
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xBB, 0x63, 0x00, 0x00, 0x00, // mov ebx, 99
+            0x85, 0xC0,                   // test eax, eax
+            0x0F, 0x44, 0xD8,             // cmove ebx, eax   (not taken)
+            0x0F, 0x45, 0xD8,             // cmovne ebx, eax  (taken)
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx, 1);
+    }
+
+    #[test]
+    fn leave_tears_down_the_frame() {
+        let cpu = run32(&[
+            0xBD, 0x00, 0x70, 0x00, 0x00, // mov ebp, 0x7000
+            0x55,                         // push ebp
+            0x89, 0xE5,                   // mov ebp, esp
+            0x83, 0xEC, 0x20,             // sub esp, 32
+            0xC9,                         // leave
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebp, 0x7000);
+        assert_eq!(cpu.esp, 0x8000);
+    }
+
+    #[test]
+    fn ret_imm16_drops_arguments() {
+        let cpu = run32(&[
+            0x68, 0x08, 0x00, 0x00, 0x00, // push 8   (a fake argument)
+            0xE8, 0x01, 0x00, 0x00, 0x00, // call +1
+            0xF4,                         // hlt (returned here)
+            0xC2, 0x04, 0x00,             // ret 4
+        ]);
+        assert!(cpu.halted);
+        assert_eq!(cpu.esp, 0x8000, "the pushed argument was dropped too");
+    }
+
+    #[test]
+    fn inc_and_dec_r_m8_preserve_carry() {
+        let mut cpu = flat32();
+        cpu.mem.write_u8(0x3000, 0x7F);
+        cpu.mem.load(0x1000, &[
+            0xF9,                               // stc
+            0xFE, 0x05, 0x00, 0x30, 0x00, 0x00, // inc byte [0x3000]
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.mem.read_u8(0x3000), 0x80);
+        assert!(cpu.get_flag(flags::CF), "INC leaves CF alone");
+        assert!(cpu.get_flag(flags::OF), "0x7F + 1 overflows a signed byte");
+    }
+
+    #[test]
+    fn lock_prefix_is_accepted() {
+        // `lock` is a prefix, not an opcode: failing to consume it turns
+        // every atomic operation in the kernel into an invalid instruction.
+        let mut cpu = flat32();
+        cpu.mem.write_u32(0x3000, 1);
+        cpu.mem.load(0x1000, &[
+            0xF0, 0xFF, 0x05, 0x00, 0x30, 0x00, 0x00, // lock inc dword [0x3000]
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert!(cpu.unknown_ops.is_empty(), "LOCK must decode as a prefix");
+        assert_eq!(cpu.mem.read_u32(0x3000), 2);
+    }
+
+    #[test]
+    fn multi_byte_nop_decodes() {
+        let cpu = run32(&[
+            0x0F, 0x1F, 0x40, 0x00, // nopl 0x0(%eax)
+            0xF4,
+        ]);
+        assert!(cpu.unknown_ops.is_empty());
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn pushfd_and_popfd_move_the_whole_of_eflags() {
+        // Linux toggles the ID bit (21) through PUSHFD/POPFD to decide whether
+        // CPUID exists at all. A 16-bit flags word cannot carry it.
+        let cpu = run32(&[
+            0x9C,                               // pushfd
+            0x58,                               // pop eax
+            0x35, 0x00, 0x00, 0x20, 0x00,       // xor eax, 0x00200000  (ID)
+            0x50,                               // push eax
+            0x9D,                               // popfd
+            0x9C,                               // pushfd
+            0x5B,                               // pop ebx
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx & 0x0020_0000, 0x0020_0000, "ID bit is writable");
+        assert_eq!(cpu.esp, 0x8000);
+    }
+
+    #[test]
+    fn segment_registers_push_and_pop() {
+        let cpu = run32(&[
+            0x0F, 0xA0, // push fs
+            0x1E,       // push ds
+            0x1F,       // pop ds
+            0x0F, 0xA1, // pop fs
+            0xF4,
+        ]);
+        assert!(cpu.unknown_ops.is_empty());
+        assert_eq!(cpu.esp, 0x8000);
+    }
+
+    #[test]
+    fn debug_registers_read_back_what_was_written() {
+        let cpu = run32(&[
+            0xB8, 0x55, 0x00, 0x00, 0x00, // mov eax, 0x55
+            0x0F, 0x23, 0xF8,             // mov dr7, eax
+            0x0F, 0x21, 0xFB,             // mov ebx, dr7
+            0xF4,
+        ]);
+        assert_eq!(cpu.ebx, 0x55);
+    }
+
+    #[test]
+    fn moffs_honours_a_segment_override() {
+        // `mov %gs:0xC,%eax` is how i386 userspace reads thread-local storage.
+        // Translating it through DS instead reads address 0xC.
+        let mut cpu = flat32();
+        cpu.seg_desc[SegReg::Gs as usize] = Descriptor {
+            base: 0x5000, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+        };
+        cpu.mem.write_u32(0x500C, 0xFEED_FACE);
+        cpu.mem.write_u32(0x000C, 0xDEAD_0000);
+        cpu.mem.load(0x1000, &[
+            0x65, 0xA1, 0x0C, 0x00, 0x00, 0x00, // mov eax, gs:0xC
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.eax, 0xFEED_FACE);
+    }
+
+    #[test]
+    fn an_immediate_that_ends_on_a_page_boundary_is_fetched_whole() {
+        // The instruction-fetch cache advances a physical pointer. When an
+        // operand's last byte sits at offset 0xFFF the cursor lands on the
+        // next *virtual* page, whose physical page is unrelated -- so the
+        // cache has to be dropped. Here the two pages are deliberately not
+        // contiguous in physical memory, so a stale cache reads rubbish.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        // Page directory entry 0 -> page table at 0x21000.
+        cpu.mem.write_u32(0x20000, 0x21003);
+        // Identity-map the first 16 pages so the stack and data work.
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        // Virtual page 0x10 -> physical 0x40000, virtual 0x11 -> 0x60000:
+        // adjacent virtually, far apart physically.
+        cpu.mem.write_u32(0x21000 + 0x10 * 4, 0x40003);
+        cpu.mem.write_u32(0x21000 + 0x11 * 4, 0x60003);
+        cpu.cr0 = 0x8000_0001;
+        // `mov dword [0x3000], 0xAABBCCDD` placed so its immediate straddles
+        // the boundary: the instruction is 10 bytes and starts 6 before it.
+        let code: [u8; 11] = [
+            0xC7, 0x05, 0x00, 0x30, 0x00, 0x00, 0xDD, 0xCC, 0xBB, 0xAA,
+            0xF4,
+        ];
+        // The first six bytes sit at the end of physical page 0x40000; the
+        // rest continue at the start of physical page 0x60000, because that
+        // is where the *next virtual* page actually lives.
+        for (i, b) in code.iter().enumerate() {
+            if i < 6 {
+                cpu.mem.write_u8(0x40000 + 0x1000 - 6 + i, *b);
+            } else {
+                cpu.mem.write_u8(0x60000 + (i - 6), *b);
+            }
+        }
+        // Physical 0x41000 -- where a stale fetch cache would keep reading --
+        // holds a pattern that must not reach the immediate.
+        for i in 0..8 {
+            cpu.mem.write_u8(0x41000 + i, 0x77);
+        }
+        cpu.eip = 0x10000 + 0x1000 - 6;
+        cpu.run(16);
+        assert_eq!(cpu.mem.read_u32(0x3000), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn a_faulting_instruction_does_not_commit_its_result() {
+        // `add (%edi),%edx` whose load page-faults must leave EDX untouched:
+        // the instruction restarts after the handler, and a partial commit
+        // makes the retry add to an already-modified value.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        cpu.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        // Leave virtual page 0x30 unmapped.
+        cpu.cr0 = 0x8000_0001;
+        cpu.idt_base = 0x5000;
+        cpu.idt_limit = 0xFF;
+        // #PF handler: just halt, so the test can look at the register.
+        let entry = 0x5000 + 0x0E * 8;
+        cpu.mem.write_u16(entry, 0x2000);
+        cpu.mem.write_u16(entry + 2, 0x08);
+        cpu.mem.write_u16(entry + 4, 0x8E00);
+        cpu.mem.write_u16(entry + 6, 0x0000);
+        cpu.mem.write_u8(0x2000, 0xF4);
+        cpu.mem.load(0x1000, &[
+            0xBA, 0x0A, 0x00, 0x00, 0x00,       // mov edx, 10
+            0xBF, 0x00, 0x00, 0x03, 0x00,       // mov edi, 0x30000 (unmapped)
+            0x03, 0x17,                         // add edx, [edi]
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.cr2, 0x0003_0000, "the faulting address");
+        assert_eq!(cpu.edx, 10, "EDX must be untouched by the faulted add");
+    }
+
+    #[test]
+    fn a_rep_string_stops_at_the_element_that_faults() {
+        // The count and index registers have to point at the failing element
+        // so the restart resumes there. Running the loop to completion through
+        // the fault writes the rest of it into nowhere and the retry copies
+        // nothing.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        cpu.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        cpu.cr0 = 0x8000_0001;
+        cpu.idt_base = 0x5000;
+        cpu.idt_limit = 0xFF;
+        let entry = 0x5000 + 0x0E * 8;
+        cpu.mem.write_u16(entry, 0x2000);
+        cpu.mem.write_u16(entry + 2, 0x08);
+        cpu.mem.write_u16(entry + 4, 0x8E00);
+        cpu.mem.write_u16(entry + 6, 0x0000);
+        cpu.mem.write_u8(0x2000, 0xF4);
+        // Store 0x100 dwords from 0xFF00: the last of them runs off the end
+        // of the mapped region at 0x10000.
+        cpu.mem.load(0x1000, &[
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF,       // mov eax, 0xFFFFFFFF
+            0xBF, 0x00, 0xFF, 0x00, 0x00,       // mov edi, 0xFF00
+            0xB9, 0x00, 0x01, 0x00, 0x00,       // mov ecx, 0x100
+            0xF3, 0xAB,                         // rep stosd
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.cr2 & !0xFFF, 0x0001_0000, "faulted on the next page");
+        assert_eq!(cpu.edi, 0x1_0000, "EDI stops at the faulting element");
+        assert_eq!(cpu.ecx, 0x100 - 0x40, "and so does the count");
+        // Everything before the fault really was written.
+        assert_eq!(cpu.mem.read_u32(0xFFFC), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn write_protect_faults_a_supervisor_write_to_a_read_only_page() {
+        // CR0.WP. Linux checks this before it will run at all.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        cpu.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        // Make virtual page 5 read-only.
+        cpu.mem.write_u32(0x21000 + 5 * 4, 0x5001);
+        cpu.idt_base = 0x5000;
+        cpu.idt_limit = 0xFF;
+        let entry = 0x5000 + 0x0E * 8;
+        cpu.mem.write_u16(entry, 0x2000);
+        cpu.mem.write_u16(entry + 2, 0x08);
+        cpu.mem.write_u16(entry + 4, 0x8E00);
+        cpu.mem.write_u16(entry + 6, 0x0000);
+        cpu.mem.write_u8(0x2000, 0xF4);
+
+        // With WP clear the write goes through.
+        cpu.cr0 = 0x8000_0001;
+        cpu.mem.load(0x1000, &[
+            0xC7, 0x05, 0x00, 0x50, 0x00, 0x00, 0x2A, 0x00, 0x00, 0x00,
+            0xF4,
+        ]);
+        cpu.run(32);
+        assert_eq!(cpu.mem.read_u32(0x5000), 42);
+
+        // With WP set the same write faults.
+        let mut cpu2 = flat32();
+        cpu2.cr3 = 0x20000;
+        cpu2.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu2.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        cpu2.mem.write_u32(0x21000 + 5 * 4, 0x5001);
+        cpu2.idt_base = 0x5000;
+        cpu2.idt_limit = 0xFF;
+        cpu2.mem.write_u16(entry, 0x2000);
+        cpu2.mem.write_u16(entry + 2, 0x08);
+        cpu2.mem.write_u16(entry + 4, 0x8E00);
+        cpu2.mem.write_u16(entry + 6, 0x0000);
+        cpu2.mem.write_u8(0x2000, 0xF4);
+        cpu2.cr0 = 0x8001_0001; // PG | WP | PE
+        cpu2.mem.load(0x1000, &[
+            0xC7, 0x05, 0x00, 0x50, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00,
+            0xF4,
+        ]);
+        cpu2.run(32);
+        assert_eq!(cpu2.cr2, 0x5000);
+        assert_ne!(cpu2.mem.read_u32(0x5000), 99, "the write must not land");
+    }
+
+    #[test]
+    fn an_exception_pushes_its_error_code_on_top_of_the_frame() {
+        // EFLAGS, CS, EIP, then the error code -- error code last, so it ends
+        // up at the lowest address. Any other order shifts every field the
+        // handler reads by one slot.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        cpu.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        cpu.cr0 = 0x8000_0001;
+        cpu.idt_base = 0x5000;
+        cpu.idt_limit = 0xFF;
+        let entry = 0x5000 + 0x0E * 8;
+        cpu.mem.write_u16(entry, 0x2000);
+        cpu.mem.write_u16(entry + 2, 0x08);
+        cpu.mem.write_u16(entry + 4, 0x8E00);
+        cpu.mem.write_u16(entry + 6, 0x0000);
+        cpu.mem.write_u8(0x2000, 0xF4);
+        cpu.mem.load(0x1000, &[
+            0xA1, 0x00, 0x00, 0x03, 0x00, // mov eax, [0x30000] (unmapped)
+            0xF4,
+        ]);
+        cpu.run(32);
+        let esp = cpu.esp as usize;
+        assert_eq!(cpu.mem.read_u32(esp), 0, "error code: not present, read");
+        assert_eq!(cpu.mem.read_u32(esp + 4), 0x1000, "EIP: the faulting insn");
+        assert_eq!(cpu.mem.read_u32(esp + 8), 0x08, "CS");
+    }
+
+    #[test]
+    fn the_16_bit_view_of_a_register_is_not_a_separate_copy() {
+        // Writing ECX then reading CL must see the new value. Keeping AX and
+        // EAX as two fields meant any 32-bit write that forgot to refresh the
+        // 16-bit half left the two disagreeing, and the next byte-register
+        // write rebuilt the 32-bit register from the stale half.
+        let cpu = run32(&[
+            0xBF, 0x00, 0x00, 0x04, 0x00, // mov edi, 0x40000 (clear of the code)
+            0xB9, 0x9C, 0x06, 0x00, 0x00, // mov ecx, 0x69C
+            0xF3, 0xAB,                   // rep stosd  (drives ECX to 0)
+            0xB1, 0x04,                   // mov cl, 4
+            0xF4,
+        ]);
+        assert_eq!(cpu.ecx, 4, "CL must write into the register ECX shares");
+    }
+
+    #[test]
+    fn hlt_waits_for_an_interrupt_instead_of_stopping_the_machine() {
+        // The idle loop is `hlt`; a CPU that stops there never takes another
+        // timer tick and the kernel never runs again.
+        let mut cpu = Cpu::new();
+        cpu.ss = 0;
+        cpu.set_sp(0x0100);
+        cpu.port_out(0x43, 0x36);
+        cpu.port_out(0x40, 200);
+        cpu.port_out(0x40, 0);
+        cpu.port_out(0x20, 0x11);
+        cpu.port_out(0x21, 0x08);
+        cpu.mem.write_u16(0x08 * 4, 0x0200);
+        cpu.mem.write_u16(0x08 * 4 + 2, 0x0000);
+        // Handler: mask the timer, set AX, iret.
+        cpu.mem.load(0x0200, &[
+            0xB0, 0x01, 0xE6, 0x21, 0xB8, 0x42, 0x00, 0xCF,
+        ]);
+        cpu.mem.load(0x0100, &[0xF4, 0xF4]);
+        cpu.cs = 0;
+        cpu.ip = 0x0100;
+        cpu.set_flag(flags::IF, true);
+        cpu.run(4096);
+        assert_eq!(cpu.ax(), 0x42, "the timer woke the halted CPU");
+    }
+
+    #[test]
+    fn a_halt_with_interrupts_disabled_really_stops() {
+        // ... but with IF clear nothing can ever wake it, so the run ends
+        // rather than spinning to the instruction limit.
+        let mut cpu = Cpu::new();
+        cpu.mem.load(0, &[0xFA, 0xF4]); // cli ; hlt
+        let ran = cpu.run(1_000_000);
+        assert!(cpu.halted);
+        assert!(ran < 10, "ran {} instructions", ran);
     }
 }

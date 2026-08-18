@@ -12,7 +12,8 @@ use crate::cpu::SegReg;
 pub struct Descriptor {
     pub base: u32,
     pub limit: u32,
-    /// Attribute byte: bits 7-4 = type, bit 3 = S, bits 2-1 = DPL, bit 0 = P.
+    /// Access byte: bit 7 = P (present), bits 6-5 = DPL, bit 4 = S
+    /// (0 = system segment), bits 3-0 = type.
     pub attr: u8,
     /// Granularity bit (G) and default operand size bit (D/B).
     pub g: bool,
@@ -22,17 +23,17 @@ pub struct Descriptor {
 impl Descriptor {
     /// Parse an 8-byte descriptor (little-endian u64).
     pub fn parse(raw: u64) -> Descriptor {
-        // 386 descriptor layout:
-        //   bits 0-15:  limit15:0
-        //   bits 16-31: base23:16
-        //   bits 32-39: base15:0
+        // 386 descriptor layout, as a little-endian u64:
+        //   bits 0-15:  limit 15:0
+        //   bits 16-31: base 15:0
+        //   bits 32-39: base 23:16
         //   bits 40-47: type/attr
-        //   bits 48-51: limit19:16
+        //   bits 48-51: limit 19:16
         //   bits 52-55: AVL, L, D/B, G
-        //   bits 56-63: base31:24
-        let base = ((raw >> 32) & 0xFF) as u32
-            | (((raw >> 16) & 0xFFFF) as u32) << 16
-            | (((raw >> 56) & 0xFF) as u32) << 24;
+        //   bits 56-63: base 31:24
+        let base = (((raw >> 16) & 0xFFFF) as u32)
+            | ((((raw >> 32) & 0xFF) as u32) << 16)
+            | ((((raw >> 56) & 0xFF) as u32) << 24);
         let limit20 = ((raw & 0xFFFF) as u32) | ((((raw >> 48) & 0xF) as u32) << 16);
         let g = (raw >> 55) & 1 == 1;
         let d_b = (raw >> 54) & 1 == 1;
@@ -42,7 +43,7 @@ impl Descriptor {
     }
 
     /// True if the descriptor is present.
-    pub fn present(&self) -> bool { self.attr & 1 != 0 }
+    pub fn present(&self) -> bool { self.attr & 0x80 != 0 }
 
     /// True if this is a code segment (S=1, type bit 3 = 1).
     pub fn is_code(&self) -> bool {
@@ -80,4 +81,38 @@ pub fn translate(seg: &Descriptor, offset: u32) -> u32 {
 /// The index of a segment register in the cached-descriptor arrays.
 pub fn seg_index(s: SegReg) -> usize {
     s as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_base_is_assembled_from_three_fields() {
+        // base = 0xC0FF_1234, limit = 0x000F_FFFF, present code segment,
+        // granularity and D/B set. Fields are scattered across the 8 bytes,
+        // and putting any of them in the wrong place still yields a plausible
+        // number -- which is why this is pinned.
+        let raw: u64 = 0x0000_FFFF                    // limit 15:0
+            | (0x1234u64 << 16)                       // base 15:0
+            | (0xFFu64 << 32)                         // base 23:16
+            | (0x9Au64 << 40)                         // access: present, code
+            | (0xCFu64 << 48)                         // limit 19:16 + G + D/B
+            | (0xC0u64 << 56);                        // base 31:24
+        let d = Descriptor::parse(raw);
+        assert_eq!(d.base, 0xC0FF_1234);
+        assert_eq!(d.limit, 0xFFFF_FFFF);
+        assert!(d.present());
+        assert!(d.is_code());
+        assert_eq!(d.dpl(), 0);
+        assert!(d.g);
+        assert!(d.d_b);
+    }
+
+    #[test]
+    fn dpl_is_read_from_the_access_byte() {
+        // A ring-3 data segment: access byte 0xF2 (present, DPL 3, data, RW).
+        let raw: u64 = 0xF2u64 << 40;
+        assert_eq!(Descriptor::parse(raw).dpl(), 3);
+    }
 }

@@ -22,7 +22,23 @@ pub const MODE12_W: usize = 640;
 pub const MODE12_H: usize = 480;
 
 /// The VGA device.
+/// CRTC register indices this emulator tracks.
+mod crtc {
+    /// Start address, high byte.
+    pub const START_HI: u8 = 0x0C;
+    /// Start address, low byte.
+    pub const START_LO: u8 = 0x0D;
+    /// Cursor location, high byte.
+    pub const CURSOR_HI: u8 = 0x0E;
+    /// Cursor location, low byte.
+    pub const CURSOR_LO: u8 = 0x0F;
+}
+
 pub struct Vga {
+    /// Currently selected CRTC register (port 0x3D4).
+    pub crtc_index: u8,
+    /// CRTC register file (port 0x3D5).
+    pub crtc: [u8; 32],
     /// Current video mode (BIOS mode number).
     pub mode: u8,
     /// Text cells: `char | (attr << 8)`, 80x25.
@@ -41,6 +57,8 @@ pub struct Vga {
 impl Vga {
     pub fn new() -> Self {
         Vga {
+            crtc_index: 0,
+            crtc: [0; 32],
             mode: 0x03,
             text: vec![0x0720; TEXT_COLS * TEXT_ROWS],
             framebuffer: Vec::new(),
@@ -113,6 +131,37 @@ impl Vga {
         for i in last..TEXT_COLS * TEXT_ROWS {
             self.text[i] = 0x0720;
         }
+    }
+}
+
+impl Vga {
+    /// Port 0x3D4: select a CRTC register.
+    pub fn write_crtc_index(&mut self, val: u8) {
+        self.crtc_index = val & 0x1F;
+    }
+
+    /// Port 0x3D5: write the selected CRTC register.
+    pub fn write_crtc_data(&mut self, val: u8) {
+        self.crtc[self.crtc_index as usize] = val;
+    }
+
+    /// Port 0x3D5: read the selected CRTC register.
+    pub fn read_crtc_data(&self) -> u8 {
+        self.crtc[self.crtc_index as usize]
+    }
+
+    /// First character cell displayed, in cells from the start of the text
+    /// window. This is how a text console scrolls: it leaves the characters
+    /// where they are and moves the window over them.
+    pub fn start_cell(&self) -> usize {
+        ((self.crtc[crtc::START_HI as usize] as usize) << 8)
+            | self.crtc[crtc::START_LO as usize] as usize
+    }
+
+    /// Cursor position, in cells from the start of the text window.
+    pub fn cursor_cell(&self) -> usize {
+        ((self.crtc[crtc::CURSOR_HI as usize] as usize) << 8)
+            | self.crtc[crtc::CURSOR_LO as usize] as usize
     }
 }
 

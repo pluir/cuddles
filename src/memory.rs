@@ -8,17 +8,35 @@
 
 pub struct Memory {
     pub data: Vec<u8>,
-    /// Memory-mapped VGA text window at physical 0xB8000 (80x25 cells, each
-    /// `char | (attr << 8)`). Reads/writes in the 0xB8000-0xB8FFF range are
-    /// routed here so the CPU can write the text screen directly (as Linux
-    /// does) rather than only through the BIOS.
+    /// Memory-mapped VGA text window at physical 0xB8000, one `u16` per cell
+    /// (`char | (attr << 8)`). Reads and writes anywhere in the aperture are
+    /// routed here so the CPU can drive the text screen directly, as Linux
+    /// does, rather than only through the BIOS.
     pub vga_text: Vec<u16>,
+    /// X86EMU_WATCH_STORE: physical address to log every store to, recorded
+    /// where the store actually happens rather than where it was translated.
+    pub watch_store: Option<usize>,
+    /// (physical address, value, width in bytes, EIP) for each logged store.
+    pub store_log: Vec<(usize, u32, u8, u32)>,
+    /// EIP of the instruction currently executing, kept in step by `Cpu::step`
+    /// only while a store watch is armed.
+    pub cur_eip: u32,
 }
 
 /// Physical address of the VGA text window.
 pub const VGA_TEXT_BASE: usize = 0xB8000;
-/// Size of the VGA text window in bytes (80x25 cells x 2 bytes).
-pub const VGA_TEXT_SIZE: usize = 80 * 25 * 2;
+/// Size of the VGA text window in bytes: the whole 32 KiB colour-text
+/// aperture, not just the 4000 bytes one screenful occupies.
+///
+/// The extra space is not slack. A VGA text console scrolls by moving the
+/// CRTC's *start address* through this buffer rather than copying characters,
+/// so the lines that have scrolled off the top are still sitting in it. With
+/// only one screenful of storage, every line after the twenty-fifth is either
+/// lost or wraps back over the first -- which looks exactly like a machine
+/// that stopped booting.
+pub const VGA_TEXT_SIZE: usize = 0x8000;
+/// Number of character cells in that window.
+pub const VGA_TEXT_CELLS: usize = VGA_TEXT_SIZE / 2;
 
 impl Memory {
     /// Backing store size (128 MiB). This is the single source of truth for
@@ -31,12 +49,27 @@ impl Memory {
     pub fn new() -> Self {
         Memory {
             data: vec![0; Self::SIZE],
-            vga_text: vec![0x0720; 80 * 25],
+            vga_text: vec![0x0720; VGA_TEXT_CELLS],
+            watch_store: std::env::var("X86EMU_WATCH_STORE").ok()
+                .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+            store_log: Vec::new(),
+            cur_eip: 0,
         }
     }
 
     /// True if `addr` falls inside the VGA text window.
     #[inline]
+    /// Log a store that overlaps the watched physical address.
+    fn note_store(&mut self, addr: usize, val: u32, width: u8) {
+        if let Some(w) = self.watch_store {
+            if addr <= w + 3 && w < addr + width as usize {
+                if self.store_log.len() >= 64 { self.store_log.remove(0); }
+                let eip = self.cur_eip;
+                self.store_log.push((addr, val, width, eip));
+            }
+        }
+    }
+
     pub fn in_vga_text(&self, addr: usize) -> bool {
         addr >= VGA_TEXT_BASE && addr < VGA_TEXT_BASE + VGA_TEXT_SIZE
     }
@@ -97,6 +130,9 @@ impl Memory {
     /// Read a little-endian u32 at a physical address.
     #[inline]
     pub fn read_u32(&self, addr: usize) -> u32 {
+        if addr + 3 < VGA_TEXT_BASE + VGA_TEXT_SIZE && addr + 3 >= VGA_TEXT_BASE {
+            return self.read_u16(addr) as u32 | ((self.read_u16(addr + 2) as u32) << 16);
+        }
         let a = addr & (Self::SIZE - 1);
         if a + 3 < Self::SIZE {
             // Fast path: read directly from the backing store.
@@ -135,6 +171,7 @@ impl Memory {
     /// Write a byte to a physical address.
     #[inline]
     pub fn write_u8(&mut self, addr: usize, val: u8) {
+        if self.watch_store.is_some() { self.note_store(addr, val as u32, 1); }
         if addr >= VGA_TEXT_BASE && addr < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             let idx = (addr - VGA_TEXT_BASE) / 2;
             let cell = self.vga_text[idx];
@@ -154,6 +191,7 @@ impl Memory {
     /// Write a little-endian u16 to a physical address.
     #[inline]
     pub fn write_u16(&mut self, addr: usize, val: u16) {
+        if self.watch_store.is_some() { self.note_store(addr, val as u32, 2); }
         if addr >= VGA_TEXT_BASE && addr + 1 < VGA_TEXT_BASE + VGA_TEXT_SIZE {
             self.vga_text[(addr - VGA_TEXT_BASE) / 2] = val;
             return;
@@ -176,6 +214,16 @@ impl Memory {
     /// Write a little-endian u32 to a physical address.
     #[inline]
     pub fn write_u32(&mut self, addr: usize, val: u32) {
+        if self.watch_store.is_some() { self.note_store(addr, val as u32, 4); }
+        // The VGA text window has to be checked here too, not only in the 8-
+        // and 16-bit paths: the console writes whole cells and cell pairs, so
+        // a dword store is the common case, and letting it reach RAM makes
+        // every screen update invisible.
+        if addr + 3 < VGA_TEXT_BASE + VGA_TEXT_SIZE && addr + 3 >= VGA_TEXT_BASE {
+            self.write_u16(addr, (val & 0xFFFF) as u16);
+            self.write_u16(addr + 2, (val >> 16) as u16);
+            return;
+        }
         let a = addr & (Self::SIZE - 1);
         if a + 3 < Self::SIZE {
             // Fast path: write directly to the backing store.
@@ -210,6 +258,16 @@ impl Memory {
 
     /// Read an f64 (8 bytes, little-endian) at a physical address.
     #[inline]
+    /// Read a 32-bit IEEE single from a physical address.
+    pub fn read_f32(&self, addr: usize) -> f32 {
+        f32::from_bits(self.read_u32(addr))
+    }
+
+    /// Write a 32-bit IEEE single to a physical address.
+    pub fn write_f32(&mut self, addr: usize, val: f32) {
+        self.write_u32(addr, val.to_bits());
+    }
+
     pub fn read_f64(&self, addr: usize) -> f64 {
         f64::from_bits(self.read_u64(addr))
     }

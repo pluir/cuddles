@@ -32,6 +32,8 @@ const HDR_MAGIC: usize = 0x202;
 const TYPE_OF_LOADER: usize = 0x210;
 const LOADFLAGS: usize = 0x211;
 const CODE32_START: usize = 0x214;
+const RAMDISK_IMAGE: usize = 0x218;
+const RAMDISK_SIZE: usize = 0x21C;
 const CMD_LINE_PTR: usize = 0x228;
 const KERNEL_ALIGNMENT: usize = 0x22E;
 const RELOCATABLE: usize = 0x232;
@@ -39,6 +41,26 @@ const PREF_ADDRESS: usize = 0x250;
 const INIT_SIZE: usize = 0x258;
 
 /// Offsets within `struct boot_params` (relative to `BOOT_PARAMS_ADDR`).
+///
+/// `struct screen_info` occupies the first 0x40 bytes. It is what tells Linux
+/// there is a text console to write on: `vgacon_startup()` treats zero rows
+/// or columns as "screen_info was never filled in" and falls back to the
+/// dummy console, which silently discards every message.
+const BP_ORIG_X: usize = 0x00;
+const BP_ORIG_Y: usize = 0x01;
+const BP_ORIG_VIDEO_PAGE: usize = 0x04;
+const BP_ORIG_VIDEO_MODE: usize = 0x06;
+const BP_ORIG_VIDEO_COLS: usize = 0x07;
+const BP_ORIG_VIDEO_EGA_BX: usize = 0x0A;
+const BP_ORIG_VIDEO_LINES: usize = 0x0E;
+const BP_ORIG_VIDEO_ISVGA: usize = 0x0F;
+const BP_ORIG_VIDEO_POINTS: usize = 0x10;
+
+/// `orig_video_isVGA` value for a colour VGA text console (VIDEO_TYPE_VGAC).
+const VIDEO_TYPE_VGAC: u8 = 0x22;
+/// BIOS video mode 3: 80x25 colour text.
+const VIDEO_MODE_COLOR_TEXT: u8 = 0x03;
+
 const BP_HDR: usize = 0x1F1; // struct setup_header hdr
 const BP_ALT_MEM_K: usize = 0x1E0;
 const BP_E820_ENTRIES: usize = 0x1E8;
@@ -136,6 +158,24 @@ fn write_gdt(mem: &mut Memory) {
     mem.write_u64(GDT_ADDR as usize + 16, 0x00CF92000000FFFF);
 }
 
+/// Fill in `boot_params.screen_info` to describe the emulated VGA text
+/// console: mode 3, 80x25, colour VGA. Without this Linux picks the dummy
+/// console and nothing ever reaches the screen.
+fn write_screen_info(mem: &mut Memory) {
+    let bp = BOOT_PARAMS_ADDR as usize;
+    mem.write_u8(bp + BP_ORIG_X, 0);
+    mem.write_u8(bp + BP_ORIG_Y, 0);
+    mem.write_u16(bp + BP_ORIG_VIDEO_PAGE, 0);
+    mem.write_u8(bp + BP_ORIG_VIDEO_MODE, VIDEO_MODE_COLOR_TEXT);
+    mem.write_u8(bp + BP_ORIG_VIDEO_COLS, crate::bios::SCREEN_COLS as u8);
+    // EGA BX: 3 means colour, 64 KB of video memory.
+    mem.write_u16(bp + BP_ORIG_VIDEO_EGA_BX, 3);
+    mem.write_u8(bp + BP_ORIG_VIDEO_LINES, crate::bios::SCREEN_ROWS as u8);
+    mem.write_u8(bp + BP_ORIG_VIDEO_ISVGA, VIDEO_TYPE_VGAC);
+    // Character cell height, in scan lines.
+    mem.write_u16(bp + BP_ORIG_VIDEO_POINTS, 16);
+}
+
 /// Write the E820 memory map into `boot_params`.
 fn write_e820(mem: &mut Memory) {
     let map = BOOT_PARAMS_ADDR as usize + BP_E820_TABLE;
@@ -164,6 +204,15 @@ fn write_e820(mem: &mut Memory) {
 /// jump to the entry point. It lets us boot a kernel without running the
 /// in-kernel decompressor (which our emulator does not yet execute correctly).
 pub fn load_elf_kernel(cpu: &mut Cpu, elf: &[u8], cmdline: &str) -> Result<u32, String> {
+    load_elf_kernel_with_initrd(cpu, elf, cmdline, None)
+}
+
+/// As `load_elf_kernel`, but also loads an initial ramdisk. The kernel's
+/// `rd_load_image` copies it into /dev/ram0, which `root=/dev/ram0` then
+/// mounts -- the path an ext2 root image on this ISO expects.
+pub fn load_elf_kernel_with_initrd(
+    cpu: &mut Cpu, elf: &[u8], cmdline: &str, initrd: Option<&[u8]>,
+) -> Result<u32, String> {
     if elf.len() < 52 || &elf[0..4] != b"\x7fELF" {
         return Err("not an ELF file".into());
     }
@@ -193,7 +242,7 @@ pub fn load_elf_kernel(cpu: &mut Cpu, elf: &[u8], cmdline: &str) -> Result<u32, 
         }
     }
     // Build boot_params, GDT, and enter protected mode (same as load_kernel).
-    setup_protected_mode(cpu, cmdline);
+    setup_protected_mode_with_initrd(cpu, cmdline, initrd);
     cpu.eip = e_entry;
     cpu.halted = false;
     Ok(e_entry)
@@ -201,8 +250,29 @@ pub fn load_elf_kernel(cpu: &mut Cpu, elf: &[u8], cmdline: &str) -> Result<u32, 
 
 /// Shared protected-mode setup used by both loaders: build boot_params at
 /// 0x90000, write the flat GDT, enable protected mode, load flat segments.
-fn setup_protected_mode(cpu: &mut Cpu, cmdline: &str) {
+/// As `setup_protected_mode`, but also places an initial ramdisk in memory and
+/// records it in `boot_params.hdr` so the kernel can find it.
+fn setup_protected_mode_with_initrd(cpu: &mut Cpu, cmdline: &str, initrd: Option<&[u8]>) {
+    if let Some(rd) = initrd {
+        // Bootloaders load the ramdisk as high in low memory as it will go,
+        // clear of the kernel image and of the bootmem allocations that
+        // follow it. The kernel reserves the region from these two fields
+        // before it allocates anything else.
+        let addr = ((crate::memory::Memory::SIZE - rd.len()) & !0xFFF) as u32;
+        for (i, b) in rd.iter().enumerate() {
+            cpu.mem.write_u8(addr as usize + i, *b);
+        }
+        let hdr = BOOT_PARAMS_ADDR as usize + BP_HDR;
+        cpu.mem.write_u32(hdr + (RAMDISK_IMAGE - SETUP_SECTS), addr);
+        cpu.mem.write_u32(hdr + (RAMDISK_SIZE - SETUP_SECTS), rd.len() as u32);
+    }
+    setup_protected_mode_inner(cpu, cmdline)
+}
+
+fn setup_protected_mode_inner(cpu: &mut Cpu, cmdline: &str) {
     let mem = &mut cpu.mem;
+    // Describe the text console in boot_params.screen_info.
+    write_screen_info(mem);
     // Write the E820 memory map.
     write_e820(mem);
     // Write the command line (NUL-terminated).
@@ -215,6 +285,10 @@ fn setup_protected_mode(cpu: &mut Cpu, cmdline: &str) {
     // cmd_line_ptr in boot_params.hdr.
     let hdr_dst = BOOT_PARAMS_ADDR as usize + BP_HDR;
     mem.write_u32(hdr_dst + (CMD_LINE_PTR - SETUP_SECTS), CMDLINE_ADDR);
+    // type_of_loader: 0xFF is "undefined bootloader". It has to be non-zero
+    // or setup_arch() ignores ramdisk_image entirely and the initrd is never
+    // reserved, never unpacked, and never mentioned in the log.
+    mem.write_u8(hdr_dst + (TYPE_OF_LOADER - SETUP_SECTS), 0xFF);
     // Set up the flat GDT.
     write_gdt(mem);
     // Enter protected mode.

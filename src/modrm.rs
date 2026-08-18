@@ -12,12 +12,32 @@ use crate::cpu::{Reg8, Reg16, Reg32};
 
 /// Decoded ModR/M descriptor (without the displacement bytes, which the CPU
 /// fetches separately and stores back here).
+///
+/// `reg` and `rm` are *register indices*, already widened to four bits by the
+/// REX prefix. `rm_raw` keeps the three bits as encoded, because every
+/// addressing decision is made on those and only those: `rm == 100b` means a
+/// SIB byte follows and `mod == 00, rm == 101b` means RIP-relative, whatever
+/// REX.B says. Extending before those tests turns R12 into a SIB escape and
+/// R13 into a RIP-relative operand -- which is exactly the bug the split
+/// exists to prevent.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModRm {
     pub mod_field: u8,
+    /// The `reg` field, extended by REX.R: a register index 0-15.
     pub reg: u8,
+    /// The `rm` field as a register index, extended by REX.B when
+    /// `mod == 3` (when it names a register rather than an addressing mode).
     pub rm: u8,
-    /// SIB byte, present in 32-bit address mode when rm == 4 (mod != 3).
+    /// The `rm` field exactly as encoded, three bits.
+    pub rm_raw: u8,
+    /// REX.B and REX.X as they applied to this byte, for the base and index
+    /// registers of a memory operand.
+    pub rex_b: bool,
+    pub rex_x: bool,
+    /// True when the operand is RIP-relative (64-bit addressing, mod == 00,
+    /// rm == 101b).
+    pub rip_rel: bool,
+    /// SIB byte, present in 32/64-bit address mode when rm == 4 (mod != 3).
     pub sib: Option<u8>,
     pub disp8: Option<u16>,
     pub disp16: Option<u16>,
@@ -30,6 +50,10 @@ impl ModRm {
             mod_field: (byte >> 6) & 0b11,
             reg: (byte >> 3) & 0b111,
             rm: byte & 0b111,
+            rm_raw: byte & 0b111,
+            rex_b: false,
+            rex_x: false,
+            rip_rel: false,
             sib: None,
             disp8: None,
             disp16: None,

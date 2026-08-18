@@ -10,20 +10,24 @@ The long-term goal is a full PC emulator (CPU + memory + devices) that can
 eventually boot real firmware. It is deliberately incremental: each stage adds
 one clean, well-tested layer on top of the previous one.
 
-Current state: **it boots Linux to a shell.** A real 32-bit buildroot kernel
-(2.6.34.14) runs from `startup_32` to a busybox prompt — device init, an ext2
-root filesystem off a ramdisk, `/sbin/init` in ring 3, the whole log on the
-emulated VGA text console.
+Current state: **all three x86 modes, and it boots Linux to a shell.** A real
+32-bit buildroot kernel (2.6.34.14) runs from `startup_32` to a busybox prompt
+— device init, an ext2 root filesystem off a ramdisk, `/sbin/init` in ring 3,
+the whole log on the emulated VGA text console.
 
 Underneath that: a 16-bit real-mode 8086-style core, a minimal BIOS (native
 Rust handlers for `INT 0x10/0x16/0x13/0x15`), 32-bit protected mode (GDT/IDT,
-descriptors, 32-bit registers and addressing), 32-bit paging with page-level
-protection (`CR0.WP`, user/supervisor, accessed and dirty bits), **ring 3**
-(TSS stack switch on a gate, `IRET` back to user mode), the PC device set
-(8254 PIT, 8259 PIC, VGA with CRTC, 8042 keyboard, 8237 DMA, IDE/ATA disk,
-MC146818 RTC) with hardware interrupts, exceptions with restartable faults,
-and a Linux boot-protocol loader with initrd support. The project is under git
-version control.
+descriptors, 32-bit registers and addressing), **64-bit long mode** (REX,
+sixteen 64-bit registers, RIP-relative addressing, `SYSCALL`/`SWAPGS`, 16-byte
+interrupt gates with an IST, compatibility mode), paging in all three of its
+structures (32-bit two-level, PAE three-level, long-mode four-level) with
+page-level protection (`CR0.WP`, user/supervisor, NX, accessed and dirty
+bits), **ring 3** (TSS stack switch on a gate, `IRET` back to user mode), the
+PC device set (8254 PIT, 8259 PIC, VGA with CRTC, 8042 keyboard, 8237 DMA,
+IDE/ATA disk, MC146818 RTC) with hardware interrupts, exceptions with
+restartable faults, **run-time-sized RAM that can exceed 4 GiB**, and Linux
+boot-protocol loaders (32- and 64-bit) with initrd support. The project is
+under git version control.
 
 **Reproducing the boot** (see README for the extraction steps):
 
@@ -31,6 +35,13 @@ version control.
 ./target/release/x86emu --kernel-elf images/golden_kernel.bin \
     --initrd images/root.bin \
     --cmdline "root=/dev/ram0 rw console=tty0" 3000000000
+```
+
+**Running 64-bit code** (no download needed):
+
+```sh
+cargo run --release --example gen_long64
+./target/release/x86emu --long examples/long64.bin
 ```
 
 ## Layout
@@ -41,9 +52,9 @@ version control.
 | `src/cpu.rs` | `Cpu` struct: registers, flags, fetch-decode-execute loop, stack, ModR/M operand helpers. |
 | `src/instructions.rs` | The instruction decoder (`decode`) and executor (`execute`). The largest file. |
 | `src/modrm.rs` | ModR/M byte decoding and register-index helpers. |
-| `src/memory.rs` | Flat `Memory` (128 MiB; `Memory::SIZE` is the single source of truth for RAM size) with segment:offset → physical translation. |
-| `src/protected.rs` | Segment descriptors, GDT/IDT parsing, protected-mode translation. |
-| `src/paging.rs` | 32-bit page-directory/page-table walk (4 KiB and 4 MiB pages). |
+| `src/memory.rs` | `Memory`, **sized at run time** (`Memory::with_size`, `--mem`). `e820_map()` is the single description of the layout, and RAM past `MMIO_HOLE_START` is wired above 4 GiB. `slot()` is the only thing that knows where RAM lives; an address with none behind it reads `0xFF`. |
+| `src/protected.rs` | Segment descriptors, GDT/IDT parsing, protected-mode translation. `Descriptor::l` is the 64-bit-code bit. |
+| `src/paging.rs` | Page-table walks for all three structures: legacy (2 levels, 4-byte entries), PAE (3, 8-byte) and long mode (4, 8-byte), with 4 MiB / 2 MiB / 1 GiB large pages, NX, and the canonical-address check. |
 | `src/pit.rs` | 8254 Programmable Interval Timer. Channel 0 -> IRQ0; channel 2's gate and output are visible on port 0x61, which is what the kernel's TSC calibration spins on. |
 | `src/cmos.rs` | MC146818 CMOS RTC (ports 0x70/0x71). Not optional: Linux spins on its update-in-progress bit at every boot, and a machine without one hangs there. |
 | `src/pic.rs` | 8259 Programmable Interrupt Controller (master + slave). |
@@ -51,11 +62,11 @@ version control.
 | `src/kbd.rs` | 8042 keyboard controller (scancodes, IRQ1). |
 | `src/dma.rs` | 8237 DMA controller (4 channels, page registers). |
 | `src/ide.rs` | IDE/ATA disk controller (PIO, LBA28, IRQ14). |
-| `src/boot.rs` | Linux boot-protocol loader: parse bzImage, load kernel, build `boot_params`, enter protected mode. |
+| `src/boot.rs` | Linux boot-protocol loader: parse bzImage, load kernel, build `boot_params`, enter protected mode. Also `enter_long_mode()` (the four-step handover), `build_identity_map()`, `load_elf64_kernel()` and `load_flat64()`. |
 | `src/fpu.rs` | x87 FPU: control/status/tag words, 8 data registers (as `f64`), the D8-DF instructions. |
 | `src/bios.rs` | `Bios` struct: native Rust handlers for `INT 0x10/0x16/0x13/0x15`. |
-| `src/main.rs` | CLI: load a flat binary, boot a boot sector, or boot a Linux bzImage. |
-| `examples/` | `gen_add.rs` (generates `add.bin`), plus prebuilt `add.bin` and `boot.bin`. |
+| `src/main.rs` | CLI: a flat binary, `--boot`, `--kernel`, `--kernel-elf`, `--kernel-elf64`, `--long`, and `--mem SIZE` (applies to every mode). |
+| `examples/` | `gen_add.rs` (generates `add.bin`) and `gen_long64.rs` (generates `long64.bin`, the 64-bit demo), plus the prebuilt `add.bin`, `boot.bin` and `long64.bin`. |
 | `gen_boot.py` | Python script that hand-assembles `examples/boot.bin`. |
 | `tools/` | Host-side helpers for the boot effort: `extract_iso.py` (pull the kernel and root filesystem out of the ISO), `unpack_bzimage.py` (decompress a bzImage to the ELF `--kernel-elf` wants), `kallsyms.py` (symbol table out of a stripped kernel), `sym.py` (address -> name), `elfsyms.py`. |
 | `images/` | Downloaded OS images for the boot effort: `linux.iso` and, extracted from it, `bzImage`, `golden_kernel.bin` (the decompressed kernel ELF) and `root.bin` (the ext2 root filesystem, loaded as an initrd). All git-ignored — they are downloads, not source. |
@@ -75,40 +86,62 @@ cargo run -- --boot examples/boot.bin
 
 ## How the emulator works
 
-- **Memory** is a flat `Vec<u8>` of 128 MiB. `Memory::SIZE` is the single
-  source of truth for the RAM size: the BIOS E820/E801/0x88 map and the boot
-  loader's `boot_params` derive their values from it, so scaling the RAM is a
-  one-line change to `Memory::SIZE`. Real-mode logical addresses
-  `segment:offset` map to physical `segment * 16 + offset`, masked to 20 bits
-  (wraps at 1 MiB). See `Memory::phys`. Protected mode translates through
-  cached segment descriptors (`Cpu::translate`). When CR0.PG is set, the
-  resulting linear address is further translated through the page tables
-  rooted at CR3 (`Cpu::apply_paging` → `paging::translate`). The VGA text
+- **Memory** is a flat `Vec<u8>` sized at construction (`Memory::with_size`,
+  `Cpu::with_ram`, `--mem`). `Memory::e820()` is the single description of the
+  layout: the BIOS E820/E801/0x88 handlers and the boot loader's `boot_params`
+  all read it, so a machine cannot describe itself two different ways.
+  **A machine larger than `MMIO_HOLE_START` (3 GiB) has its extra RAM above
+  4 GiB**, and `slot()` is the one function that knows it — a single compare
+  for any address on a machine that fits below the hole. An address with no
+  RAM behind it reads `0xFF` and swallows writes; it does **not** alias back
+  into low memory, and see "Things not to undo" for why that mattered.
+  Real-mode logical addresses `segment:offset` map to physical
+  `segment * 16 + offset`, masked to 20 bits (wraps at 1 MiB). See
+  `Memory::phys`. Protected mode translates through cached segment
+  descriptors (`Cpu::translate`); 64-bit mode has no segment bases at all
+  except FS and GS, whose bases come from MSRs. When CR0.PG is set, the
+  resulting linear address goes through whichever paging structure
+  `Cpu::paging_mode()` names (`Cpu::apply_paging` → `paging::translate_mode`). The VGA text
   window at physical `0xB8000` (80x25 cells) is memory-mapped: reads/writes
   in that range are routed to `Memory::vga_text` so the CPU can write the
   text screen directly (as Linux does), not only through the BIOS. The BIOS
   teletype/scroll services and the CLI's screen dump read this same window.
-- **The CPU** keeps the eight general registers **once**, 32 bits wide.
-  `ax()`/`set_ax()` and friends are *views* of the low half of `eax`; there is
-  no separate 16-bit storage, and `reg8`/`set_reg8` go through the same place.
-  This used to be two sets of fields kept in sync by hand, and the writes that
-  forgot to sync produced corruption a long way from the cause — `rep movsb`
-  cleared `ecx` directly, `cx` kept the old count, and the next `mov $4,%cl`
-  rebuilt `ecx` from the stale half. Do not reintroduce a second copy.
-  EFLAGS is a full **32 bits** (`flags: u32`): Linux identifies the CPU by
-  toggling the `AC` (18) and `ID` (21) bits through `PUSHFD`/`POPFD`.
+- **The CPU** keeps the sixteen general registers **once**, 64 bits wide, in
+  `regs: [u64; 16]`. `eax()`, `ax()`/`set_ax()` and `reg8_idx` are all *views*
+  of the same store; there is no separate narrow storage anywhere. This used
+  to be two sets of fields kept in sync by hand, and the writes that forgot to
+  sync produced corruption a long way from the cause — `rep movsb` cleared
+  `ecx` directly, `cx` kept the old count, and the next `mov $4,%cl` rebuilt
+  `ecx` from the stale half. Do not reintroduce a second copy at any width.
+  The **width rules are asymmetric and that is not a simplification**: a
+  32-bit write zero-extends into the whole 64-bit register, while 16- and
+  8-bit writes preserve what is above them (`set_reg_w`). EFLAGS is a full
+  **32 bits** (`flags: u32`): Linux identifies the CPU by toggling the `AC`
+  (18) and `ID` (21) bits through `PUSHFD`/`POPFD`.
+- **Mode.** `Cpu::mode()` returns Real / Protected / Compat / Long.
+  `long_mode()` is EFER.LMA — the *machine* is in long mode — and `long64()`
+  additionally requires the current code segment's **L** bit. Almost
+  everything that cares (operand size, address size, stack width, register
+  width) keys off `long64()`, not `long_mode()`, because a 64-bit kernel runs
+  32-bit processes in compatibility mode with LMA still set. `osize()` and
+  `asize()` give the current widths in bits.
 - **Decode/execute** live in `instructions.rs`. `decode` reads opcode bytes
   (and ModR/M + immediates) from the instruction stream via `Cpu::fetch_*`;
   `execute` mutates the `Cpu`. `Cpu::step` calls both and bumps
   `instructions_executed`.
 - **Prefixes** (`0x66` operand-size, `0x67` address-size, segment overrides,
-  REP) are consumed at the top of `decode` and stored on the `Cpu`
-  (`opsize`/`addrsize`/`seg_override`). They are reset at the *start* of the
-  next `decode` so `execute` can still see them. The *default* operand and
-  address size is 16-bit in real mode, but in protected mode it is derived
-  from the code segment's D bit (D=1 → 32-bit); a `0x66`/`0x67` prefix
-  *toggles* the size rather than forcing 32-bit. This matters for booting a
-  32-bit kernel, whose code runs in a D=1 segment with no size prefixes.
+  REP, and **REX**) are consumed at the top of `decode` and stored on the
+  `Cpu` (`opsize`/`addrsize`/`addr64`/`seg_override`/`rex_*`). They are reset
+  at the *start* of the next `decode` so `execute` can still see them — which
+  is exactly how the width-generic execute arms read `cpu.osize()`. The
+  *default* operand and address size is 16-bit in real mode; in protected mode
+  it comes from the code segment's D bit (D=1 → 32-bit) and `0x66`/`0x67`
+  *toggle* it. In 64-bit mode neither comes from the segment (D must be 0 when
+  L is set): operands default to 32 and addresses to 64, `0x66` selects 16-bit
+  operands, `0x67` selects 32-bit addressing, and **REX.W** selects 64-bit
+  operands and wins over `0x66`. REX must be the **last** prefix before the
+  opcode; a legacy prefix after one cancels it, which the prefix loop
+  implements by clearing the REX flags.
 - **The BIOS** is *not* machine code. It is a set of host-side Rust service
   routines. The `INT` executor checks the vector: if it is a BIOS vector
   (0x10/0x15/0x16/0x13), it calls the matching `Bios` method directly (no IVT frame
@@ -165,15 +198,19 @@ cargo run -- --boot examples/boot.bin
   before the kernel installs its IDT), the CPU **triple-faults**: it sets
   `triple_fault = true` and halts instead of dispatching to a garbage entry
   and looping forever (a real CPU resets on a triple fault).
-- **Page-level protection.** `paging::translate` reports a mapping's
-  permissions as well as its address, and the effective R/W and U/S bits are
-  the **AND of the PDE's and the PTE's**. `Cpu::apply_paging_access` takes the
-  access type: a supervisor write to a read-only page faults when `CR0.WP` is
-  set (Linux's `test_wp_bit` panics on a CPU that gets this wrong), a user
-  access to a supervisor page faults, and the error code records
-  present/write/user. The TLB caches the permissions alongside the
-  translation — a check that only ran on a miss would let the second write
-  through. Accessed and dirty bits are maintained. Writing **CR4 flushes the
+- **Page-level protection.** The walk reports a mapping's permissions as well
+  as its address, and the effective R/W, U/S and NX are the **combination of
+  every level's** — two for legacy paging, four in long mode.
+  `Cpu::apply_paging_access` takes the access type: a supervisor write to a
+  read-only page faults when `CR0.WP` is set (Linux's `test_wp_bit` panics on
+  a CPU that gets this wrong), a user access to a supervisor page faults, and
+  the error code records present/write/user. `apply_paging_fetch` is a
+  *separate* entry point because of NX: a no-execute page must still be
+  readable, so only the fetch path may fault on it, and only when `EFER.NXE`
+  is set (bit 63 is reserved otherwise). The TLB caches the permissions
+  alongside the translation — a check that only ran on a miss would let the
+  second write through. Accessed and dirty bits are maintained on every level
+  walked, at the entry width the structure uses. Writing **CR4 flushes the
   TLB**: `__flush_tlb_global()` is literally a CR4 write with PGE toggled.
 - **Ring 3.** `Cpu::cpl()` is the CS selector's RPL. A gate to a more
   privileged segment switches to the ring-0 stack from the **TSS** (`LTR`
@@ -182,6 +219,32 @@ cargo run -- --boot examples/boot.bin
   the frame is written — the pushes happen at the new privilege level, and
   doing it the other way round makes the frame a user write to supervisor
   memory, which paging then rejects.
+- **Long mode.** Entering it is a four-step handover and none of the steps can
+  move (`boot::enter_long_mode` is the reference): **CR4.PAE** first, because
+  long mode is built on PAE's 8-byte entries; **CR3** pointing at a PML4 that
+  already maps the code about to run; **EFER.LME**, which only *asks*; and
+  **CR0.PG**, which enters — the CPU sets `EFER.LMA` itself in response
+  (`Cpu::update_long_mode`). The instruction after the one that sets PG is
+  fetched through the new page tables, which is why an identity map is not a
+  nicety. Segmentation is gone: CS/DS/ES/SS have base 0 and no limit, and only
+  FS/GS keep a base, from an MSR (`fs_base`/`gs_base`) rather than a
+  descriptor. A **non-canonical** linear address is a `#GP` *before* the page
+  tables, so the unused middle of the address space is a hole, not an alias.
+- **Long-mode interrupts** are a different shape and every difference bites.
+  A gate is **sixteen** bytes, with the 64-bit offset in three pieces and an
+  IST index sharing a byte with the reserved field. The frame is five 8-byte
+  words and **SS:RSP are pushed always**, privilege change or not — which is
+  what makes `IRETQ` one shape rather than two; a handler that pops three
+  words returns to nonsense. A stack switch loads a **null** SS (a 64-bit TSS
+  has no SS0 to load). An **IST** index in the gate switches stacks
+  *unconditionally*, which is the point: a double fault or an NMI must reach a
+  stack that is good even when the one in RSP is what broke. See `long_int`.
+- **`SYSCALL` does not switch stacks.** It reads its entry point from LSTAR,
+  puts the return address in RCX and the flags in R11, clears the RFLAGS bits
+  SFMASK names, and takes its segments from STAR — consulting no table and
+  touching no memory, which is what makes it fast. It therefore lands in the
+  kernel still on the *user* stack, which is why `SWAPGS` exists and why every
+  64-bit entry stub starts with it.
 - **The Linux boot loader** (`src/boot.rs`) implements the Linux boot
   protocol (Documentation/x86/boot.rst). `parse_bzimage` reads the setup
   header at file offset `0x1F1` (the boot sector occupies file offset 0,
@@ -210,16 +273,28 @@ cargo run -- --boot examples/boot.bin
 
 ## Performance
 
-The emulator runs at roughly 25 million instructions/second on a release
-build, which puts a full boot to the shell prompt in the tens of seconds. The
-number to watch is not the rate but whether a boot still completes: measure by
-timing a fixed instruction count, since a change that breaks the boot can
-otherwise look like a speed-up. Key optimizations:
+The number to watch is not the rate but whether a boot still completes:
+measure by timing a **fixed instruction count**, since a change that breaks
+the boot can otherwise look like a speed-up.
+
+```sh
+time ./target/release/x86emu --kernel-elf images/golden_kernel.bin \
+    --initrd images/root.bin --cmdline "root=/dev/ram0 rw console=tty0" 300000000
+```
+
+Adding 64-bit and run-time-sized RAM cost roughly a seventh of the rate
+(measured that way, against the same command on the previous commit, same
+machine, best of two). That is the price of bounds-checked memory instead of a
+compile-time mask, a register file that is 64 bits wide underneath every
+narrow access, and width-parameterised ALU and shift paths. It is worth
+knowing, and worth re-measuring the same way before believing any claim about
+a change's cost. Key optimizations:
 
 - **TLB.** `Cpu` has a 256-entry direct-mapped TLB (`tlb: [TlbEntry; 256]`)
-  that caches linear-page → physical-page translations. `apply_paging()`
-  checks the TLB first (fast path: one array index + comparison) and only
-  walks the page tables on a miss. `flush_tlb()` clears all entries (called
+  that caches linear-page → physical-page translations, 64 bits wide on both
+  sides (a long-mode linear address is 48 bits, a physical one up to 52).
+  `apply_paging()` checks the TLB first (fast path: one array index +
+  comparison) and only walks the page tables on a miss. `flush_tlb()` clears all entries (called
   on MOV CR3 and when CR0.PG toggles). `invlpg()` invalidates a single entry
   (called by the INVLPG instruction, 0F 01 /7). Without the TLB, every byte
   fetch did a 2-read page-table walk; with it, ~99% of translations are a
@@ -229,10 +304,16 @@ otherwise look like a speed-up. Key optimizations:
   `X86EMU_TRACE` environment variable is set. The file handle is cached in
   the `Cpu` struct (`trace_file: Option<File>`) rather than opened and
   closed per instruction. When tracing is off, zero I/O happens.
-- **Fast multi-byte memory access.** `read_u16`/`read_u32`/`write_u16`/
-  `write_u32` have fast paths that read/write directly from the `data`
-  slice using `get_unchecked` (after bounds and VGA checks), avoiding the
-  per-byte branching of the byte-by-byte path.
+- **Fast multi-byte memory access.** `read_u16`/`read_u32`/`read_u64` and
+  their write counterparts have fast paths that read/write directly from the
+  `data` slice using `get_unchecked` (after `slot()` and the VGA check),
+  avoiding the per-byte branching of the byte-by-byte path. The 64-bit forms
+  go through one unaligned 8-byte access rather than eight single-byte ones —
+  they are the common case now, because a page-table entry is 8 bytes in two
+  of the three paging modes.
+- **`rip_mask`.** RIP wraps at 32 bits in a legacy mode and at 64 in long
+  mode. Rather than test the mode on every byte fetched, `step()` computes the
+  mask once per instruction and `advance_ip` ANDs with it.
 - **Batched interrupt checks.** `deliver_hardware_interrupt()` ticks the
   PIT every instruction (for timing accuracy) but only checks the
   keyboard/IDE IRQs and calls `pic.acknowledge()` every 64 instructions
@@ -261,11 +342,43 @@ Each of these looks like an oddity and is a fix. They cost a lot to find, and
 every one of them is the sort of thing a tidy-up would quietly revert.
 
 - **Widths are explicit, never a bool.** `Shift`/`ShiftImm` carry `width: u32`
-  (8/16/32) and the bit-test instructions carry a `BitOffset`. A `w: bool`
+  (8/16/32/64) and the bit-test instructions carry a `BitOffset`. A `w: bool`
   with `!w32` at the call site is exactly how 32-bit shifts came to run as
-  8-bit ones.
-- **The 16-bit registers are views**, EFLAGS is `u32`, and port numbers are
-  `u16`. Do not narrow any of them back.
+  8-bit ones — and the same shape came back with REX.W, where a hard-coded
+  `if w32 { 32 } else { 16 }` in the decoder made `shl $32,%rax` a no-op. Any
+  instruction that carries a width takes it from `cpu.osize()`.
+- **`w32` in the decoder selects a *shape*, not a width.** The "32-bit"
+  `Inst` variants cover both 32 and 64 bits; `cpu.osize()` at execute time is
+  what says which. That is why the prefix state survives into `execute`.
+- **The narrow registers are views**, EFLAGS is `u32`, and port numbers are
+  `u16`. Do not narrow any of them back. `regs` is `[u64; 16]` even in a
+  16-bit boot: one store, many widths.
+- **A 32-bit register write zero-extends; a 16- or 8-bit one does not.** That
+  asymmetry is x86-64's, it is load-bearing for compiled 64-bit code
+  (`mov $0,%eax` is how RAX gets cleared), and it costs nothing in legacy
+  modes where nothing can observe the upper half. See `set_reg_w`.
+- **`rm_raw` is not a duplicate of `rm`.** Every *addressing* decision is made
+  on the raw three bits — `rm == 100b` means a SIB byte follows, `mod == 00,
+  rm == 101b` means RIP-relative — while `rm` is the REX-extended register
+  index. Test the extended value and R12 becomes a SIB escape, R13 becomes a
+  RIP-relative operand.
+- **Descriptor tables are named by *linear* address**, and are translated as
+  such (`Cpu::linear_to_phys_ro`). This was invisible for a long time because
+  masking every physical address into a 128 MiB store folded `0xC02C1000` onto
+  `0x002C1000` — which is exactly what the kernel's direct map maps it to. The
+  coincidence dies the moment a machine has more RAM than the mask, so an
+  unbacked address now reads as an open bus and the translation is done
+  properly.
+- **`long64()`, not `long_mode()`,** decides operand width, address width,
+  stack width and register width. A 64-bit kernel runs 32-bit processes in
+  compatibility mode with LMA still set; keying off the machine rather than
+  the code segment runs them as 64-bit code.
+- **`EFER.LMA` is the CPU's bit, not software's.** `write_msr` preserves it
+  and `update_long_mode()` derives it from `CR0.PG && EFER.LME`. Letting a
+  WRMSR set it directly makes long mode look active with no page tables under
+  it.
+- **The long-mode interrupt frame always carries SS:RSP**, and `IRETQ` always
+  pops five words. There is no privilege-dependent variant to "optimize" into.
 - **CMP and TEST commit nothing**; the ALU r/m↔reg forms check `AluOp::Cmp`
   before writing back, exactly as the immediate forms always did.
 - **Stores translate as stores.** `translate_write` / `modrm_addr*_write`, not
@@ -296,6 +409,8 @@ every one of them is the sort of thing a tidy-up would quietly revert.
 - [x] Devices (part 1): 8254 PIT and 8259 PIC, hardware interrupts (IRQ0 from the timer), IN/OUT port I/O.
 - [x] Devices (part 2): VGA text/graphics framebuffer, 8042 keyboard controller, DMA, IDE/ATA disk, boot a real OS image.
 - [x] Exceptions: `#DE`, `#BP`, `#OF`, `#UD`, `#PF` (with CR2), dispatched through the IVT/IDT with optional error codes. Exceptions that fire with no IDT installed (or while handling another) **triple-fault** — the CPU halts cleanly instead of looping forever.
+- [x] Scale the RAM: sized at run time (`--mem`), with more than 4 GiB wired above the 32-bit MMIO hole and described that way in the BIOS map and `boot_params`.
+- [x] 64-bit long mode: REX, sixteen 64-bit registers, RIP-relative addressing, PAE and 4-level paging with NX and 1 GiB pages, 16-byte interrupt gates with an IST, `SYSCALL`/`SYSRET`/`SWAPGS`, the FS/GS base MSRs, compatibility mode, and `--long` / `--kernel-elf64`.
 - [x] Boot a real OS (Linux, 32-bit): **done — it reaches a busybox shell.**
       The kernel prints its whole log to the emulated VGA console, mounts an
       ext2 root filesystem from an initrd, and runs `/sbin/init` in ring 3.
@@ -304,6 +419,14 @@ every one of them is the sort of thing a tidy-up would quietly revert.
       it was subtly wrong semantics, each found by a crash thousands of
       instructions downstream. See "Debugging a boot" below for the tools that
       make that tractable.
+- [ ] **SSE/SSE2**, the missing piece for a 64-bit *userspace*. The x86-64 ABI
+      requires SSE2, so a 64-bit Linux boot needs it before init can run —
+      `movaps`/`movdqa`/`movq` and the XMM register file are the next layer,
+      and they are a SIMD problem rather than a 64-bit one. The 64-bit CPU
+      core is complete and tested without them; a 64-bit kernel is not
+      claimed, and the tests say what is actually verified.
+- [ ] A 64-bit Linux boot, once SSE is in: `--kernel-elf64` already loads an
+      ELF64 kernel, builds `boot_params` and hands over in long mode.
 - [ ] Keyboard input: the kernel's i8042 probe fails (`Can't read CTR`), so
       the shell that comes up cannot be typed at. `src/kbd.rs` implements the
       scancode/status side but not the controller command interface
@@ -341,7 +464,7 @@ variables, all off by default, and none of them cost anything when unset.
    `Linux version`; the panic and its call trace are in there, with symbol
    names already resolved by the kernel.
 4. **Stop at the right instant.** `X86EMU_TRAP_EIP=<hex>` halts the moment
-   execution reaches an address, `X86EMU_TRAP_USER=<n>` before the `n`th
+   execution reaches an address (a full 64-bit one in long mode), `X86EMU_TRAP_USER=<n>` before the `n`th
    user-mode instruction. Combine with `X86EMU_DEBUG` to get the ring buffer
    at that point, or with `X86EMU_TRACE=1` + `X86EMU_TRACE_FROM=<n>` for a
    full instruction trace of just the window that matters.
@@ -368,7 +491,15 @@ decode by hand.
 
 - **Add an instruction:** add a variant to the `Inst` enum in
   `instructions.rs`, add its opcode case(s) in `decode`, add the execution
-  logic in `execute`, then add a test.
+  logic in `execute`, then add a test. If it has an operand size, take the
+  width from `cpu.osize()` in `execute` and use `read_rm_w`/`write_rm_w` and
+  `reg_w`/`set_reg_w` — that is what makes it work at 16, 32 **and** 64 bits
+  from one implementation. Only reach for a fixed-width helper when the
+  instruction genuinely has one width (`SETcc` is always a byte).
+- **Add a 64-bit test:** `long_cpu(&code)` in `instructions.rs`'s tests builds
+  a machine already in long mode through the real boot path
+  (`boot::load_flat64`), so a test exercises the same handover a payload gets.
+  `run64` runs to `HLT` with a bound and fails rather than hanging.
 - **Add a BIOS service:** add a method to `Bios` in `bios.rs`, dispatch it from
   the `INT` executor, and add a test.
 - **Add a device:** create a module (e.g. `src/pit.rs`), add a field to the

@@ -18,6 +18,12 @@ pub struct Descriptor {
     /// Granularity bit (G) and default operand size bit (D/B).
     pub g: bool,
     pub d_b: bool,
+    /// The L bit (bit 53): this is a 64-bit code segment. It is what
+    /// distinguishes 64-bit code from compatibility-mode code inside long
+    /// mode, and it is mutually exclusive with D/B -- a descriptor with both
+    /// set is illegal, because "64-bit operands" and "32-bit operands" cannot
+    /// both be the default.
+    pub l: bool,
 }
 
 impl Descriptor {
@@ -29,7 +35,7 @@ impl Descriptor {
         //   bits 32-39: base 23:16
         //   bits 40-47: type/attr
         //   bits 48-51: limit 19:16
-        //   bits 52-55: AVL, L, D/B, G
+        //   bits 52-55: AVL, L, D/B, G  (L marks a 64-bit code segment)
         //   bits 56-63: base 31:24
         let base = (((raw >> 16) & 0xFFFF) as u32)
             | ((((raw >> 32) & 0xFF) as u32) << 16)
@@ -37,9 +43,10 @@ impl Descriptor {
         let limit20 = ((raw & 0xFFFF) as u32) | ((((raw >> 48) & 0xF) as u32) << 16);
         let g = (raw >> 55) & 1 == 1;
         let d_b = (raw >> 54) & 1 == 1;
+        let l = (raw >> 53) & 1 == 1;
         let limit = if g { (limit20 << 12) | 0xFFF } else { limit20 };
         let attr = ((raw >> 40) & 0xFF) as u8;
-        Descriptor { base, limit, attr, g, d_b }
+        Descriptor { base, limit, attr, g, d_b, l }
     }
 
     /// True if the descriptor is present.
@@ -64,13 +71,15 @@ impl Descriptor {
     pub fn dpl(&self) -> u8 { (self.attr >> 5) & 0x3 }
 }
 
-/// Read a descriptor from the GDT/IDT at `base + index*8`.
-pub fn read_descriptor(mem: &crate::memory::Memory, base: u32, index: u16) -> Descriptor {
-    let addr = Memory::phys32(base.wrapping_add((index as u32) * 8));
-    Descriptor::parse(mem.read_u64(addr))
+/// Read a descriptor from a **physical** address.
+///
+/// The caller resolves the table entry's linear address first (see
+/// `Cpu::linear_to_phys_ro`): a descriptor table lives wherever the kernel
+/// says it does, which on a kernel running in the higher half is not where
+/// its bytes physically are.
+pub fn read_descriptor(mem: &crate::memory::Memory, entry_phys: usize) -> Descriptor {
+    Descriptor::parse(mem.read_u64(entry_phys))
 }
-
-use crate::memory::Memory;
 
 /// Translate a logical address in protected mode to a physical address.
 /// `seg` is the cached descriptor for the segment register.
@@ -107,6 +116,19 @@ mod tests {
         assert_eq!(d.dpl(), 0);
         assert!(d.g);
         assert!(d.d_b);
+        assert!(!d.l);
+    }
+
+    #[test]
+    fn the_l_bit_marks_a_64_bit_code_segment() {
+        // A long-mode kernel code segment: present, code, L set, D/B clear.
+        // The pair is mutually exclusive, and reading L out of the D/B bit is
+        // how a 64-bit segment gets mistaken for a 32-bit one.
+        let raw: u64 = (0x9Au64 << 40) | (0x20u64 << 48);
+        let d = Descriptor::parse(raw);
+        assert!(d.l);
+        assert!(!d.d_b);
+        assert!(d.is_code());
     }
 
     #[test]

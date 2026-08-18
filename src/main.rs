@@ -1,13 +1,21 @@
 //! x86emu binary: load a flat binary at a segment:offset and run it.
 //!
 //! Usage:
-//!   x86emu <file> [segment:offset] [max_instructions]
-//!   x86emu --boot <bootsector.bin> [max_instructions]
+//!   x86emu [--mem SIZE] <file> [segment:offset] [max_instructions]
+//!   x86emu [--mem SIZE] --boot <bootsector.bin> [max_instructions]
+//!   x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [n]
+//!   x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [n]
+//!   x86emu [--mem SIZE] --long <flat64.bin> [load_addr_hex] [max_instructions]
 //!
 //! Defaults: load at 0000:0x0100 (like a DOS .COM), run up to 100000
 //! instructions or until HLT. Prints the final register state.
 //! `--boot` loads a 512-byte boot sector at 0000:0x7C00 (like a real PC)
 //! and prints the emulated text screen afterwards.
+//!
+//! `--mem` takes a size with an optional K/M/G suffix (a bare number is
+//! MiB), so `--mem 8G` builds a machine with 8 GiB of RAM. It applies to
+//! every mode, and is the only place the machine's size is chosen -- the
+//! BIOS memory map and `boot_params` are both derived from it.
 
 use std::env;
 use std::process::ExitCode;
@@ -20,25 +28,71 @@ fn parse_addr(s: &str) -> Option<(u16, u16)> {
     Some((u16::from_str_radix(seg, 16).ok()?, u16::from_str_radix(off, 16).ok()?))
 }
 
+/// Parse a `--mem` size: a number with an optional K/M/G suffix. A bare
+/// number is MiB, which is what everyone means by "give it 512".
+fn parse_mem(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last()? {
+        'k' | 'K' => (&s[..s.len() - 1], 1usize << 10),
+        'm' | 'M' => (&s[..s.len() - 1], 1usize << 20),
+        'g' | 'G' => (&s[..s.len() - 1], 1usize << 30),
+        _ => (s, 1usize << 20),
+    };
+    let n: usize = digits.trim().parse().ok()?;
+    n.checked_mul(mult)
+}
+
+/// Pull a `--mem SIZE` option out of the argument list, wherever it appears.
+/// Returning the remaining arguments keeps every mode's own parsing unaware
+/// of it.
+fn take_mem(args: &[String]) -> (usize, Vec<String>) {
+    let mut ram = Memory::DEFAULT_SIZE;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--mem" {
+            match args.get(i + 1).and_then(|v| parse_mem(v)) {
+                Some(n) => ram = n,
+                None => eprintln!("warning: --mem wants a size like 512M or 8G; ignoring"),
+            }
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    (ram, rest)
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let argv: Vec<String> = env::args().collect();
+    let (ram, args) = take_mem(&argv);
     if args.len() < 2 {
-        eprintln!("usage: x86emu <file> [segment:offset] [max_instructions]");
-        eprintln!("       x86emu --boot <bootsector.bin> [max_instructions]");
+        eprintln!("usage: x86emu [--mem SIZE] <file> [segment:offset] [max_instructions]");
+        eprintln!("       x86emu [--mem SIZE] --boot <bootsector.bin> [max_instructions]");
+        eprintln!("       x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [n]");
+        eprintln!("       x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [n]");
+        eprintln!("       x86emu [--mem SIZE] --long <flat64.bin> [load_addr_hex] [max_instructions]");
         return ExitCode::from(2);
     }
 
     if args[1] == "--boot" {
-        return boot(&args[2..]);
+        return boot(ram, &args[2..]);
     }
     if args[1] == "--kernel" {
-        return kernel(&args[2..]);
+        return kernel(ram, &args[2..]);
     }
     if args[1] == "--kernel-elf" {
-        return kernel_elf(&args[2..]);
+        return kernel_elf(ram, &args[2..], false);
+    }
+    if args[1] == "--kernel-elf64" {
+        return kernel_elf(ram, &args[2..], true);
+    }
+    if args[1] == "--long" {
+        return long_flat(ram, &args[2..]);
     }
     if args[1] == "--dump" {
-        return dump(&args[2..]);
+        return dump(ram, &args[2..]);
     }
 
     let path = &args[1];
@@ -57,7 +111,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut cpu = Cpu::new();
+    let mut cpu = Cpu::with_ram(ram);
     cpu.cs = segment;
     cpu.ip = offset;
     cpu.ds = segment;
@@ -81,7 +135,8 @@ fn main() -> ExitCode {
 }
 
 /// Boot a 512-byte boot sector at 0000:0x7C00 and print the text screen.
-fn boot(args: &[String]) -> ExitCode {    if args.is_empty() {
+fn boot(ram: usize, args: &[String]) -> ExitCode {
+    if args.is_empty() {
         eprintln!("usage: x86emu --boot <bootsector.bin> [max_instructions]");
         return ExitCode::from(2);
     }
@@ -102,7 +157,7 @@ fn boot(args: &[String]) -> ExitCode {    if args.is_empty() {
         return ExitCode::from(1);
     }
 
-    let mut cpu = Cpu::new();
+    let mut cpu = Cpu::with_ram(ram);
     // Real PCs load the boot sector at 0000:0x7C00.
     cpu.cs = 0x0000;
     cpu.ip = 0x7C00;
@@ -127,7 +182,7 @@ fn boot(args: &[String]) -> ExitCode {    if args.is_empty() {
 }
 
 /// Load a Linux bzImage via the boot protocol and run the 32-bit kernel.
-fn kernel(args: &[String]) -> ExitCode {
+fn kernel(ram: usize, args: &[String]) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: x86emu --kernel <bzImage> [max_instructions]");
         return ExitCode::from(2);
@@ -145,7 +200,7 @@ fn kernel(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut cpu = Cpu::new();
+    let mut cpu = Cpu::with_ram(ram);
     match x86emu::boot::load_kernel(&mut cpu, &bytes, "console=tty0") {
         Ok(info) => {
             println!("loaded bzImage: setup_sects={} syssize={} code32_start={:08X}",
@@ -174,7 +229,7 @@ fn kernel(args: &[String]) -> ExitCode {
 /// Dump a region of emulated memory to a file. Used for debugging the
 /// kernel decompressor: `x86emu --dump <bzImage> <outfile> <addr> <len> <max_instructions>`
 /// loads the kernel, runs it, and writes `len` bytes from physical `addr` to `outfile`.
-fn dump(args: &[String]) -> ExitCode {
+fn dump(ram: usize, args: &[String]) -> ExitCode {
     if args.len() < 5 {
         eprintln!("usage: x86emu --dump <bzImage> <outfile> <addr> <len> <max_instructions>");
         return ExitCode::from(2);
@@ -193,7 +248,7 @@ fn dump(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut cpu = Cpu::new();
+    let mut cpu = Cpu::with_ram(ram);
     match x86emu::boot::load_kernel(&mut cpu, &bytes, "console=tty0") {
         Ok(info) => {
             println!("loaded bzImage: setup_sects={} syssize={} code32_start={:08X}",
@@ -233,9 +288,9 @@ fn dump(args: &[String]) -> ExitCode {
 ///
 /// Usage: --kernel-elf <kernel.elf> [--initrd <file>] [--cmdline <str>]
 ///        [max_instructions]
-fn kernel_elf(args: &[String]) -> ExitCode {
+fn kernel_elf(ram: usize, args: &[String], long_mode: bool) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: x86emu --kernel-elf <kernel.elf> [--initrd <file>] \
+        eprintln!("usage: x86emu --kernel-elf[64] <kernel.elf> [--initrd <file>] \
                    [--cmdline <str>] [max_instructions]");
         return ExitCode::from(2);
     }
@@ -276,12 +331,18 @@ fn kernel_elf(args: &[String]) -> ExitCode {
         None => None,
     };
 
-    let mut cpu = Cpu::new();
-    match x86emu::boot::load_elf_kernel_with_initrd(
-        &mut cpu, &bytes, &cmdline, initrd.as_deref(),
-    ) {
+    let mut cpu = Cpu::with_ram(ram);
+    println!("machine: {} MiB of RAM", cpu.mem.ram_size() >> 20);
+    let loaded = if long_mode {
+        x86emu::boot::load_elf64_kernel(&mut cpu, &bytes, &cmdline, initrd.as_deref())
+    } else {
+        x86emu::boot::load_elf_kernel_with_initrd(&mut cpu, &bytes, &cmdline, initrd.as_deref())
+            .map(|e| e as u64)
+    };
+    match loaded {
         Ok(entry) => {
-            println!("loaded kernel ELF, entry={:08X}  cmdline={:?}", entry, cmdline);
+            println!("loaded {} kernel ELF, entry={:016X}  cmdline={:?}",
+                if long_mode { "64-bit" } else { "32-bit" }, entry, cmdline);
         }
         Err(e) => {
             eprintln!("error loading kernel ELF: {}", e);
@@ -295,6 +356,61 @@ fn kernel_elf(args: &[String]) -> ExitCode {
     if cpu.halted {
         if cpu.triple_fault {
             println!("halted (TRIPLE FAULT: exception fired with no IDT installed)");
+        } else {
+            println!("halted");
+        }
+    } else {
+        println!("stopped (instruction limit reached)");
+    }
+    print_state(&cpu);
+    print_debug(&mut cpu);
+    print_screen(&cpu);
+    ExitCode::from(0)
+}
+
+/// Run a flat 64-bit binary in long mode.
+///
+/// The 64-bit counterpart of `--boot`: no ELF and no boot protocol, just
+/// bytes loaded at an address with the machine already in long mode, an
+/// identity-mapped low 4 GiB and a stack. The smallest thing that
+/// demonstrates a 64-bit CPU end to end.
+fn long_flat(ram: usize, args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: x86emu --long <flat64.bin> [load_addr_hex] [max_instructions]");
+        return ExitCode::from(2);
+    }
+    let path = &args[0];
+    let addr = args.get(1)
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x10_0000);
+    let max = args.get(2)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1_000_000);
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error reading {}: {}", path, e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut cpu = Cpu::with_ram(ram);
+    println!("machine: {} MiB of RAM", cpu.mem.ram_size() >> 20);
+    match x86emu::boot::load_flat64(&mut cpu, &bytes, addr) {
+        Ok(entry) => println!("long mode: {} bytes at {:016X}, RSP={:016X}",
+            bytes.len(), entry, cpu.rsp()),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    }
+
+    let ran = cpu.run(max);
+    println!("executed {} instructions", ran);
+    if cpu.halted {
+        if cpu.triple_fault {
+            println!("halted (TRIPLE FAULT)");
         } else {
             println!("halted");
         }
@@ -349,8 +465,8 @@ fn dump_linear(cpu: &mut Cpu) {
         eprintln!("X86EMU_DUMP_LINEAR wants <hexaddr>:<hexlen>:<path>");
         return;
     }
-    let addr = u32::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap_or(0);
-    let len = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap_or(0);
+    let addr = u64::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap_or(0);
+    let len = u64::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap_or(0);
     let mut buf = Vec::with_capacity(len as usize);
     for i in 0..len {
         let phys = cpu.apply_paging(addr.wrapping_add(i));
@@ -359,7 +475,7 @@ fn dump_linear(cpu: &mut Cpu) {
         buf.push(cpu.mem.read_u8(phys));
     }
     match std::fs::write(parts[2], &buf) {
-        Ok(_) => println!("dumped {:X} bytes from linear {:08X} to {}", len, addr, parts[2]),
+        Ok(_) => println!("dumped {:X} bytes from linear {:016X} to {}", len, addr, parts[2]),
         Err(e) => eprintln!("error writing {}: {}", parts[2], e),
     }
 }
@@ -372,10 +488,10 @@ fn print_debug(cpu: &mut Cpu) {
         println!("--- unimplemented opcodes ---");
         for (op, (count, eip)) in cpu.unknown_ops.iter() {
             if *op > 0xFF {
-                println!("  0F {:02X}  hits={:<10} first at eip={:08X}",
+                println!("  0F {:02X}  hits={:<10} first at rip={:016X}",
                     op & 0xFF, count, eip);
             } else {
-                println!("  {:02X}     hits={:<10} first at eip={:08X}",
+                println!("  {:02X}     hits={:<10} first at rip={:016X}",
                     op, count, eip);
             }
         }
@@ -393,29 +509,29 @@ fn print_debug(cpu: &mut Cpu) {
         cpu.pic.slave_imr, cpu.pic.slave_irr, cpu.pic.slave_isr, cpu.pic.slave_base);
     for (v, n) in cpu.irq_vectors.iter().enumerate() {
         if *n > 0 {
-            println!("  IRQ vector {:02X}: {} (IDT -> {:08X})", v, n, cpu.idt_target(v as u8));
+            println!("  IRQ vector {:02X}: {} (IDT -> {:016X})", v, n, cpu.idt_target(v as u8));
         }
     }
     println!("user-mode instructions: {}  ring switches into the kernel: {}",
         cpu.user_instructions, cpu.ring_switches);
-    println!("TR selector={:04X} base={:08X} limit={:08X}  LDT base={:08X}",
+    println!("TR selector={:04X} base={:016X} limit={:08X}  LDT base={:016X}",
         cpu.tr_selector, cpu.tr_base, cpu.tr_limit, cpu.ldt_base);
     if !cpu.watch_log.is_empty() {
         println!("--- writes covering the watched address ---");
         for (n, eip, addr) in cpu.watch_log.iter().take(40) {
-            println!("  [{}] eip={:08X} store at linear {:08X}", n, eip, addr);
+            println!("  [{}] rip={:016X} store at {:012X}", n, eip, addr);
         }
     }
     if !cpu.syscall_log.is_empty() {
         println!("--- user system calls (int 0x80) ---");
         for (n, ax, bx, cx, dx) in cpu.syscall_log.iter() {
-            println!("  [{}] eax={} ebx={:08X} ecx={:08X} edx={:08X}", n, ax, bx, cx, dx);
+            println!("  [{}] rax={} rbx={:016X} rcx={:016X} rdx={:016X}", n, ax, bx, cx, dx);
         }
     }
     if !cpu.mem.store_log.is_empty() {
         println!("--- stores to the watched physical address ---");
         for (addr, val, width, eip) in cpu.mem.store_log.iter() {
-            println!("  {:08X} <- {:08X} ({} bytes) from eip={:08X}", addr, val, width, eip);
+            println!("  {:012X} <- {:016X} ({} bytes) from rip={:016X}", addr, val, width, eip);
         }
     }
     println!("--- exception counts ---");
@@ -426,7 +542,7 @@ fn print_debug(cpu: &mut Cpu) {
     }
     println!("--- first {} exceptions ---", cpu.exc_log.len());
     for (n, vector, code, eip, cr2) in cpu.exc_log.iter().take(40) {
-        println!("  [{}] vec={:02X} err={:?} eip={:08X} cr2={:08X}",
+        println!("  [{}] vec={:02X} err={:?} rip={:016X} cr2={:016X}",
             n, vector, code, eip, cr2);
     }
     let ring = &cpu.eip_ring;
@@ -437,7 +553,7 @@ fn print_debug(cpu: &mut Cpu) {
         println!("--- last {} instruction pointers ---", tail);
         for i in 0..tail {
             let idx = (cpu.eip_ring_pos + ring.len() - tail + i) % ring.len();
-            println!("  {:08X}", ring[idx]);
+            println!("  {:016X}", ring[idx]);
         }
     }
 }
@@ -466,20 +582,47 @@ fn print_screen(cpu: &Cpu) {
 }
 
 fn print_state(cpu: &Cpu) {
-    println!("EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X}",
-        cpu.eax, cpu.ebx, cpu.ecx, cpu.edx);
-    println!("AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
-        cpu.ax(), cpu.bx(), cpu.cx(), cpu.dx());
-    println!("ESP={:08X} EBP={:08X} ESI={:08X} EDI={:08X}",
-        cpu.esp, cpu.ebp, cpu.esi, cpu.edi);
-    println!("SP={:04X} BP={:04X} SI={:04X} DI={:04X}",
-        cpu.sp(), cpu.bp(), cpu.si(), cpu.di());
+    use x86emu::cpu::Mode;
+    let mode = cpu.mode();
+    if mode == Mode::Long {
+        // In 64-bit mode the registers are named and printed at their real
+        // width; showing the low halves would hide exactly the bits that
+        // matter.
+        const NAMES: [&str; 16] = ["RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI",
+                                   "R8 ", "R9 ", "R10", "R11", "R12", "R13", "R14", "R15"];
+        for row in 0..4 {
+            let mut line = String::new();
+            for col in 0..4 {
+                let i = row * 4 + col;
+                line.push_str(&format!("{}={:016X} ", NAMES[i], cpu.regs[i]));
+            }
+            println!("{}", line.trim_end());
+        }
+        println!("RIP={:016X} RFLAGS={:08X}", cpu.rip, cpu.flags);
+    } else {
+        println!("EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X}",
+            cpu.eax(), cpu.ebx(), cpu.ecx(), cpu.edx());
+        println!("AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
+            cpu.ax(), cpu.bx(), cpu.cx(), cpu.dx());
+        println!("ESP={:08X} EBP={:08X} ESI={:08X} EDI={:08X}",
+            cpu.esp(), cpu.ebp(), cpu.esi(), cpu.edi());
+        println!("SP={:04X} BP={:04X} SI={:04X} DI={:04X}",
+            cpu.sp(), cpu.bp(), cpu.si(), cpu.di());
+        println!("EIP={:08X} IP={:04X} FLAGS={:04X}", cpu.eip(), cpu.ip, cpu.flags);
+    }
     println!("CS={:04X} DS={:04X} ES={:04X} SS={:04X} FS={:04X} GS={:04X}",
         cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs);
-    println!("EIP={:08X} IP={:04X} FLAGS={:04X}", cpu.eip, cpu.ip, cpu.flags);
+    println!("mode: {}", match mode {
+        Mode::Real => "real",
+        Mode::Protected => "protected (32-bit)",
+        Mode::Compat => "long mode, compatibility (32-bit code)",
+        Mode::Long => "long mode, 64-bit",
+    });
     if cpu.pe {
-        println!("protected mode: GDT base={:08X} limit={:04X}  IDT base={:08X} limit={:04X}",
+        println!("GDT base={:016X} limit={:04X}  IDT base={:016X} limit={:04X}",
             cpu.gdt_base, cpu.gdt_limit, cpu.idt_base, cpu.idt_limit);
+        println!("CR0={:08X} CR3={:016X} CR4={:08X} EFER={:016X}",
+            cpu.cr0, cpu.cr3, cpu.cr4, cpu.efer);
     }
     let f = |on: bool, ch: char| if on { ch } else { '-' };
     print!("flags: ");

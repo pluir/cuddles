@@ -5,7 +5,13 @@ emulator (CPU + memory + devices) that can eventually boot real firmware.
 We're starting with a solid 16-bit real-mode CPU core and layering on
 protected mode, paging, and devices.
 
-## Current stage: boots Linux to a shell
+## Current stage: 64-bit, and boots Linux to a shell
+
+The CPU implements all three of x86's modes — 16-bit real, 32-bit protected,
+and **64-bit long mode** — with paging structures to match: two-level 32-bit
+paging, PAE, and long mode's four-level tables. RAM is sized at run time
+rather than compiled in, and a machine can be given **more than 4 GiB**, with
+the excess wired above the 32-bit MMIO hole exactly as a real chipset does.
 
 A real 32-bit Linux kernel (buildroot, 2.6.34.14) boots on this emulator from
 `startup_32` to a busybox shell prompt: it brings up its devices, mounts an
@@ -62,15 +68,67 @@ Debugging switches, all off by default and all environment variables:
 and `tools/sym.py` turns an address into a name — between them, "stuck at
 `C02EF525`" becomes "stuck in `early_page_fault`".
 
+### Running 64-bit code
+
+```sh
+cargo run --release --example gen_long64      # writes examples/long64.bin
+./target/release/x86emu --long examples/long64.bin
+```
+
+`--long` puts the machine straight into 64-bit long mode — PAE on, a 4-level
+page table identity-mapping the low 4 GiB, a GDT whose code segment has the
+L bit set — and runs a flat binary there, the way `--boot` does for a 16-bit
+boot sector. The bundled demo prints to the VGA console through a 64-bit
+pointer, reaches its own data with RIP-relative addressing, uses the
+registers REX added, and does an addition whose result does not fit in 32
+bits:
+
+```
+--- text screen ---
+Hello from 64-bit long mode!
+
+RAX=02468ACF13579BDE RCX=0000000000000000 RDX=0000000000000000 RBX=0000000000000000
+R8 =0123456789ABCDEF ...
+mode: long mode, 64-bit
+```
+
+`--kernel-elf64 <kernel.elf>` loads a 64-bit ELF kernel the same way
+`--kernel-elf` loads a 32-bit one: PT_LOAD segments at their physical
+addresses, `boot_params` at 0x90000 with the machine's own E820 map, RSI
+pointing at it, and the CPU handed over already in long mode.
+
+### Sizing the memory
+
+`--mem SIZE` (a number with an optional `K`/`M`/`G` suffix; a bare number is
+MiB) builds the machine with that much RAM. It applies to every mode, and it
+is the *only* place the size is chosen — the BIOS `INT 0x15` map, `boot_params`
+and the physical address space are all derived from it:
+
+```sh
+./target/release/x86emu --mem 1G --kernel-elf images/golden_kernel.bin ...
+./target/release/x86emu --mem 8G --long examples/long64.bin
+```
+
+Above 3 GiB the map splits: RAM fills `0 .. 0xC0000000`, the window from
+there to 4 GiB is reserved for devices, and the remainder appears at
+`0x1_0000_0000` and up. That is what a real machine reports, and it is why
+reaching the top of an 8 GiB machine needs 64-bit addressing.
+
 ### What works
 
-- **128 MiB flat memory** with real-mode `segment:offset` → 20-bit physical
-  address translation (`segment * 16 + offset`, with 1 MiB wraparound) and
-  32-bit protected-mode translation through segment descriptors.
-- **Registers**: eight general registers stored once, 32 bits wide
-  (EAX/.../EDI), with AX/.../DI and AL/AH/... as *views* of them rather than
-  separate copies; six segment registers (ES/CS/SS/DS/FS/GS); the instruction
-  pointer; and a full 32-bit EFLAGS.
+- **Run-time-sized memory**, defaulting to 128 MiB and settable with `--mem`,
+  with real-mode `segment:offset` → 20-bit physical address translation
+  (`segment * 16 + offset`, with 1 MiB wraparound), 32-bit protected-mode
+  translation through segment descriptors, and 64-bit translation where the
+  offset *is* the linear address. A machine larger than 3 GiB has its extra
+  RAM wired above 4 GiB, past the MMIO hole; an address with no RAM behind it
+  reads as an open bus rather than aliasing back into low memory.
+- **Registers**: sixteen general registers stored once, 64 bits wide
+  (RAX/.../RDI, R8-R15), with EAX/.../EDI, AX/.../DI and AL/AH/... as *views*
+  of them rather than separate copies; six segment registers
+  (ES/CS/SS/DS/FS/GS); a 64-bit RIP; and RFLAGS. A 32-bit write zero-extends
+  into the whole register while 16- and 8-bit writes preserve what is above
+  them — x86-64's rule, and one compiled code depends on.
 - **Flags**: CF, PF, AF, ZF, SF, TF, IF, DF, OF, plus the high-half bits a
   32-bit OS cares about — `AC` (18) and `ID` (21), which Linux toggles through
   `PUSHFD`/`POPFD` to identify the CPU. Computed correctly for the implemented
@@ -120,8 +178,10 @@ and `tools/sym.py` turns an address into a name — between them, "stuck at
     and family/model/feature flags (leaf 1, including the TSC bit).
   - `RDTSC` (0x0F 0x31) — reads the time-stamp counter (incremented each
     step) into EDX:EAX.
-  - `RDMSR`/`WRMSR` (0x0F 0x32 / 0x0F 0x30) — read/write model-specific
-    registers (all MSRs report 0; writes are no-ops).
+  - `RDMSR`/`WRMSR` (0x0F 0x32 / 0x0F 0x30) — the registers long mode needs
+    are real (EFER, STAR/LSTAR/CSTAR/SFMASK, FS/GS/KERNEL_GS base, the
+    SYSENTER trio); anything else reads back zero and swallows writes, so
+    feature probing does not fault.
   - Bit tests `BT/BTS/BTR/BTC` (0x0F 0xA3/0xAB/0xB3/0xBB and group 8
     `0x0F 0xBA` /4-/7), 16/32-bit.
   - `TEST AL/AX/EAX, imm` (0xA8/0xA9).
@@ -137,8 +197,16 @@ and `tools/sym.py` turns an address into a name — between them, "stuck at
   - Segment `PUSH`/`POP` including FS/GS (0x0F 0xA0/0xA1/0xA8/0xA9),
     `MOV` to and from the debug registers (0x0F 0x21/0x23), and
     `LLDT`/`LTR`/`SLDT`/`STR` (0x0F 0x00).
-  - The multi-byte `NOP` (0x0F 0x1F) and the fences (0x0F 0xAE /5-/7), which
-    GCC and the kernel's alternatives machinery both emit.
+  - The multi-byte `NOP` (0x0F 0x1F), the fences (0x0F 0xAE /5-/7), the
+    prefetch hints and `INVD`/`WBINVD` — no-ops on a single core with no
+    cache, but they have to *decode*, and GCC and the kernel's alternatives
+    machinery emit them by the yard.
+  - **64-bit forms**: the `REX` prefixes (W/R/X/B), which widen operands to
+    64 bits, reach R8-R15, and rename the byte registers to
+    SPL/BPL/SIL/DIL; `MOVSXD` (0x63); `MOV r64, imm64` (`movabs`);
+    RIP-relative addressing; `SYSCALL`/`SYSRET` (0x0F 0x05/0x07);
+    `SWAPGS` (0x0F 0x01 F8); `RDTSCP`; `IRETQ`; and 64-bit `LGDT`/`LIDT`,
+    whose pseudo-descriptor carries an eight-byte base.
   - **x87 FPU** (`src/fpu.rs`): the D8-DF escape opcodes — `FNINIT`,
     `FSTCW`/`FLDCW`, `FSTSW` (AX and m16), `FLD`/`FST`/`FSTP` (m32/m64 and
     ST(i)), `FILD`/`FISTP` (m16/m32), simplified `FADD/FSUB/FMUL/FDIV`
@@ -157,15 +225,36 @@ and `tools/sym.py` turns an address into a name — between them, "stuck at
   in-kernel decompressor.
 - **Protected mode**: GDT/IDT parsing, segment-descriptor caching, 32-bit
   address translation, and protected-mode interrupt dispatch through the IDT.
-- **Paging**: 32-bit two-level page tables (page directory + page table),
-  4 KiB and 4 MiB pages, CR0.PG/CR3/CR4, and virtual → physical translation
-  applied to all memory accesses when paging is enabled, cached in a
-  256-entry TLB. **Page-level protection** is enforced: the effective R/W and
-  U/S bits are the AND of the directory's and the table's, a supervisor write
-  to a read-only page faults when `CR0.WP` is set, a user access to a
-  supervisor page faults, and the accessed and dirty bits are maintained. The
-  `#PF` error code reports present/write/user, and the faulting linear address
-  goes in CR2.
+- **Paging, all three structures** (`src/paging.rs`):
+
+  | CR4.PAE | EFER.LMA | structure | levels | entry | largest page |
+  |---------|----------|-----------|--------|-------|--------------|
+  | 0       | 0        | legacy    | 2      | 4 B   | 4 MiB        |
+  | 1       | 0        | PAE       | 3      | 8 B   | 2 MiB        |
+  | 1       | 1        | long      | 4      | 8 B   | 1 GiB        |
+
+  Translation is applied to every memory access when paging is enabled and
+  cached in a 256-entry TLB. **Page-level protection** is enforced: the
+  effective R/W, U/S and NX are the combination of *every* level's, a
+  supervisor write to a read-only page faults when `CR0.WP` is set, a user
+  access to a supervisor page faults, an instruction fetch from a no-execute
+  page faults when `EFER.NXE` is set (and a *read* of it does not), and the
+  accessed and dirty bits are maintained. The `#PF` error code reports
+  present/write/user/fetch, and the faulting linear address goes in a 64-bit
+  CR2. In long mode a non-canonical address is a `#GP` before the page tables
+  are consulted at all, so the unused middle of the 64-bit address space is a
+  hole rather than an alias.
+- **Long mode** (`Mode::Long` / `Mode::Compat`): EFER with LME/LMA/NXE/SCE,
+  where LMA is the *CPU's* to set — software asks for long mode by setting
+  LME and enters it by turning paging on. Segmentation is gone in 64-bit
+  mode: CS/DS/ES/SS have no base and no limit, while FS and GS keep one that
+  comes from an MSR rather than a descriptor. A code segment's L bit chooses
+  between 64-bit code and **compatibility mode**, which runs an unmodified
+  32-bit binary underneath a 64-bit kernel. Interrupts go through 16-byte
+  gates with a 64-bit offset and an interrupt-stack-table index; the frame is
+  five 8-byte words with SS:RSP pushed *always*, and `IRETQ` pops all five.
+  `SYSCALL` reads its entry point out of LSTAR and deliberately does **not**
+  switch stacks, which is why `SWAPGS` exists.
 - **Restartable faults**: a fault reports the address of the instruction that
   faulted (traps report the next one), and a faulting instruction commits
   nothing — no register write, no memory write, no stack-pointer movement, and
@@ -223,15 +312,20 @@ and `tools/sym.py` turns an address into a name — between them, "stuck at
     device's disk image.
   - `INT 0x15` memory map: `AH=0xE820` (E820, entry-by-entry with the
     `'SMAP'` signature and EBX continuation), `AH=0xE8`/`AL=0x01` (E801),
-    and `AH=0x88` (extended memory in KB). Reports the physical RAM layout
-    Linux queries very early in boot.
-- **Stack**: `PUSH`/`POP`/`CALL`/`RET` use SS:SP (16-bit) or SS:ESP (32-bit).
-- **A binary** (`x86emu`) with four modes: a flat `.bin` at a
-  `segment:offset`; `--boot` for a 512-byte boot sector at `0000:0x7C00`;
-  `--kernel` for a bzImage through the Linux boot protocol; and
-  `--kernel-elf` for an already-decompressed kernel ELF, which also takes
-  `--initrd <file>` and `--cmdline <string>`. Every mode prints the final
-  register state and the emulated text screen.
+    and `AH=0x88` (extended memory in KB). All three are derived from the
+    machine's own map, so a machine built with `--mem 8G` describes itself
+    the same way through every one of them.
+- **Stack**: `PUSH`/`POP`/`CALL`/`RET` use SS:SP (16-bit), SS:ESP (32-bit) or
+  RSP (64-bit, where the width is not overridable — there is no encoding for
+  a four-byte push).
+- **A binary** (`x86emu`) with six modes: a flat `.bin` at a `segment:offset`;
+  `--boot` for a 512-byte boot sector at `0000:0x7C00`; `--kernel` for a
+  bzImage through the Linux boot protocol; `--kernel-elf` for an
+  already-decompressed 32-bit kernel ELF; `--kernel-elf64` for a 64-bit one;
+  and `--long` for a flat 64-bit binary. The ELF modes also take
+  `--initrd <file>` and `--cmdline <string>`, and `--mem SIZE` applies to all
+  of them. Every mode prints the final register state — at 64-bit width when
+  the machine ends in long mode — and the emulated text screen.
 
 ### Working on this codebase
 
@@ -246,26 +340,32 @@ making changes.
 src/
   lib.rs          — crate root, re-exports
   cpu.rs          — registers, flags, fetch-decode-execute loop, stack, ModR/M helpers
-  memory.rs       — flat `Memory` (128 MiB, `Memory::SIZE` is the single source
-                  of truth for RAM size) + segment translation
+  memory.rs       — `Memory`, sized at run time (`--mem`), with RAM above the
+                  32-bit MMIO hole wired past 4 GiB; `e820_map()` is the one
+                  description of the layout
   modrm.rs        — ModR/M byte decoding + register-index helpers
   instructions.rs — instruction decoder + executor + ALU flag computation
   protected.rs    — segment descriptors, GDT/IDT parsing, protected-mode translation
-  paging.rs       — 32-bit page-directory/page-table walk (4 KiB and 4 MiB pages)
+  paging.rs       — page-table walks for all three structures: 32-bit (2 levels),
+                  PAE (3) and long mode (4), up to 1 GiB pages, with NX
   pit.rs          — 8254 Programmable Interval Timer (channel 0 -> IRQ0)
   pic.rs          — 8259 Programmable Interrupt Controller (master + slave)
   vga.rs          — VGA display: text mode + graphics modes 12h/13h
   kbd.rs          — 8042 keyboard controller (scancodes, IRQ1)
   dma.rs          — 8237 DMA controller (4 channels, page registers)
   ide.rs          — IDE/ATA disk controller (PIO, LBA28, IRQ14)
-  boot.rs         — Linux boot-protocol loader (parse bzImage, load kernel, boot_params)
+  boot.rs         — Linux boot-protocol loader (parse bzImage, load kernel,
+                  boot_params) + the long-mode entry sequence and ELF64 loader
   fpu.rs          — x87 FPU: control/status/tag words, 8 data registers, D8-DF instructions
   bios.rs         — minimal BIOS: INT 0x10/0x15/0x16/0x13 handlers + text screen
-  main.rs         — CLI binary: load a .bin and run it, --boot a boot sector, or --kernel a bzImage
+  main.rs         — CLI binary: a flat .bin, --boot, --kernel, --kernel-elf,
+                  --kernel-elf64, --long, and --mem
 examples/
   gen_add.rs      — writes a tiny test program (examples/add.bin)
+  gen_long64.rs   — writes a 64-bit demo (examples/long64.bin)
   add.bin         — mov ax,0x1234 ; mov bx,2 ; add ax,bx ; hlt
   boot.bin        — a 512-byte boot sector that prints "Hello from x86emu!"
+  long64.bin      — a flat 64-bit program for --long
 ```
 
 ### Running it
@@ -276,6 +376,9 @@ cargo run --release --example gen_add   # generate examples/add.bin
 cargo run --release -- examples/add.bin 0000:0100 100
 cargo run --release -- --boot examples/boot.bin   # boot a boot sector
 cargo run --release -- --kernel bzImage            # boot a Linux bzImage
+cargo run --release --example gen_long64           # generate examples/long64.bin
+cargo run --release -- --long examples/long64.bin  # run 64-bit code
+cargo run --release -- --mem 4G --long examples/long64.bin   # ...on a 4 GiB machine
 ```
 
 Sample output (flat binary):
@@ -329,6 +432,21 @@ Hello from x86emu!
    ext2 root filesystem out of an initial ramdisk, runs `/sbin/init` in ring 3,
    and reaches an interactive prompt. See **Booting Linux** above for how to
    run it.
+8. **Scale the memory** — *done*. RAM is sized at run time with `--mem`
+   instead of being a compile-time constant, and a machine can have more than
+   4 GiB: the excess is wired above the 32-bit MMIO hole, exactly where a real
+   chipset puts it, and the BIOS map and `boot_params` say so. Physical
+   addresses with no RAM behind them read as an open bus instead of aliasing
+   back into low memory — which also meant fixing what that aliasing had been
+   quietly standing in for: the descriptor tables are named by *linear*
+   address, and are now translated as such.
+9. **64-bit (long mode)** — *done*. Sixteen 64-bit general registers, the REX
+   prefixes, RIP-relative addressing, PAE and 4-level paging with NX and
+   1 GiB pages, 64-bit interrupt gates with an IST, `SYSCALL`/`SYSRET`,
+   `SWAPGS`, the FS/GS base MSRs, compatibility mode, and a `--long` /
+   `--kernel-elf64` boot path. What is *not* there is SSE: the x86-64 ABI
+   requires it, so a 64-bit Linux userspace needs it before it will run, and
+   it is the next layer rather than part of this one.
 
    What it took, beyond the earlier stages, was mostly *correctness* rather
    than new features — a kernel exercises the parts of an emulator that a

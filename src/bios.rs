@@ -119,8 +119,10 @@ impl Bios {
     // ---- INT 0x15: memory map services (AH = function) ----
     // E820 (AH=0xE820), E801 (AH=0xE801) and 0x88 report the physical RAM
     // layout. Linux queries these very early in boot to learn how much memory
-    // it can use. The backing store is `Memory::SIZE` (256 MiB), so extended
-    // memory (above the 1 MiB mark) is `Memory::SIZE - 1 MiB`.
+    // it can use. Every answer is derived from `Memory::e820()`, so a machine
+    // built with a different amount of RAM describes itself consistently
+    // through all three -- including one big enough that the map has to
+    // straddle the 4 GiB mark.
 
     fn memory_map(&mut self, cpu: &mut Cpu) {
         match cpu.reg8(Reg8::Ah) {
@@ -143,49 +145,47 @@ impl Bios {
     fn e820(&mut self, cpu: &mut Cpu) {
         // E820 entry layout (20 bytes): base (u64), length (u64), type (u32).
         // Types: 1 = usable, 2 = reserved, 3 = ACPI reclaimable, 4 = ACPI NVS.
-        // The extended-memory entry and end marker are derived from
-        // `Memory::SIZE` so the reported layout always matches the backing
-        // store, no matter how the RAM is scaled.
-        const ENTRIES: [(u64, u64, u32); 5] = [
-            (0x00000000, 0x0009FC00, 1), // conventional memory (640K - 1K)
-            (0x0009FC00, 0x00000400, 2), // EBDA
-            (0x000A0000, 0x00060000, 2), // VGA / ROM area
-            (0x00100000, (Memory::SIZE as u64) - 0x100000, 1), // extended memory
-            (Memory::SIZE as u64, 0x00000000, 2), // end marker (reserved)
-        ];
+        // The map comes from `Memory::e820()` so the reported layout always
+        // matches the machine, however it was sized -- including the split
+        // around the 32-bit MMIO hole on a machine with more than 3 GiB.
+        //
         // E820 protocol: EAX=0x0000E820, EDX='SMAP' (0x534D4150),
         // EBX=continuation (0 first), ECX=buffer size, ES:DI=buffer.
         // Returns EBX=next continuation (0=done).
-        if cpu.eax != 0x0000_E820 || cpu.edx != 0x534D_4150 {
+        if cpu.eax() != 0x0000_E820 || cpu.edx() != 0x534D_4150 {
             cpu.set_flag(flags::CF, true); // unsupported
             return;
         }
-        let cont = cpu.ebx as usize;
-        if cont >= ENTRIES.len() {
+        let entries = cpu.mem.e820();
+        let cont = cpu.ebx() as usize;
+        if cont >= entries.len() {
             cpu.set_flag(flags::CF, true); // out of entries
             return;
         }
-        let (base, len, typ) = ENTRIES[cont];
+        let (base, len, typ) = entries[cont];
         let buf = Memory::phys(cpu.es, cpu.di());
         cpu.mem.write_u64(buf, base);
         cpu.mem.write_u64(buf + 8, len);
         cpu.mem.write_u32(buf + 16, typ);
         // Next continuation (0 means done).
-        cpu.ebx = if cont + 1 < ENTRIES.len() { (cont + 1) as u32 } else { 0 };
-        cpu.eax = 0x0000_E820;
-        cpu.ecx = 20; // bytes written
+        cpu.set_ebx(if cont + 1 < entries.len() { (cont + 1) as u32 } else { 0 });
+        cpu.set_eax(0x0000_E820);
+        cpu.set_ecx(20); // bytes written
         cpu.set_flag(flags::CF, false);
     }
 
     fn e801(&mut self, cpu: &mut Cpu) {
         // Extended memory below 16 MiB in KB (15 MiB = 15360 KB), and above
-        // 16 MiB in 64 KiB units, derived from `Memory::SIZE`.
+        // 16 MiB in 64 KiB units. E801 is a 16-bit interface: the count above
+        // 16 MiB saturates at 0xFFFF units (~4 GiB), which is as much as it
+        // can say. A machine larger than that is described honestly by E820
+        // and understated here, exactly as a real BIOS understates it.
         let ext_kb: u16 = 15 * 1024;
         cpu.set_ax(ext_kb);
         cpu.set_cx(ext_kb);
-        // (SIZE - 16 MiB) / 64 KiB units.
-        let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
-        let units = (above_16m / (64 << 10)) as u16;
+        let low_ram = cpu.mem.ram_size().min(crate::memory::MMIO_HOLE_START);
+        let above_16m = low_ram.saturating_sub(16 << 20);
+        let units = (above_16m / (64 << 10)).min(0xFFFF) as u16;
         cpu.set_bx(units);
         cpu.set_dx(units);
     }
@@ -195,7 +195,8 @@ impl Bios {
         // 16-bit value, so it saturates at 65535 KB (~64 MiB); real BIOSes
         // report 0xFFFF when extended memory exceeds that. Linux uses E820 /
         // E801 for the full map.
-        cpu.set_ax(0xFFFF);
+        let ext_kb = (cpu.mem.ram_size().saturating_sub(0x10_0000)) / 1024;
+        cpu.set_ax(ext_kb.min(0xFFFF) as u16);
     }
 
     // ---- INT 0x16: keyboard services (AH = function) ----
@@ -338,9 +339,9 @@ mod tests {
         // E820 call: eax=0x0000E820, edx='SMAP', ebx=0 (first entry),
         // ecx=24 (buffer size), es:di = buffer. The program sets eax/edx
         // via movs; ebx/ecx are pre-set here.
-        cpu.edx = 0x534D_4150;
-        cpu.ebx = 0;
-        cpu.ecx = 24;
+        cpu.set_edx(0x534D_4150);
+        cpu.set_ebx(0);
+        cpu.set_ecx(24);
         // mov ah, 0xE8 ; mov al, 0x20 ; int 0x15 ; hlt
         load(&mut cpu, &[
             0xB4, 0xE8, 0xB0, 0x20, 0xCD, 0x15,
@@ -356,9 +357,9 @@ mod tests {
         assert_eq!(len, 0x9FC00);
         assert_eq!(typ, 1);
         // Continuation advanced to 1.
-        assert_eq!(cpu.ebx, 1);
+        assert_eq!(cpu.ebx(), 1);
         // eax preserved as 0x0000E820.
-        assert_eq!(cpu.eax, 0x0000_E820);
+        assert_eq!(cpu.eax(), 0x0000_E820);
     }
 
     #[test]
@@ -366,9 +367,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.es = 0;
         cpu.set_di(0x2000);
-        cpu.edx = 0x534D_4150;
-        cpu.ebx = 3; // fourth entry (extended memory)
-        cpu.ecx = 24;
+        cpu.set_edx(0x534D_4150);
+        cpu.set_ebx(3); // fourth entry (extended memory)
+        cpu.set_ecx(24);
         load(&mut cpu, &[
             0xB4, 0xE8, 0xB0, 0x20, 0xCD, 0x15,
             0xF4,
@@ -379,10 +380,32 @@ mod tests {
         let len = cpu.mem.read_u64(0x2008);
         let typ = cpu.mem.read_u32(0x2010);
         assert_eq!(base, 0x0010_0000); // 1 MiB
-        assert_eq!(len, (Memory::SIZE as u64) - 0x100000); // extended memory
+        assert_eq!(len, cpu.mem.ram_size() - 0x100000); // extended memory
         assert_eq!(typ, 1);
-        // Continuation advanced to 4 (index 4 is the end marker).
-        assert_eq!(cpu.ebx, 4);
+        // That was the last entry on a machine this size, so the
+        // continuation returns to 0 to say the map is finished.
+        assert_eq!(cpu.ebx(), 0);
+    }
+
+    #[test]
+    fn e820_describes_memory_above_four_gib() {
+        // A machine with more RAM than fits below the MMIO hole reports it in
+        // two pieces. Entry 4 is the hole; entry 5 is the RAM above 4 GiB.
+        let mut cpu = Cpu::with_ram(crate::memory::MMIO_HOLE_START as usize + (256 << 20));
+        cpu.es = 0;
+        cpu.set_di(0x2000);
+        cpu.set_edx(0x534D_4150);
+        cpu.set_ebx(5);
+        cpu.set_ecx(24);
+        load(&mut cpu, &[
+            0xB4, 0xE8, 0xB0, 0x20, 0xCD, 0x15,
+            0xF4,
+        ]);
+        cpu.run(16);
+        assert!(!cpu.get_flag(flags::CF));
+        assert_eq!(cpu.mem.read_u64(0x2000), crate::memory::HIGH_RAM_BASE);
+        assert_eq!(cpu.mem.read_u64(0x2008), 256 << 20);
+        assert_eq!(cpu.mem.read_u32(0x2010), 1);
     }
 
     #[test]
@@ -397,8 +420,8 @@ mod tests {
         // 15 MiB of extended memory below 16 MiB = 15360 KB in both AX and CX.
         assert_eq!(cpu.ax(), 15 * 1024);
         assert_eq!(cpu.cx(), 15 * 1024);
-        // Memory above 16 MiB: (SIZE - 16 MiB) / 64 KiB units.
-        let above_16m = (Memory::SIZE as u64).saturating_sub(16 << 20);
+        // Memory above 16 MiB: (RAM - 16 MiB) / 64 KiB units.
+        let above_16m = cpu.mem.ram_size().saturating_sub(16 << 20);
         let units = (above_16m / (64 << 10)) as u16;
         assert_eq!(cpu.bx(), units);
         assert_eq!(cpu.dx(), units);

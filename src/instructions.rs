@@ -6,7 +6,7 @@
 //! through the IDT.
 
 use crate::cpu::{Cpu, Reg8, Reg16, Reg32, SegReg, flags};
-use crate::modrm::{ModRm, Reg};
+use crate::modrm::ModRm;
 
 /// A decoded instruction, kept simple for diagnostics and tests.
 #[derive(Clone, Debug)]
@@ -22,9 +22,11 @@ pub enum Inst {
     MovRm8Imm { m: ModRm, imm: u8 },
     MovRm16Imm { m: ModRm, imm: u16 },
     MovRm32Imm { m: ModRm, imm: u32 },
-    MovReg8Imm { dst: Reg8, imm: u8 },
-    MovReg16Imm { dst: Reg16, imm: u16 },
-    MovReg32Imm { dst: Reg32, imm: u32 },
+    MovReg8Imm { dst: u8, imm: u8 },
+    MovReg16Imm { dst: u8, imm: u16 },
+    MovReg32Imm { dst: u8, imm: u32 },
+    /// B8+r with REX.W: the only instruction carrying a 64-bit immediate.
+    MovReg64Imm { dst: u8, imm: u64 },
     MovAccMem8 { addr: u16 },
     MovMem8Acc { addr: u16 },
     MovAccMem8Addr32 { addr: u32 },
@@ -33,8 +35,11 @@ pub enum Inst {
     MovMem16Acc { addr: u16 },
     MovAccMem16Addr32 { addr: u32 },
     MovMem16AccAddr32 { addr: u32 },
-    MovAccMem32 { addr: u32 },
-    MovMem32Acc { addr: u32 },
+    // The moffs forms take an address as wide as the address size, which
+    // in 64-bit mode is a full 64 bits — `movabs` to and from an absolute
+    // address, the only way to reach one without a base register.
+    MovAccMem32 { addr: u64 },
+    MovMem32Acc { addr: u64 },
     MovRmSeg { m: ModRm, seg: SegReg },
     MovSegRm { seg: SegReg, m: ModRm },
     // Load segment with pointer: LDS (0xC5) / LES (0xC4) / LSS (0F B2) /
@@ -53,14 +58,14 @@ pub enum Inst {
     AluAccImm8 { op: AluOp, imm: u8 },
     AluAccImm16 { op: AluOp, imm: u16 },
     AluAccImm32 { op: AluOp, imm: u32 },
-    IncReg16 { dst: Reg16 },
-    DecReg16 { dst: Reg16 },
-    IncReg32 { dst: Reg32 },
-    DecReg32 { dst: Reg32 },
-    PushReg16 { src: Reg16 },
-    PopReg16 { dst: Reg16 },
-    PushReg32 { src: Reg32 },
-    PopReg32 { dst: Reg32 },
+    IncReg16 { dst: u8 },
+    DecReg16 { dst: u8 },
+    IncReg32 { dst: u8 },
+    DecReg32 { dst: u8 },
+    PushReg16 { src: u8 },
+    PopReg16 { dst: u8 },
+    PushReg32 { src: u8 },
+    PopReg32 { dst: u8 },
     // Two- and three-operand IMUL: 0F AF (r <- r * r/m) and 69/6B
     // (r <- r/m * imm). Both set CF/OF when the full product does not fit
     // in the destination; the stored result is the truncated low half.
@@ -123,14 +128,16 @@ pub enum Inst {
     // MOVSX r16/32, r/m8 (0F BE) / MOVSX r32, r/m16 (0F BF)
     Movsx8 { m: ModRm, dst: u8 },
     Movsx16 { m: ModRm, dst: u8 },
+    /// MOVSXD r64, r/m32 (0x63 in 64-bit mode, where it displaces ARPL).
+    Movsxd { m: ModRm, dst: u8 },
     CallRel16 { rel: i16 },
     CallRel32 { rel: i32 },
     Ret,
     Ret32,
     // RET imm16 (0xC2): return, then drop `imm` bytes of arguments.
     RetImm { imm: u16, w32: bool },
-    XchgAxReg { reg: Reg16 },
-    XchgEaxReg { reg: Reg32 },
+    XchgAxReg { reg: u8 },
+    XchgEaxReg { reg: u8 },
     Int { vector: u8 },
     Int3,
     Into,
@@ -217,6 +224,17 @@ pub enum Inst {
     MovToCr { cr: u8, reg: u8 },
     // CLTS (0x0F 0x06): clear CR0.TS (task-switched flag).
     Clts,
+    /// SYSCALL (0F 05) and SYSRET (0F 07): the fast system-call pair long
+    /// mode replaces `int 0x80` with.
+    Syscall,
+    Sysret,
+    /// SWAPGS (0F 01 F8): exchange GS.base with KERNEL_GS_BASE.
+    Swapgs,
+    /// RDTSCP (0F 01 F9): RDTSC plus the processor id in ECX.
+    Rdtscp,
+    /// Instructions with no architectural effect here: memory fences,
+    /// prefetch hints, cache management, and the multi-byte NOP.
+    NopHint,
     // CPUID (0x0F 0xA2) / RDTSC (0x0F 0x31)
     Cpuid,
     Rdtsc,
@@ -373,19 +391,57 @@ impl Cond {
 
 pub fn decode(cpu: &mut Cpu) -> Inst {
     // Reset per-instruction prefix state (persists through execute, which
-    // runs after decode returns). The default operand/address size comes
-    // from the code segment: in protected mode a D=1 code segment defaults
-    // to 32-bit operands and addressing; otherwise the default is 16-bit.
-    // The 0x66/0x67 prefixes then *toggle* the size.
-    let d32 = cpu.pe && cpu.seg_desc[SegReg::Cs as usize].d_b;
-    cpu.opsize = d32;
-    cpu.addrsize = d32;
+    // runs after decode returns).
+    //
+    // The defaults come from the mode. In a legacy mode they come from the
+    // code segment: a D=1 code segment defaults to 32-bit operands and
+    // addressing, otherwise 16-bit, and 0x66/0x67 *toggle* the size. In
+    // 64-bit mode they do not come from the segment at all -- D must be 0
+    // when L is set -- and are fixed at 32-bit operands and 64-bit
+    // addressing, with 0x66 selecting 16-bit operands, 0x67 selecting 32-bit
+    // addressing, and REX.W selecting 64-bit operands.
+    let long64 = cpu.long64();
+    if long64 {
+        cpu.opsize = true;
+        cpu.addrsize = true;
+        cpu.addr64 = true;
+    } else {
+        let d32 = cpu.pe && cpu.seg_desc[SegReg::Cs as usize].d_b;
+        cpu.opsize = d32;
+        cpu.addrsize = d32;
+        cpu.addr64 = false;
+    }
     cpu.seg_override = None;
+    cpu.rex_present = false;
+    cpu.rex_w = false;
+    cpu.rex_r = false;
+    cpu.rex_x = false;
+    cpu.rex_b = false;
     // Handle prefixes: REP/REPNE (0xF3/0xF2), operand-size (0x66),
-    // address-size (0x67), and segment overrides.
+    // address-size (0x67), segment overrides, and — in 64-bit mode — REX.
     let mut rep = Rep::None;
     loop {
         let peek = cpu.peek_u8();
+        // REX (0x40-0x4F) exists only in 64-bit mode, where it displaces
+        // the one-byte INC/DEC forms entirely, and it must be the **last**
+        // prefix before the opcode: a legacy prefix after one cancels it.
+        if long64 && (0x40..=0x4F).contains(&peek) {
+            let b = cpu.fetch_u8();
+            cpu.rex_present = true;
+            cpu.rex_w = b & 8 != 0;
+            cpu.rex_r = b & 4 != 0;
+            cpu.rex_x = b & 2 != 0;
+            cpu.rex_b = b & 1 != 0;
+            continue;
+        }
+        if matches!(peek, 0xF0 | 0xF3 | 0xF2 | 0x66 | 0x67
+                        | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) {
+            cpu.rex_present = false;
+            cpu.rex_w = false;
+            cpu.rex_r = false;
+            cpu.rex_x = false;
+            cpu.rex_b = false;
+        }
         match peek {
             // LOCK. This is a uniprocessor emulator with no concurrent bus
             // master, so the prefix is consumed and the instruction runs
@@ -394,22 +450,41 @@ pub fn decode(cpu: &mut Cpu) -> Inst {
             0xF0 => { cpu.fetch_u8(); }
             0xF3 => { rep = Rep::Repe; cpu.fetch_u8(); }
             0xF2 => { rep = Rep::Repne; cpu.fetch_u8(); }
-            0x66 => { cpu.opsize = !cpu.opsize; cpu.fetch_u8(); }
-            0x67 => { cpu.addrsize = !cpu.addrsize; cpu.fetch_u8(); }
-            0x2E => { cpu.seg_override = Some(SegReg::Cs); cpu.fetch_u8(); }
-            0x36 => { cpu.seg_override = Some(SegReg::Ss); cpu.fetch_u8(); }
-            0x3E => { cpu.seg_override = Some(SegReg::Ds); cpu.fetch_u8(); }
-            0x26 => { cpu.seg_override = Some(SegReg::Es); cpu.fetch_u8(); }
+            0x66 => {
+                if long64 { cpu.opsize = false; } else { cpu.opsize = !cpu.opsize; }
+                cpu.fetch_u8();
+            }
+            0x67 => {
+                if long64 { cpu.addr64 = false; } else { cpu.addrsize = !cpu.addrsize; }
+                cpu.fetch_u8();
+            }
+            // In 64-bit mode CS, DS, ES and SS overrides are ignored -- those
+            // segments have no base to override. FS and GS keep theirs.
+            0x2E => { if !long64 { cpu.seg_override = Some(SegReg::Cs); } cpu.fetch_u8(); }
+            0x36 => { if !long64 { cpu.seg_override = Some(SegReg::Ss); } cpu.fetch_u8(); }
+            0x3E => { if !long64 { cpu.seg_override = Some(SegReg::Ds); } cpu.fetch_u8(); }
+            0x26 => { if !long64 { cpu.seg_override = Some(SegReg::Es); } cpu.fetch_u8(); }
             0x64 => { cpu.seg_override = Some(SegReg::Fs); cpu.fetch_u8(); }
             0x65 => { cpu.seg_override = Some(SegReg::Gs); cpu.fetch_u8(); }
             _ => break,
         }
     }
+    // REX.W wins over everything: it is the one prefix that can *widen* the
+    // operand size, and a 0x66 seen earlier does not undo it.
+    if cpu.rex_w { cpu.opsize = true; }
     let op = cpu.fetch_u8();
     decode_op(cpu, op, rep)
 }
 
+/// REX.B as the high bit of an opcode-embedded register number.
+#[inline]
+fn rb(cpu: &Cpu) -> u8 { (cpu.rex_b as u8) << 3 }
+
 fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
+    // `w32` selects between the 16-bit and the wider instruction *shapes*.
+    // The wider one covers both 32 and 64 bits; `cpu.osize()` is what says
+    // which, and instructions that carry an explicit width take it from
+    // there so REX.W actually widens them.
     let w32 = cpu.opsize;
     match op {
         0x00 => { let m = cpu.fetch_modrm(); Inst::AluRm8Reg { op: AluOp::Add, m, reg: m.reg, dir: Dir::RmReg } }
@@ -469,11 +544,13 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0x3D => { if w32 { Inst::AluAccImm32 { op: AluOp::Cmp, imm: cpu.fetch_u32() } } else { Inst::AluAccImm16 { op: AluOp::Cmp, imm: cpu.fetch_u16() } } }
 
         // INC reg (0x40-0x47) / DEC reg (0x48-0x4F)
-        0x40..=0x47 => { if w32 { Inst::IncReg32 { dst: Reg::reg32(op - 0x40) } } else { Inst::IncReg16 { dst: Reg::reg16(op - 0x40) } } }
-        0x48..=0x4F => { if w32 { Inst::DecReg32 { dst: Reg::reg32(op - 0x48) } } else { Inst::DecReg16 { dst: Reg::reg16(op - 0x48) } } }
+        // 0x40-0x4F are INC/DEC only in a legacy mode; in 64-bit mode the
+        // prefix loop above has already eaten them as REX.
+        0x40..=0x47 => { if w32 { Inst::IncReg32 { dst: op - 0x40 } } else { Inst::IncReg16 { dst: op - 0x40 } } }
+        0x48..=0x4F => { if w32 { Inst::DecReg32 { dst: op - 0x48 } } else { Inst::DecReg16 { dst: op - 0x48 } } }
         // PUSH reg (0x50-0x57) / POP reg (0x58-0x5F)
-        0x50..=0x57 => { if w32 { Inst::PushReg32 { src: Reg::reg32(op - 0x50) } } else { Inst::PushReg16 { src: Reg::reg16(op - 0x50) } } }
-        0x58..=0x5F => { if w32 { Inst::PopReg32 { dst: Reg::reg32(op - 0x58) } } else { Inst::PopReg16 { dst: Reg::reg16(op - 0x58) } } }
+        0x50..=0x57 => { let r = (op - 0x50) | rb(cpu); if w32 { Inst::PushReg32 { src: r } } else { Inst::PushReg16 { src: r } } }
+        0x58..=0x5F => { let r = (op - 0x58) | rb(cpu); if w32 { Inst::PopReg32 { dst: r } } else { Inst::PopReg16 { dst: r } } }
 
         // IMUL r, r/m, imm (0x69 imm16/32, 0x6B imm8 sign-extended)
         0x69 => {
@@ -509,7 +586,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
 
         // XCHG r/m, r (0x86 / 0x87)
         0x86 => { let m = cpu.fetch_modrm(); Inst::XchgRmReg { m, reg: m.reg, width: 8 } }
-        0x87 => { let m = cpu.fetch_modrm(); Inst::XchgRmReg { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+        0x87 => { let m = cpu.fetch_modrm(); Inst::XchgRmReg { m, reg: m.reg, width: cpu.osize() } }
 
         // POP r/m (0x8F). Only /0 is defined; other /reg values are invalid.
         0x8F => {
@@ -575,7 +652,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
 
         // XCHG AX/EAX, reg (0x90 = NOP when reg is AX)
         0x90 => Inst::Nop,
-        0x91..=0x97 => { if w32 { Inst::XchgEaxReg { reg: Reg::reg32(op - 0x90) } } else { Inst::XchgAxReg { reg: Reg::reg16(op - 0x90) } } }
+        0x91..=0x97 => { let r = (op - 0x90) | rb(cpu); if w32 { Inst::XchgEaxReg { reg: r } } else { Inst::XchgAxReg { reg: r } } }
 
         // CBW (0x98) / CWD (0x99) / CWDE / CDQ
         0x98 => { if w32 { Inst::Cwde } else { Inst::Cbw } }
@@ -586,11 +663,15 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0x9D => Inst::Popf,
 
         // MOV reg8, imm8 (0xB0-0xB7)
-        0xB0..=0xB7 => Inst::MovReg8Imm { dst: Reg::reg8(op - 0xB0), imm: cpu.fetch_u8() },
+        0xB0..=0xB7 => Inst::MovReg8Imm { dst: (op - 0xB0) | rb(cpu), imm: cpu.fetch_u8() },
         // MOV reg16/32, imm (0xB8-0xBF)
         0xB8..=0xBF => {
-            if w32 { Inst::MovReg32Imm { dst: Reg::reg32(op - 0xB8), imm: cpu.fetch_u32() } }
-            else { Inst::MovReg16Imm { dst: Reg::reg16(op - 0xB8), imm: cpu.fetch_u16() } }
+            let r = (op - 0xB8) | rb(cpu);
+            // With REX.W this is the one instruction that carries a full
+            // 64-bit immediate (`movabs`).
+            if cpu.rex_w { Inst::MovReg64Imm { dst: r, imm: cpu.fetch_u64() } }
+            else if w32 { Inst::MovReg32Imm { dst: r, imm: cpu.fetch_u32() } }
+            else { Inst::MovReg16Imm { dst: r, imm: cpu.fetch_u16() } }
         }
 
         // RET (near) 0xC3
@@ -616,13 +697,13 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         // Group 2 shifts/rotates: 0xD0 (r/m8, 1), 0xD1 (r/m16/32, 1),
         // 0xD2 (r/m8, CL), 0xD3 (r/m16/32, CL)
         0xD0 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: 8, count: ShiftCount::One } }
-        0xD1 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, count: ShiftCount::One } }
+        0xD1 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: cpu.osize(), count: ShiftCount::One } }
         0xD2 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: 8, count: ShiftCount::Cl } }
-        0xD3 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, count: ShiftCount::Cl } }
+        0xD3 => { let m = cpu.fetch_modrm(); Inst::Shift { op: ShiftOp::from_index(m.reg), m, width: cpu.osize(), count: ShiftCount::Cl } }
         // Group 2 shifts/rotates with imm8 count: 0xC0 (r/m8, imm8),
         // 0xC1 (r/m16/32, imm8)
         0xC0 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, width: 8, imm } }
-        0xC1 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, width: if w32 { 32 } else { 16 }, imm } }
+        0xC1 => { let m = cpu.fetch_modrm(); let imm = cpu.fetch_u8(); Inst::ShiftImm { op: ShiftOp::from_index(m.reg), m, width: cpu.osize(), imm } }
 
         // CALL rel16/32 (0xE8)
         0xE8 => { if w32 { Inst::CallRel32 { rel: cpu.fetch_u32() as i32 } } else { Inst::CallRel16 { rel: cpu.fetch_u16() as i16 } } }
@@ -735,22 +816,32 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         // MOV AX/EAX, moffs / MOV moffs, AX/EAX (0xA1/0xA3)
         // The moffs width follows the ADDRESS size.
         0xA1 => {
-            if cpu.addrsize {
-                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() } }
+            if cpu.addr64 { Inst::MovAccMem32 { addr: cpu.fetch_u64() } }
+            else if cpu.addrsize {
+                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u32() as u64 } }
                 else { Inst::MovAccMem16Addr32 { addr: cpu.fetch_u32() } }
             } else {
-                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u16() as u32 } }
+                if w32 { Inst::MovAccMem32 { addr: cpu.fetch_u16() as u64 } }
                 else { Inst::MovAccMem16 { addr: cpu.fetch_u16() } }
             }
         }
         0xA3 => {
-            if cpu.addrsize {
-                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u32() } }
+            if cpu.addr64 { Inst::MovMem32Acc { addr: cpu.fetch_u64() } }
+            else if cpu.addrsize {
+                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u32() as u64 } }
                 else { Inst::MovMem16AccAddr32 { addr: cpu.fetch_u32() } }
             } else {
-                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u16() as u32 } }
+                if w32 { Inst::MovMem32Acc { addr: cpu.fetch_u16() as u64 } }
                 else { Inst::MovMem16Acc { addr: cpu.fetch_u16() } }
             }
+        }
+
+        // 0x63: ARPL in a legacy mode (a protection check this emulator does
+        // not enforce), MOVSXD in 64-bit mode — where it is how every 32-bit
+        // value becomes a 64-bit index.
+        0x63 => {
+            let m = cpu.fetch_modrm();
+            if cpu.long64() { Inst::Movsxd { m, dst: m.reg } } else { Inst::Nop }
         }
 
         // LEA reg16/32, m (0x8D)
@@ -787,6 +878,16 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
             match op2 {
                 0x01 => {
                     let m = cpu.fetch_modrm();
+                    // The register forms of /7 are not INVLPG at all: F8 is
+                    // SWAPGS and F9 is RDTSCP, which is why the mod field has
+                    // to be looked at before the reg field is trusted.
+                    if m.mod_field == 3 && (m.reg & 7) == 7 {
+                        return match m.rm_raw {
+                            0 => Inst::Swapgs,
+                            1 => Inst::Rdtscp,
+                            _ => Inst::Unknown { opcode: 0x0F01 },
+                        };
+                    }
                     match m.reg & 7 {
                         2 => Inst::Lgdt { m },
                         3 => Inst::Lidt { m },
@@ -794,6 +895,21 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                         _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
                     }
                 }
+                // SYSCALL / SYSRET: the fast system-call pair. They replace
+                // `int 0x80` entirely on 64-bit, so a 64-bit userspace cannot
+                // make a single call without them.
+                0x05 => Inst::Syscall,
+                0x07 => Inst::Sysret,
+                // Cache and store-ordering instructions. This emulator has
+                // one core, no caches and no store buffer, so they are
+                // architecturally complete as no-ops -- but they must be
+                // *decoded*, or a kernel's `mfence` reads as a bad opcode.
+                0x08 | 0x09 => Inst::NopHint,       // INVD / WBINVD
+                0x0D => { cpu.fetch_modrm(); Inst::NopHint }  // prefetch hints
+                0x18 => { cpu.fetch_modrm(); Inst::NopHint }  // PREFETCHh
+                // The multi-byte NOP (0F 1F /0). Compilers emit it by the
+                // yard to align 64-bit branch targets.
+                0x1F => { cpu.fetch_modrm(); Inst::NopHint }
                 // 0F 00 group: SLDT (/0), STR (/1), LLDT (/2), LTR (/3).
                 // LTR is load-bearing once user mode exists: the TSS it names
                 // holds the ring-0 stack an interrupt from CPL 3 switches to.
@@ -908,10 +1024,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0xBD => { let m = cpu.fetch_modrm(); Inst::Bsr { m, dst: m.reg, w32 } }
                 // CMPXCHG (0F B0 / 0F B1)
                 0xB0 => { let m = cpu.fetch_modrm(); Inst::Cmpxchg { m, reg: m.reg, width: 8 } }
-                0xB1 => { let m = cpu.fetch_modrm(); Inst::Cmpxchg { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+                0xB1 => { let m = cpu.fetch_modrm(); Inst::Cmpxchg { m, reg: m.reg, width: cpu.osize() } }
                 // XADD (0F C0 / 0F C1)
                 0xC0 => { let m = cpu.fetch_modrm(); Inst::Xadd { m, reg: m.reg, width: 8 } }
-                0xC1 => { let m = cpu.fetch_modrm(); Inst::Xadd { m, reg: m.reg, width: if w32 { 32 } else { 16 } } }
+                0xC1 => { let m = cpu.fetch_modrm(); Inst::Xadd { m, reg: m.reg, width: cpu.osize() } }
                 // CMPXCHG8B m64 (0F C7 /1)
                 0xC7 => {
                     let m = cpu.fetch_modrm();
@@ -919,7 +1035,7 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                     else { Inst::Unknown { opcode: 0x0FC7 } }
                 }
                 // BSWAP r32 (0F C8+r)
-                0xC8..=0xCF => Inst::Bswap { reg: op2 - 0xC8 },
+                0xC8..=0xCF => Inst::Bswap { reg: (op2 - 0xC8) | rb(cpu) },
                 // CMOVcc r, r/m (0F 40-4F)
                 0x40..=0x4F => {
                     let m = cpu.fetch_modrm();
@@ -944,10 +1060,18 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 // patches MFENCE in as its memory barrier.
                 0xAE => {
                     let m = cpu.fetch_modrm();
-                    match m.reg & 7 {
-                        0 => Inst::Fxsave { m },
-                        1 => Inst::Fxrstor { m },
-                        _ => Inst::Nop,
+                    // The *register* forms are the fences; only the memory
+                    // forms are FXSAVE/FXRSTOR, and treating `mfence` as an
+                    // FXSAVE with reg=6 would have it write 512 bytes of FPU
+                    // state over whatever a register number resolved to.
+                    if m.mod_field == 3 {
+                        Inst::NopHint
+                    } else {
+                        match m.reg & 7 {
+                            0 => Inst::Fxsave { m },
+                            1 => Inst::Fxrstor { m },
+                            _ => Inst::NopHint,
+                        }
                     }
                 }
                 _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
@@ -1068,74 +1192,91 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
 
         // ---- MOV ----
         Inst::MovRm8Reg { m, src } => {
-            let v = cpu.reg8(Reg::reg8(src));
+            let v = cpu.reg8_idx(src);
             cpu.write_rm8(&m, v);
         }
         Inst::MovRm16Reg { m, src } => {
-            let v = cpu.reg16(Reg::reg16(src));
+            let v = cpu.reg16_idx(src);
             cpu.write_rm16(&m, v);
         }
         Inst::MovRm32Reg { m, src } => {
-            let v = cpu.reg32(Reg::reg32(src));
-            cpu.write_rm32(&m, v);
+            let w = cpu.osize();
+            let v = cpu.reg_w(src, w);
+            cpu.write_rm_w(&m, w, v);
         }
         Inst::MovRegRm8 { m, dst } => {
             let v = cpu.read_rm8(&m);
-            cpu.set_reg8(Reg::reg8(dst), v);
+            cpu.set_reg8_idx(dst, v);
         }
         Inst::MovRegRm16 { m, dst } => {
             let v = cpu.read_rm16(&m);
-            cpu.set_reg16(Reg::reg16(dst), v);
+            cpu.set_reg16_idx(dst, v);
         }
         Inst::MovRegRm32 { m, dst } => {
-            let v = cpu.read_rm32(&m);
-            cpu.set_reg32(Reg::reg32(dst), v);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            cpu.set_reg_w(dst, w, v);
         }
         Inst::MovRm8Imm { m, imm } => cpu.write_rm8(&m, imm),
         Inst::MovRm16Imm { m, imm } => cpu.write_rm16(&m, imm),
-        Inst::MovRm32Imm { m, imm } => cpu.write_rm32(&m, imm),
-        Inst::MovReg8Imm { dst, imm } => cpu.set_reg8(dst, imm),
-        Inst::MovReg16Imm { dst, imm } => cpu.set_reg16(dst, imm),
-        Inst::MovReg32Imm { dst, imm } => cpu.set_reg32(dst, imm),
+        // C7 /0 takes an imm32 even at 64-bit operand size, and
+        // **sign-extends** it: `movq $-1,(%rax)` is five bytes, not twelve.
+        Inst::MovRm32Imm { m, imm } => {
+            let w = cpu.osize();
+            cpu.write_rm_w(&m, w, sext(imm as u64, 32));
+        }
+        Inst::MovReg8Imm { dst, imm } => cpu.set_reg8_idx(dst, imm),
+        Inst::MovReg16Imm { dst, imm } => cpu.set_reg16_idx(dst, imm),
+        Inst::MovReg32Imm { dst, imm } => cpu.set_reg_w(dst, 32, imm as u64),
+        // B8+r with REX.W: the one instruction that carries a full 64-bit
+        // immediate, and the only way to load an arbitrary 64-bit constant in
+        // one go.
+        Inst::MovReg64Imm { dst, imm } => cpu.set_reg_w(dst, 64, imm),
         Inst::MovAccMem8 { addr } => {
-            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), (addr as u32) as u64);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
         Inst::MovAccMem8Addr32 { addr } => {
-            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), (addr) as u64);
             cpu.set_reg8(Reg8::Al, cpu.mem.read_u8(phys));
         }
         Inst::MovMem8Acc { addr } => {
-            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
+            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), (addr as u32) as u64);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
         Inst::MovMem8AccAddr32 { addr } => {
-            let phys = cpu.translate_write(SegReg::Ds, addr);
+            let phys = cpu.translate_write(SegReg::Ds, (addr) as u64);
             cpu.mem.write_u8(phys, cpu.reg8(Reg8::Al));
         }
         Inst::MovAccMem16 { addr } => {
-            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), (addr as u32) as u64);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
         Inst::MovAccMem16Addr32 { addr } => {
-            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
+            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), (addr) as u64);
             cpu.set_reg16(Reg16::Ax, cpu.mem.read_u16(phys));
         }
         Inst::MovMem16Acc { addr } => {
-            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr as u32);
+            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), (addr as u32) as u64);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
         Inst::MovMem16AccAddr32 { addr } => {
-            let phys = cpu.translate_write(SegReg::Ds, addr);
+            let phys = cpu.translate_write(SegReg::Ds, (addr) as u64);
             cpu.mem.write_u16(phys, cpu.reg16(Reg16::Ax));
         }
         Inst::MovAccMem32 { addr } => {
-            let phys = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), addr);
-            cpu.set_reg32(Reg32::Eax, cpu.mem.read_u32(phys));
+            let w = cpu.osize();
+            let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+            let phys = cpu.translate(seg, addr);
+            let v = mem_read_w(cpu, phys, w);
+            cpu.set_reg_w(0, w, v);
         }
         Inst::MovMem32Acc { addr } => {
-            let phys = cpu.translate_write(cpu.operand_seg_for_exec(SegReg::Ds), addr);
-            cpu.mem.write_u32(phys, cpu.reg32(Reg32::Eax));
+            let w = cpu.osize();
+            let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+            let phys = cpu.translate_write(seg, addr);
+            let v = cpu.reg_w(0, w);
+            mem_write_w(cpu, phys, w, v);
         }
         Inst::MovRmSeg { m, seg } => {
             let v = cpu.seg(seg);
@@ -1156,7 +1297,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
 
         // ---- ALU r/m, reg ----
         Inst::AluRm8Reg { op, m, reg, dir } => {
-            let regv = cpu.reg8(Reg::reg8(reg));
+            let regv = cpu.reg8_idx(reg);
             let rmv = cpu.read_rm8(&m);
             let (a, b, store) = match dir {
                 Dir::RmReg => (rmv, regv, true),
@@ -1165,11 +1306,11 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let result = alu8(cpu, op, a, b);
             // CMP sets flags only — it must never write its result back.
             if op != AluOp::Cmp {
-                if store { cpu.write_rm8(&m, result); } else { cpu.set_reg8(Reg::reg8(reg), result); }
+                if store { cpu.write_rm8(&m, result); } else { cpu.set_reg8_idx(reg, result); }
             }
         }
         Inst::AluRm16Reg { op, m, reg, dir } => {
-            let regv = cpu.reg16(Reg::reg16(reg));
+            let regv = cpu.reg16_idx(reg);
             let rmv = cpu.read_rm16(&m);
             let (a, b, store) = match dir {
                 Dir::RmReg => (rmv, regv, true),
@@ -1178,20 +1319,21 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let result = alu16(cpu, op, a, b);
             // CMP sets flags only — it must never write its result back.
             if op != AluOp::Cmp {
-                if store { cpu.write_rm16(&m, result); } else { cpu.set_reg16(Reg::reg16(reg), result); }
+                if store { cpu.write_rm16(&m, result); } else { cpu.set_reg16_idx(reg, result); }
             }
         }
         Inst::AluRm32Reg { op, m, reg, dir } => {
-            let regv = cpu.reg32(Reg::reg32(reg));
-            let rmv = cpu.read_rm32(&m);
+            let w = cpu.osize();
+            let regv = cpu.reg_w(reg, w);
+            let rmv = cpu.read_rm_w(&m, w);
             let (a, b, store) = match dir {
                 Dir::RmReg => (rmv, regv, true),
                 Dir::RegRm => (regv, rmv, false),
             };
-            let result = alu32(cpu, op, a, b);
+            let result = alu_w(cpu, op, a, b, w);
             // CMP sets flags only — it must never write its result back.
             if op != AluOp::Cmp {
-                if store { cpu.write_rm32(&m, result); } else { cpu.set_reg32(Reg::reg32(reg), result); }
+                if store { cpu.write_rm_w(&m, w, result); } else { cpu.set_reg_w(reg, w, result); }
             }
         }
 
@@ -1206,10 +1348,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let result = alu16(cpu, op, rmv, imm);
             if op != AluOp::Cmp { cpu.write_rm16(&m, result); }
         }
+        // The immediate is imm32 (or a sign-extended imm8) whatever the
+        // operand size: 64-bit forms sign-extend it, they do not carry eight
+        // more bytes.
         Inst::AluRm32Imm { op, m, imm, .. } => {
-            let rmv = cpu.read_rm32(&m);
-            let result = alu32(cpu, op, rmv, imm);
-            if op != AluOp::Cmp { cpu.write_rm32(&m, result); }
+            let w = cpu.osize();
+            let rmv = cpu.read_rm_w(&m, w);
+            let result = alu_w(cpu, op, rmv, sext(imm as u64, 32), w);
+            if op != AluOp::Cmp { cpu.write_rm_w(&m, w, result); }
         }
         Inst::AluAccImm8 { op, imm } => {
             let a = cpu.reg8(Reg8::Al);
@@ -1222,43 +1368,44 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             if op != AluOp::Cmp { cpu.set_reg16(Reg16::Ax, result); }
         }
         Inst::AluAccImm32 { op, imm } => {
-            let a = cpu.reg32(Reg32::Eax);
-            let result = alu32(cpu, op, a, imm);
-            if op != AluOp::Cmp { cpu.set_reg32(Reg32::Eax, result); }
+            let w = cpu.osize();
+            let a = cpu.reg_w(0, w);
+            let result = alu_w(cpu, op, a, sext(imm as u64, 32), w);
+            if op != AluOp::Cmp { cpu.set_reg_w(0, w, result); }
         }
 
         // ---- INC / DEC ----
         Inst::IncReg16 { dst } => {
-            let v = cpu.reg16(dst);
+            let v = cpu.reg16_idx(dst);
             let result = v.wrapping_add(1);
-            cpu.set_reg16(dst, result);
+            cpu.set_reg16_idx(dst, result);
             let cf = cpu.get_flag(CF);
             set_logic_flags16(cpu, result);
             set_add_carry(cpu, v, 1, result, false);
             cpu.set_flag(CF, cf);
         }
         Inst::DecReg16 { dst } => {
-            let v = cpu.reg16(dst);
+            let v = cpu.reg16_idx(dst);
             let result = v.wrapping_sub(1);
-            cpu.set_reg16(dst, result);
+            cpu.set_reg16_idx(dst, result);
             let cf = cpu.get_flag(CF);
             set_logic_flags16(cpu, result);
             set_sub_borrow(cpu, v, 1, result, false);
             cpu.set_flag(CF, cf);
         }
         Inst::IncReg32 { dst } => {
-            let v = cpu.reg32(dst);
+            let v = cpu.reg32_idx(dst);
             let result = v.wrapping_add(1);
-            cpu.set_reg32(dst, result);
+            cpu.set_reg32_idx(dst, result);
             let cf = cpu.get_flag(CF);
             set_logic_flags32(cpu, result);
             set_add_carry32(cpu, v, 1, result, false);
             cpu.set_flag(CF, cf);
         }
         Inst::DecReg32 { dst } => {
-            let v = cpu.reg32(dst);
+            let v = cpu.reg32_idx(dst);
             let result = v.wrapping_sub(1);
-            cpu.set_reg32(dst, result);
+            cpu.set_reg32_idx(dst, result);
             let cf = cpu.get_flag(CF);
             set_logic_flags32(cpu, result);
             set_sub_borrow32(cpu, v, 1, result, false);
@@ -1270,11 +1417,11 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // with the *original* SP/ESP (captured before the first push).
         Inst::Pusha { w32 } => {
             if w32 {
-                let esp = cpu.esp;
-                cpu.push32(cpu.eax); cpu.push32(cpu.ecx);
-                cpu.push32(cpu.edx); cpu.push32(cpu.ebx);
-                cpu.push32(esp);     cpu.push32(cpu.ebp);
-                cpu.push32(cpu.esi); cpu.push32(cpu.edi);
+                let esp = cpu.esp();
+                cpu.push32(cpu.eax()); cpu.push32(cpu.ecx());
+                cpu.push32(cpu.edx()); cpu.push32(cpu.ebx());
+                cpu.push32(esp);     cpu.push32(cpu.ebp());
+                cpu.push32(cpu.esi()); cpu.push32(cpu.edi());
             } else {
                 let sp = cpu.sp();
                 cpu.push16(cpu.ax()); cpu.push16(cpu.cx());
@@ -1306,54 +1453,67 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 cpu.set_reg16(Reg16::Cx, cx); cpu.set_reg16(Reg16::Ax, ax);
             }
         }
-        Inst::PushReg16 { src } => cpu.push16(cpu.reg16(src)),
-        Inst::PopReg16 { dst } => { let v = cpu.pop16(); cpu.set_reg16(dst, v); }
-        Inst::PushReg32 { src } => cpu.push32(cpu.reg32(src)),
-        Inst::PopReg32 { dst } => { let v = cpu.pop32(); cpu.set_reg32(dst, v); }
-        Inst::PushImm16 { imm } => cpu.push16(imm),
-        Inst::PushImm32 { imm } => cpu.push32(imm),
+        Inst::PushReg16 { src } => { let v = cpu.reg16_idx(src) as u64; cpu.push_w(16, v) }
+        Inst::PopReg16 { dst } => { let v = cpu.pop_w(16); cpu.set_reg16_idx(dst, v as u16); }
+        // In 64-bit mode PUSH and POP of a register are 64-bit and there is
+        // no encoding for anything narrower -- the stack width is not the
+        // operand size, which is why these go through `stack_width`.
+        Inst::PushReg32 { src } => {
+            let w = cpu.stack_width();
+            let v = cpu.reg_w(src, w);
+            cpu.push_w(w, v);
+        }
+        Inst::PopReg32 { dst } => {
+            let w = cpu.stack_width();
+            let v = cpu.pop_w(w);
+            cpu.set_reg_w(dst, w, v);
+        }
+        Inst::PushImm16 { imm } => cpu.push_w(16, imm as u64),
+        Inst::PushImm32 { imm } => {
+            let w = cpu.stack_width();
+            cpu.push_w(w, sext(imm as u64, 32));
+        }
 
         // ---- Control flow ----
-        Inst::JmpRel8 { rel } => {
-            if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
-            else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
-        }
+        Inst::JmpRel8 { rel } => branch_rel(cpu, rel as i64),
         Inst::JmpRel16 { rel } => { cpu.ip = cpu.ip.wrapping_add(rel as u16); }
-        Inst::JmpRel32 { rel } => { cpu.eip = cpu.eip.wrapping_add(rel as u32); }
+        Inst::JmpRel32 { rel } => branch_rel(cpu, rel as i64),
         Inst::Jcc { cond, rel } => {
-            if cond.test(cpu) {
-                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
-                else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
-            }
+            if cond.test(cpu) { branch_rel(cpu, rel as i64); }
         }
         Inst::Jcc32 { cond, rel } => {
             // 0F 80-8F: conditional jump with rel32 displacement. In 32-bit
             // mode it branches via EIP; in 16-bit mode via IP.
-            if cond.test(cpu) {
-                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as u32); }
-                else { cpu.ip = cpu.ip.wrapping_add(rel as u16); }
-            }
+            if cond.test(cpu) { branch_rel(cpu, rel as i64); }
         }
         // ---- MOVZX / MOVSX ----
         Inst::Movzx8 { m, dst } => {
-            let v = cpu.read_rm8(&m);
-            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as u32); }
-            else { cpu.set_reg16(Reg::reg16(dst), v as u16); }
+            let w = cpu.osize();
+            let v = cpu.read_rm8(&m) as u64;
+            cpu.set_reg_w(dst, w, v);
         }
         Inst::Movzx16 { m, dst } => {
-            let v = cpu.read_rm16(&m);
-            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as u32); }
-            else { cpu.set_reg16(Reg::reg16(dst), v); }
+            let w = cpu.osize();
+            let v = cpu.read_rm16(&m) as u64;
+            cpu.set_reg_w(dst, w, v);
         }
         Inst::Movsx8 { m, dst } => {
-            let v = cpu.read_rm8(&m) as i8;
-            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as i32 as u32); }
-            else { cpu.set_reg16(Reg::reg16(dst), v as i16 as u16); }
+            let w = cpu.osize();
+            let v = sext(cpu.read_rm8(&m) as u64, 8);
+            cpu.set_reg_w(dst, w, v);
         }
         Inst::Movsx16 { m, dst } => {
-            let v = cpu.read_rm16(&m) as i16;
-            if cpu.opsize { cpu.set_reg32(Reg::reg32(dst), v as i32 as u32); }
-            else { cpu.set_reg16(Reg::reg16(dst), v as u16); }
+            let w = cpu.osize();
+            let v = sext(cpu.read_rm16(&m) as u64, 16);
+            cpu.set_reg_w(dst, w, v);
+        }
+        // MOVSXD (0x63) took over the ARPL opcode in 64-bit mode, and it is
+        // how a 32-bit value becomes a 64-bit index: every array subscript in
+        // compiled 64-bit code goes through it.
+        Inst::Movsxd { m, dst } => {
+            let w = cpu.osize();
+            let v = sext(cpu.read_rm_w(&m, 32), 32);
+            cpu.set_reg_w(dst, w, v);
         }
         Inst::CallRel16 { rel } => {
             let next = cpu.ip;
@@ -1361,35 +1521,46 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.ip = cpu.ip.wrapping_add(rel as u16);
         }
         Inst::CallRel32 { rel } => {
-            let next = cpu.eip;
-            cpu.push32(next);
-            cpu.eip = cpu.eip.wrapping_add(rel as u32);
+            let w = cpu.stack_width();
+            let next = if cpu.long64() { cpu.rip } else { cpu.eip() as u64 };
+            cpu.push_w(w, next);
+            if cpu.pending_exception.is_some() { return; }
+            branch_rel(cpu, rel as i64);
         }
         Inst::Ret => { cpu.ip = cpu.pop16(); }
         Inst::RetImm { imm, w32 } => {
             // The stack adjustment happens after the return address is popped.
-            if w32 {
+            if cpu.long64() {
+                let target = cpu.pop_w(64);
+                cpu.set_rsp(cpu.rsp().wrapping_add(imm as u64));
+                cpu.rip = target;
+            } else if w32 {
                 let target = cpu.pop32();
-                cpu.esp = cpu.esp.wrapping_add(imm as u32);
-                cpu.eip = target;
+                cpu.set_esp(cpu.esp().wrapping_add(imm as u32));
+                cpu.set_eip(target);
             } else {
                 let target = cpu.pop16();
                 cpu.set_sp(cpu.sp().wrapping_add(imm));
                 cpu.ip = target;
             }
         }
-        Inst::Ret32 => { cpu.eip = cpu.pop32(); }
+        Inst::Ret32 => {
+            let w = cpu.stack_width();
+            let t = cpu.pop_w(w);
+            if cpu.long64() { cpu.rip = t; } else { cpu.set_eip(t as u32); }
+        }
         Inst::XchgAxReg { reg } => {
             let ax = cpu.reg16(Reg16::Ax);
-            let r = cpu.reg16(reg);
+            let r = cpu.reg16_idx(reg);
             cpu.set_reg16(Reg16::Ax, r);
-            cpu.set_reg16(reg, ax);
+            cpu.set_reg16_idx(reg, ax);
         }
         Inst::XchgEaxReg { reg } => {
-            let ax = cpu.reg32(Reg32::Eax);
-            let r = cpu.reg32(reg);
-            cpu.set_reg32(Reg32::Eax, r);
-            cpu.set_reg32(reg, ax);
+            let w = cpu.osize();
+            let ax = cpu.reg_w(0, w);
+            let r = cpu.reg_w(reg, w);
+            cpu.set_reg_w(0, w, r);
+            cpu.set_reg_w(reg, w, ax);
         }
         Inst::Int { vector } => {
             // Record system calls from user mode: the sequence of calls ld.so
@@ -1397,7 +1568,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             if cpu.debug_enabled && vector == 0x80 && cpu.cpl() == 3
                 && cpu.syscall_log.len() < 512 {
                 let n = cpu.instructions_executed;
-                cpu.syscall_log.push((n, cpu.eax, cpu.ebx, cpu.ecx, cpu.edx));
+                cpu.syscall_log.push((n, cpu.reg64(0), cpu.reg64(3), cpu.reg64(1), cpu.reg64(2)));
             }
             // BIOS services (INT 0x10/0x16/0x13) are handled natively in Rust.
             let mut bios = std::mem::take(&mut cpu.bios);
@@ -1443,6 +1614,26 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f as u32);
             cpu.servicing_irq = false;
         }
+        // IRETQ: in long mode the frame is always five 8-byte words --
+        // SS:RSP included, whether or not the privilege level changes -- so
+        // it is popped unconditionally. Getting that wrong leaves RSP eight
+        // bytes off on every kernel-to-kernel return, which unwinds into
+        // nonsense a few interrupts later.
+        Inst::Iret32 if cpu.long_mode() => {
+            let w = if cpu.rex_w { 64 } else { 32 };
+            let rip = cpu.pop_w(w);
+            let cs = cpu.pop_w(w) as u16;
+            let f = cpu.pop_w(w) as u32;
+            let rsp = cpu.pop_w(w);
+            let ss = cpu.pop_w(w) as u16;
+            cpu.load_seg(SegReg::Cs, cs);
+            cpu.load_seg(SegReg::Ss, ss);
+            cpu.set_rsp(rsp);
+            cpu.rip = rip;
+            cpu.flags = write_flags(cpu.flags, f);
+            cpu.servicing_irq = false;
+            cpu.invalidate_phys_ip();
+        }
         Inst::Iret32 => {
             let eip = cpu.pop32();
             let cs = cpu.pop32() as u16;
@@ -1454,9 +1645,9 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 let esp = cpu.pop32();
                 let ss = cpu.pop32() as u16;
                 cpu.load_seg(SegReg::Ss, ss);
-                cpu.esp = esp;
+                cpu.set_esp(esp);
             }
-            cpu.eip = eip;
+            cpu.set_eip(eip);
             cpu.load_seg(SegReg::Cs, cs);
             cpu.flags = write_flags(cpu.flags, f);
             cpu.servicing_irq = false;
@@ -1467,20 +1658,23 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // and ID bits — so a 16-bit-only implementation both loses those bits
         // and moves ESP by the wrong amount.
         Inst::Pushf => {
-            if cpu.opsize {
+            let w = cpu.stack_width();
+            if w >= 32 {
                 // VM and RF read back as zero in the pushed image.
-                cpu.push32(cpu.flags & !(flags::VM | flags::RF));
+                let f = (cpu.flags & !(flags::VM | flags::RF)) as u64;
+                cpu.push_w(w, f);
             } else {
-                cpu.push16(cpu.flags as u16);
+                cpu.push_w(16, cpu.flags as u64);
             }
         }
         Inst::Popf => {
-            if cpu.opsize {
-                let f = cpu.pop32();
+            let w = cpu.stack_width();
+            if w >= 32 {
+                let f = cpu.pop_w(w) as u32;
                 cpu.flags = write_flags(cpu.flags, f);
             } else {
-                let f = cpu.pop16();
-                cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f as u32);
+                let f = cpu.pop_w(16) as u32;
+                cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f);
             }
         }
 
@@ -1513,30 +1707,33 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(OF, false);
         }
         Inst::TestRm32Imm { m, imm } => {
-            let v = cpu.read_rm32(&m);
-            let r = v & imm;
-            set_logic_flags32(cpu, r);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            let r = v & sext(imm as u64, 32);
+            set_logic_flags_width(cpu, r, w);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
         }
         Inst::TestRm8Reg { m, reg } => {
             let v = cpu.read_rm8(&m);
-            let r = v & cpu.reg8(Reg::reg8(reg));
+            let r = v & cpu.reg8_idx(reg);
             set_logic_flags8(cpu, r);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
         }
         Inst::TestRm16Reg { m, reg } => {
             let v = cpu.read_rm16(&m);
-            let r = v & cpu.reg16(Reg::reg16(reg));
+            let r = v & cpu.reg16_idx(reg);
             set_logic_flags16(cpu, r);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
         }
         Inst::TestRm32Reg { m, reg } => {
-            let v = cpu.read_rm32(&m);
-            let r = v & cpu.reg32(Reg::reg32(reg));
-            set_logic_flags32(cpu, r);
+            let w = cpu.osize();
+            let a = cpu.read_rm_w(&m, w);
+            let b = cpu.reg_w(reg, w);
+            let r = a & b;
+            set_logic_flags_width(cpu, r, w);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
         }
@@ -1555,15 +1752,20 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(OF, false);
         }
         Inst::TestAccImm32 { imm } => {
-            let v = cpu.reg32(Reg32::Eax);
-            let r = v & imm;
-            set_logic_flags32(cpu, r);
+            let w = cpu.osize();
+            let a = cpu.reg_w(0, w);
+            let r = a & sext(imm as u64, 32);
+            set_logic_flags_width(cpu, r, w);
             cpu.set_flag(CF, false);
             cpu.set_flag(OF, false);
         }
         Inst::NotRm8 { m } => { let v = cpu.read_rm8(&m); cpu.write_rm8(&m, !v); }
         Inst::NotRm16 { m } => { let v = cpu.read_rm16(&m); cpu.write_rm16(&m, !v); }
-        Inst::NotRm32 { m } => { let v = cpu.read_rm32(&m); cpu.write_rm32(&m, !v); }
+        Inst::NotRm32 { m } => {
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            cpu.write_rm_w(&m, w, !v);
+        }
         Inst::NegRm8 { m } => {
             let v = cpu.read_rm8(&m);
             let r = v.wrapping_neg();
@@ -1583,12 +1785,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(AF, v != 0);
         }
         Inst::NegRm32 { m } => {
-            let v = cpu.read_rm32(&m);
-            let r = v.wrapping_neg();
-            cpu.write_rm32(&m, r);
-            set_logic_flags32(cpu, r);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            let r = v.wrapping_neg() & mask_w(w);
+            cpu.write_rm_w(&m, w, r);
+            set_logic_flags_width(cpu, r, w);
             cpu.set_flag(CF, v != 0);
-            cpu.set_flag(OF, v == 0x8000_0000);
+            // OF is set only for the one value that has no negation.
+            cpu.set_flag(OF, v == 1u64 << (w - 1));
             cpu.set_flag(AF, v != 0);
         }
         Inst::MulRm8 { m } => {
@@ -1612,12 +1816,13 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(OF, c);
         }
         Inst::MulRm32 { m } => {
-            let v = cpu.read_rm32(&m);
-            let a = cpu.reg32(Reg32::Eax) as u64;
-            let r = a * v as u64;
-            cpu.set_reg32(Reg32::Eax, r as u32);
-            cpu.set_reg32(Reg32::Edx, (r >> 32) as u32);
-            let c = (r >> 32) != 0;
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w) as u128;
+            let a = cpu.reg_w(0, w) as u128;
+            let r = a * v;
+            cpu.set_reg_w(0, w, r as u64);
+            cpu.set_reg_w(2, w, (r >> w) as u64);
+            let c = (r >> w) != 0;
             cpu.set_flag(CF, c);
             cpu.set_flag(OF, c);
         }
@@ -1645,14 +1850,15 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(OF, c);
         }
         Inst::ImulRm32 { m } => {
-            let v = cpu.read_rm32(&m) as i32 as i64;
-            let a = cpu.reg32(Reg32::Eax) as i32 as i64;
+            let w = cpu.osize();
+            let v = sign_extend(cpu.read_rm_w(&m, w), w) as i128;
+            let a = sign_extend(cpu.reg_w(0, w), w) as i128;
             let r = a * v;
-            cpu.set_reg32(Reg32::Eax, r as u32);
-            cpu.set_reg32(Reg32::Edx, (r >> 32) as u32);
-            let hi = (r >> 32) as i32;
-            let lo = r as i32;
-            let c = hi != lo;
+            cpu.set_reg_w(0, w, r as u64);
+            cpu.set_reg_w(2, w, (r >> w) as u64);
+            // CF/OF say the product did not fit in the low half: the high
+            // half must be nothing but copies of the low half sign bit.
+            let c = r != sign_extend(r as u64, w) as i128;
             cpu.set_flag(CF, c);
             cpu.set_flag(OF, c);
         }
@@ -1681,16 +1887,23 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_reg16(Reg16::Dx, rem as u16);
         }
         Inst::DivRm32 { m } => {
-            let v = cpu.read_rm32(&m);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w) as u128;
             if v == 0 {
                 cpu.pending_exception = Some((0x00, None)); // #DE
                 return;
             }
-            let a = ((cpu.reg32(Reg32::Edx) as u64) << 32) | cpu.reg32(Reg32::Eax) as u64;
-            let q = a / v as u64;
-            let rem = a % v as u64;
-            cpu.set_reg32(Reg32::Eax, q as u32);
-            cpu.set_reg32(Reg32::Edx, rem as u32);
+            let a = ((cpu.reg_w(2, w) as u128) << w) | cpu.reg_w(0, w) as u128;
+            let q = a / v;
+            let rem = a % v;
+            // A quotient too wide for the destination is also a #DE, not a
+            // truncated answer.
+            if q > mask_w(w) as u128 {
+                cpu.pending_exception = Some((0x00, None));
+                return;
+            }
+            cpu.set_reg_w(0, w, q as u64);
+            cpu.set_reg_w(2, w, rem as u64);
         }
         Inst::IdivRm8 { m } => {
             let v = cpu.read_rm8(&m) as i8 as i16;
@@ -1717,26 +1930,34 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_reg16(Reg16::Dx, rem as u16);
         }
         Inst::IdivRm32 { m } => {
-            let v = cpu.read_rm32(&m) as i32 as i64;
+            let w = cpu.osize();
+            let v = sign_extend(cpu.read_rm_w(&m, w), w) as i128;
             if v == 0 {
                 cpu.pending_exception = Some((0x00, None)); // #DE
                 return;
             }
-            let a = ((cpu.reg32(Reg32::Edx) as u64) << 32 | cpu.reg32(Reg32::Eax) as u64) as i64;
+            let raw = ((cpu.reg_w(2, w) as u128) << w) | cpu.reg_w(0, w) as u128;
+            // The dividend is a signed 2*w-bit value: sign-extend it from its
+            // own width, not from 64.
+            let a = if w == 64 { raw as i128 } else {
+                let bits = 2 * w;
+                ((raw << (128 - bits)) as i128) >> (128 - bits)
+            };
             let q = a / v;
             let rem = a % v;
-            cpu.set_reg32(Reg32::Eax, q as u32);
-            cpu.set_reg32(Reg32::Edx, rem as u32);
+            if q != sign_extend(q as u64, w) as i128 {
+                cpu.pending_exception = Some((0x00, None));
+                return;
+            }
+            cpu.set_reg_w(0, w, q as u64);
+            cpu.set_reg_w(2, w, rem as u64);
         }
 
         // ---- LEA ----
         Inst::Lea { m, dst } => {
+            let w = cpu.osize();
             let ea = lea_offset(&m, cpu);
-            if cpu.opsize {
-                cpu.set_reg32(Reg::reg32(dst), ea as u32);
-            } else {
-                cpu.set_reg16(Reg::reg16(dst), ea as u16);
-            }
+            cpu.set_reg_w(dst, w, ea);
         }
 
         // ---- CBW / CWD / CWDE / CDQ ----
@@ -1749,28 +1970,52 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let dx = if (ax as i16) < 0 { 0xFFFF } else { 0 };
             cpu.set_reg16(Reg16::Dx, dx);
         }
+        // CWDE at 32-bit operand size; CDQE (the same opcode with REX.W)
+        // sign-extends EAX into the whole of RAX.
         Inst::Cwde => {
-            let ax = cpu.reg16(Reg16::Ax);
-            cpu.set_reg32(Reg32::Eax, ax as i16 as i32 as u32);
+            let w = cpu.osize();
+            let v = sext(cpu.reg_w(0, w / 2), w / 2);
+            cpu.set_reg_w(0, w, v);
         }
+        // CDQ, and CQO with REX.W: fill the high register with the sign.
         Inst::Cdq => {
-            let eax = cpu.reg32(Reg32::Eax);
-            let edx = if (eax as i32) < 0 { 0xFFFF_FFFF } else { 0 };
-            cpu.set_reg32(Reg32::Edx, edx);
+            let w = cpu.osize();
+            let v = cpu.reg_w(0, w);
+            let neg = (v >> (w - 1)) & 1 != 0;
+            cpu.set_reg_w(2, w, if neg { u64::MAX } else { 0 });
         }
 
         // ---- LOOP / LOOPZ / LOOPNZ / JCXZ ----
         Inst::Loop { cond, rel } => {
+            // The count register follows the *address* size, so in 64-bit
+            // mode LOOP counts RCX.
+            if cpu.addr64 {
+                let take = match cond {
+                    LoopCond::Jcxz => cpu.reg64(1) == 0,
+                    _ => {
+                        let c = cpu.reg64(1).wrapping_sub(1);
+                        cpu.set_reg64_raw(1, c);
+                        match cond {
+                            LoopCond::Loop => c != 0,
+                            LoopCond::Loopz => c != 0 && cpu.get_flag(ZF),
+                            LoopCond::Loopnz => c != 0 && !cpu.get_flag(ZF),
+                            _ => false,
+                        }
+                    }
+                };
+                if take { branch_rel(cpu, rel as i64); }
+                return;
+            }
             let take = if cpu.opsize {
                 // 32-bit mode: LOOP uses ECX and branches via EIP.
                 match cond {
-                    LoopCond::Jcxz => cpu.ecx == 0,
+                    LoopCond::Jcxz => cpu.ecx() == 0,
                     _ => {
-                        cpu.ecx = cpu.ecx.wrapping_sub(1);
+                        cpu.set_ecx(cpu.ecx().wrapping_sub(1));
                         match cond {
-                            LoopCond::Loop => cpu.ecx != 0,
-                            LoopCond::Loopz => cpu.ecx != 0 && cpu.get_flag(ZF),
-                            LoopCond::Loopnz => cpu.ecx != 0 && !cpu.get_flag(ZF),
+                            LoopCond::Loop => cpu.ecx() != 0,
+                            LoopCond::Loopz => cpu.ecx() != 0 && cpu.get_flag(ZF),
+                            LoopCond::Loopnz => cpu.ecx() != 0 && !cpu.get_flag(ZF),
                             _ => false,
                         }
                     }
@@ -1791,7 +2036,7 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 }
             };
             if take {
-                if cpu.opsize { cpu.eip = cpu.eip.wrapping_add(rel as i32 as u32); }
+                if cpu.opsize { cpu.set_eip(cpu.eip().wrapping_add(rel as i32 as u32)); }
                 else { cpu.ip = cpu.ip.wrapping_add(rel as i16 as u16); }
             }
         }
@@ -1808,23 +2053,31 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.cs = seg;
             cpu.ip = off;
         }
+        // The far jump is how a boot sequence *leaves* the mode it is in:
+        // it is the instruction that makes a newly loaded CS take effect, and
+        // in a 64-bit boot it is the step that turns compatibility-mode code
+        // into 64-bit code by landing in an L=1 segment.
         Inst::JmpFar32 { off, seg } => {
-            cpu.cs = seg;
-            cpu.eip = off;
+            cpu.load_seg(SegReg::Cs, seg);
+            cpu.set_eip(off);
+            cpu.invalidate_phys_ip();
         }
         Inst::CallFar32 { off, seg } => {
-            let ip = cpu.eip;
-            cpu.push32(cpu.cs as u32);
+            let ip = cpu.eip();
+            let cs = cpu.cs as u32;
+            cpu.push32(cs);
             cpu.push32(ip);
-            cpu.cs = seg;
-            cpu.eip = off;
+            cpu.load_seg(SegReg::Cs, seg);
+            cpu.set_eip(off);
+            cpu.invalidate_phys_ip();
         }
         Inst::Retf => {
             cpu.ip = cpu.pop16();
             cpu.cs = cpu.pop16();
         }
         Inst::Retf32 => {
-            cpu.eip = cpu.pop32();
+            let t = cpu.pop32();
+            cpu.set_eip(t);
             cpu.cs = cpu.pop16();
         }
 
@@ -1863,12 +2116,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(CF, cf);
         }
         Inst::IncRm32 { m } => {
-            let v = cpu.read_rm32(&m);
-            let result = v.wrapping_add(1);
-            cpu.write_rm32(&m, result);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            let result = v.wrapping_add(1) & mask_w(w);
+            cpu.write_rm_w(&m, w, result);
             let cf = cpu.get_flag(CF);
-            set_logic_flags32(cpu, result);
-            set_add_carry32(cpu, v, 1, result, false);
+            set_logic_flags_width(cpu, result, w);
+            set_add_carry64(cpu, v, 1, result, false);
+            cpu.set_flag(OF, v == mask_w(w) >> 1);
             cpu.set_flag(CF, cf);
         }
         Inst::DecRm16 { m } => {
@@ -1881,12 +2136,14 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_flag(CF, cf);
         }
         Inst::DecRm32 { m } => {
-            let v = cpu.read_rm32(&m);
-            let result = v.wrapping_sub(1);
-            cpu.write_rm32(&m, result);
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            let result = v.wrapping_sub(1) & mask_w(w);
+            cpu.write_rm_w(&m, w, result);
             let cf = cpu.get_flag(CF);
-            set_logic_flags32(cpu, result);
-            set_sub_borrow32(cpu, v, 1, result, false);
+            set_logic_flags_width(cpu, result, w);
+            set_sub_borrow64(cpu, v, 1, result, false);
+            cpu.set_flag(OF, v == 1u64 << (w - 1));
             cpu.set_flag(CF, cf);
         }
         Inst::CallRm16 { m } => {
@@ -1896,68 +2153,71 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.ip = target;
         }
         Inst::CallRm32 { m } => {
-            let target = cpu.read_rm32(&m);
-            let next = cpu.eip;
-            cpu.push32(next);
-            cpu.eip = target;
+            // The call target follows the operand size (64-bit by default in
+            // 64-bit mode), and so does the return address pushed for it.
+            let w = cpu.stack_width();
+            let target = cpu.read_rm_w(&m, w);
+            let next = if cpu.long64() { cpu.rip } else { cpu.eip() as u64 };
+            cpu.push_w(w, next);
+            if cpu.pending_exception.is_some() { return; }
+            if cpu.long64() { cpu.rip = target; } else { cpu.set_eip(target as u32); }
+            cpu.invalidate_phys_ip();
         }
         Inst::JmpRm16 { m } => {
             cpu.ip = cpu.read_rm16(&m);
         }
         Inst::JmpRm32 { m } => {
-            cpu.eip = cpu.read_rm32(&m);
+            let w = cpu.stack_width();
+            let t = cpu.read_rm_w(&m, w);
+            if cpu.long64() { cpu.rip = t; } else { cpu.set_eip(t as u32); }
+            cpu.invalidate_phys_ip();
         }
         Inst::PushRm16 { m } => {
             let v = cpu.read_rm16(&m);
             cpu.push16(v);
         }
         Inst::PushRm32 { m } => {
-            let v = cpu.read_rm32(&m);
-            cpu.push32(v);
+            let w = cpu.stack_width();
+            let v = cpu.read_rm_w(&m, w);
+            cpu.push_w(w, v);
         }
         // BSF/BSR: ZF is set when the source is zero, and the destination is
         // then architecturally undefined - we leave it alone.
-        Inst::Bsf { m, dst, w32 } => {
-            if w32 {
-                let v = cpu.read_rm32(&m);
-                cpu.set_flag(flags::ZF, v == 0);
-                if v != 0 { cpu.set_reg32(Reg::reg32(dst), v.trailing_zeros()); }
-            } else {
-                let v = cpu.read_rm16(&m);
-                cpu.set_flag(flags::ZF, v == 0);
-                if v != 0 { cpu.set_reg16(Reg::reg16(dst), v.trailing_zeros() as u16); }
-            }
+        Inst::Bsf { m, dst, .. } => {
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            cpu.set_flag(flags::ZF, v == 0);
+            // With a zero source the destination is left alone -- it is
+            // architecturally undefined, and leaving it is what every real
+            // CPU does.
+            if v != 0 { cpu.set_reg_w(dst, w, v.trailing_zeros() as u64); }
         }
-        Inst::Bsr { m, dst, w32 } => {
-            if w32 {
-                let v = cpu.read_rm32(&m);
-                cpu.set_flag(flags::ZF, v == 0);
-                if v != 0 { cpu.set_reg32(Reg::reg32(dst), 31 - v.leading_zeros()); }
-            } else {
-                let v = cpu.read_rm16(&m);
-                cpu.set_flag(flags::ZF, v == 0);
-                if v != 0 { cpu.set_reg16(Reg::reg16(dst), (15 - v.leading_zeros()) as u16); }
-            }
+        Inst::Bsr { m, dst, .. } => {
+            let w = cpu.osize();
+            let v = cpu.read_rm_w(&m, w);
+            cpu.set_flag(flags::ZF, v == 0);
+            if v != 0 { cpu.set_reg_w(dst, w, (63 - v.leading_zeros()) as u64); }
         }
         // XCHG r/m, r. No flags.
         Inst::XchgRmReg { m, reg, width } => match width {
             8 => {
                 let a = cpu.read_rm8(&m);
-                let b = cpu.reg8(Reg::reg8(reg));
+                let b = cpu.reg8_idx(reg);
                 cpu.write_rm8(&m, b);
-                cpu.set_reg8(Reg::reg8(reg), a);
+                cpu.set_reg8_idx(reg, a);
             }
             16 => {
                 let a = cpu.read_rm16(&m);
-                let b = cpu.reg16(Reg::reg16(reg));
+                let b = cpu.reg16_idx(reg);
                 cpu.write_rm16(&m, b);
-                cpu.set_reg16(Reg::reg16(reg), a);
+                cpu.set_reg16_idx(reg, a);
             }
             _ => {
-                let a = cpu.read_rm32(&m);
-                let b = cpu.reg32(Reg::reg32(reg));
-                cpu.write_rm32(&m, b);
-                cpu.set_reg32(Reg::reg32(reg), a);
+                let w = cpu.osize();
+                let a = cpu.read_rm_w(&m, w);
+                let b = cpu.reg_w(reg, w);
+                cpu.write_rm_w(&m, w, b);
+                cpu.set_reg_w(reg, w, a);
             }
         },
         // CMPXCHG: compare the accumulator with the destination. On a match
@@ -1968,22 +2228,23 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 let dest = cpu.read_rm8(&m);
                 let acc = cpu.reg8(Reg8::Al);
                 alu8(cpu, AluOp::Cmp, acc, dest);
-                if acc == dest { let v = cpu.reg8(Reg::reg8(reg)); cpu.write_rm8(&m, v); }
+                if acc == dest { let v = cpu.reg8_idx(reg); cpu.write_rm8(&m, v); }
                 else { cpu.set_reg8(Reg8::Al, dest); }
             }
             16 => {
                 let dest = cpu.read_rm16(&m);
                 let acc = cpu.reg16(Reg16::Ax);
                 alu16(cpu, AluOp::Cmp, acc, dest);
-                if acc == dest { let v = cpu.reg16(Reg::reg16(reg)); cpu.write_rm16(&m, v); }
+                if acc == dest { let v = cpu.reg16_idx(reg); cpu.write_rm16(&m, v); }
                 else { cpu.set_reg16(Reg16::Ax, dest); }
             }
             _ => {
-                let dest = cpu.read_rm32(&m);
-                let acc = cpu.reg32(Reg32::Eax);
-                alu32(cpu, AluOp::Cmp, acc, dest);
-                if acc == dest { let v = cpu.reg32(Reg::reg32(reg)); cpu.write_rm32(&m, v); }
-                else { cpu.set_reg32(Reg32::Eax, dest); }
+                let w = cpu.osize();
+                let dest = cpu.read_rm_w(&m, w);
+                let acc = cpu.reg_w(0, w);
+                alu_w(cpu, AluOp::Cmp, acc, dest, w);
+                if acc == dest { let v = cpu.reg_w(reg, w); cpu.write_rm_w(&m, w, v); }
+                else { cpu.set_reg_w(0, w, dest); }
             }
         },
         // XADD: the destination gets the sum, the source register gets the
@@ -1991,36 +2252,37 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::Xadd { m, reg, width } => match width {
             8 => {
                 let dest = cpu.read_rm8(&m);
-                let src = cpu.reg8(Reg::reg8(reg));
+                let src = cpu.reg8_idx(reg);
                 let sum = alu8(cpu, AluOp::Add, dest, src);
-                cpu.set_reg8(Reg::reg8(reg), dest);
+                cpu.set_reg8_idx(reg, dest);
                 cpu.write_rm8(&m, sum);
             }
             16 => {
                 let dest = cpu.read_rm16(&m);
-                let src = cpu.reg16(Reg::reg16(reg));
+                let src = cpu.reg16_idx(reg);
                 let sum = alu16(cpu, AluOp::Add, dest, src);
-                cpu.set_reg16(Reg::reg16(reg), dest);
+                cpu.set_reg16_idx(reg, dest);
                 cpu.write_rm16(&m, sum);
             }
             _ => {
-                let dest = cpu.read_rm32(&m);
-                let src = cpu.reg32(Reg::reg32(reg));
-                let sum = alu32(cpu, AluOp::Add, dest, src);
-                cpu.set_reg32(Reg::reg32(reg), dest);
-                cpu.write_rm32(&m, sum);
+                let w = cpu.osize();
+                let dest = cpu.read_rm_w(&m, w);
+                let src = cpu.reg_w(reg, w);
+                let sum = alu_w(cpu, AluOp::Add, dest, src, w);
+                cpu.set_reg_w(reg, w, dest);
+                cpu.write_rm_w(&m, w, sum);
             }
         },
         // CMPXCHG8B: compare EDX:EAX with the 64-bit destination; on a
         // match store ECX:EBX, otherwise load the destination into EDX:EAX.
         // Only ZF reports the outcome.
         Inst::Cmpxchg8b { m } => {
-            let addr = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
+            let addr = cpu.rm_addr(&m, true);
             let lo = cpu.mem.read_u32(addr);
             let hi = cpu.mem.read_u32(addr + 4);
-            if lo == cpu.eax && hi == cpu.edx {
+            if lo == cpu.eax() && hi == cpu.edx() {
                 cpu.set_flag(flags::ZF, true);
-                let (bl, ch) = (cpu.ebx, cpu.ecx);
+                let (bl, ch) = (cpu.ebx(), cpu.ecx());
                 cpu.mem.write_u32(addr, bl);
                 cpu.mem.write_u32(addr + 4, ch);
             } else {
@@ -2030,42 +2292,44 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             }
         }
         Inst::Bswap { reg } => {
-            let v = cpu.reg32(Reg::reg32(reg));
-            cpu.set_reg32(Reg::reg32(reg), v.swap_bytes());
+            let w = cpu.osize();
+            let v = cpu.reg_w(reg, w);
+            let r = if w == 64 { v.swap_bytes() } else { (v as u32).swap_bytes() as u64 };
+            cpu.set_reg_w(reg, w, r);
         }
         // CMOVcc: the load happens only when the condition holds. (A real CPU
         // reads the memory operand either way, but nothing observable here
         // depends on that, and skipping the read avoids a spurious fault.)
-        Inst::Cmovcc { cond, m, dst, w32 } => {
+        Inst::Cmovcc { cond, m, dst, .. } => {
             if cond.test(cpu) {
-                if w32 {
-                    let v = cpu.read_rm32(&m);
-                    cpu.set_reg32(Reg::reg32(dst), v);
-                } else {
-                    let v = cpu.read_rm16(&m);
-                    cpu.set_reg16(Reg::reg16(dst), v);
-                }
+                let w = cpu.osize();
+                let v = cpu.read_rm_w(&m, w);
+                cpu.set_reg_w(dst, w, v);
             }
         }
         // PUSH/POP a segment register. The pushed value occupies the full
         // operand size, but only the low 16 bits carry the selector.
         Inst::PushSeg { seg } => {
-            let v = cpu.seg(seg);
-            if cpu.opsize { cpu.push32(v as u32); } else { cpu.push16(v); }
+            let w = cpu.stack_width();
+            let v = cpu.seg(seg) as u64;
+            cpu.push_w(w, v);
         }
         Inst::PopSeg { seg } => {
-            let v = if cpu.opsize { cpu.pop32() as u16 } else { cpu.pop16() };
+            let w = cpu.stack_width();
+            let v = cpu.pop_w(w) as u16;
             cpu.load_seg(seg, v);
         }
         // Debug registers. Nothing here implements hardware breakpoints, so
         // they are plain storage: the kernel writes DR7 = 0 and DR0-3 = 0 at
         // startup and expects the reads to agree, which this satisfies.
         Inst::MovDr { dr, reg } => {
+            let w = if cpu.long_mode() { 64 } else { 32 };
             let v = cpu.dr[dr as usize];
-            cpu.set_reg32(Reg::reg32(reg), v);
+            cpu.set_reg_w(reg, w, v);
         }
         Inst::MovToDr { dr, reg } => {
-            cpu.dr[dr as usize] = cpu.reg32(Reg::reg32(reg));
+            let w = if cpu.long_mode() { 64 } else { 32 };
+            cpu.dr[dr as usize] = cpu.reg_w(reg, w);
         }
         Inst::Lldt { m } => {
             let sel = cpu.read_rm16(&m);
@@ -2078,8 +2342,13 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         Inst::Sldt { m } => { let v = cpu.ldt_selector; cpu.write_rm16(&m, v); }
         Inst::Str { m } => { let v = cpu.tr_selector; cpu.write_rm16(&m, v); }
         Inst::Leave { w32 } => {
-            if w32 {
-                cpu.set_reg32(Reg32::Esp, cpu.ebp);
+            if cpu.long64() {
+                let bp = cpu.reg64(5);
+                cpu.set_rsp(bp);
+                let v = cpu.pop_w(64);
+                cpu.set_reg64(5, v);
+            } else if w32 {
+                cpu.set_reg32(Reg32::Esp, cpu.ebp());
                 let v = cpu.pop32();
                 cpu.set_reg32(Reg32::Ebp, v);
             } else {
@@ -2095,8 +2364,9 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.write_rm16(&m, v);
         }
         Inst::PopRm32 { m } => {
-            let v = cpu.pop32();
-            cpu.write_rm32(&m, v);
+            let w = cpu.stack_width();
+            let v = cpu.pop_w(w);
+            cpu.write_rm_w(&m, w, v);
         }
 
         // ---- String ops ----
@@ -2123,130 +2393,107 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // *operand* size; they are not the same thing when a 0x66 prefix is
         // in play.
         Inst::Movs { rep, w } => {
-            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let bits = if w { cpu.osize() } else { 8 };
+            let esize = bits / 8;
             let step = string_step(cpu, esize);
-            let a32 = cpu.addrsize;
-            let (mut si, mut di) = (string_si(cpu, a32), string_di(cpu, a32));
-            let mut cnt = string_count(cpu, a32, rep);
+            let asize = cpu.asize();
+            let (mut si, mut di) = (string_si(cpu, asize), string_di(cpu, asize));
+            let mut cnt = string_count(cpu, asize, rep);
             while cnt > 0 {
-                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+                let src = cpu.translate(seg, si);
                 let dst = cpu.translate_write(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
-                match esize {
-                    4 => { let v = cpu.mem.read_u32(src); cpu.mem.write_u32(dst, v); }
-                    2 => { let v = cpu.mem.read_u16(src); cpu.mem.write_u16(dst, v); }
-                    _ => { let v = cpu.mem.read_u8(src); cpu.mem.write_u8(dst, v); }
-                }
-                si = string_advance(si, step, a32);
-                di = string_advance(di, step, a32);
+                let v = mem_read_w(cpu, src, bits);
+                mem_write_w(cpu, dst, bits, v);
+                si = string_advance(si, step, asize);
+                di = string_advance(di, step, asize);
                 cnt -= 1;
             }
-            string_set_si(cpu, a32, si);
-            string_set_di(cpu, a32, di);
-            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
+            string_set_si(cpu, asize, si);
+            string_set_di(cpu, asize, di);
+            if rep != Rep::None { string_set_count(cpu, asize, cnt); }
         }
         Inst::Stos { rep, w } => {
-            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let bits = if w { cpu.osize() } else { 8 };
+            let esize = bits / 8;
             let step = string_step(cpu, esize);
-            let a32 = cpu.addrsize;
-            let mut di = string_di(cpu, a32);
-            let mut cnt = string_count(cpu, a32, rep);
+            let asize = cpu.asize();
+            let mut di = string_di(cpu, asize);
+            let mut cnt = string_count(cpu, asize, rep);
             while cnt > 0 {
                 let dst = cpu.translate_write(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
-                match esize {
-                    4 => { let v = cpu.reg32(Reg32::Eax); cpu.mem.write_u32(dst, v); }
-                    2 => { let v = cpu.reg16(Reg16::Ax); cpu.mem.write_u16(dst, v); }
-                    _ => { let v = cpu.reg8(Reg8::Al); cpu.mem.write_u8(dst, v); }
-                }
-                di = string_advance(di, step, a32);
+                let v = cpu.reg_w(0, bits);
+                mem_write_w(cpu, dst, bits, v);
+                di = string_advance(di, step, asize);
                 cnt -= 1;
             }
-            string_set_di(cpu, a32, di);
-            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
+            string_set_di(cpu, asize, di);
+            if rep != Rep::None { string_set_count(cpu, asize, cnt); }
         }
         Inst::Lods { rep, w } => {
-            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let bits = if w { cpu.osize() } else { 8 };
+            let esize = bits / 8;
             let step = string_step(cpu, esize);
-            let a32 = cpu.addrsize;
-            let mut si = string_si(cpu, a32);
-            let mut cnt = string_count(cpu, a32, rep);
+            let asize = cpu.asize();
+            let mut si = string_si(cpu, asize);
+            let mut cnt = string_count(cpu, asize, rep);
             while cnt > 0 {
-                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+                let src = cpu.translate(seg, si);
                 if cpu.pending_exception.is_some() { break; }
-                match esize {
-                    4 => { let v = cpu.mem.read_u32(src); cpu.set_reg32(Reg32::Eax, v); }
-                    2 => { let v = cpu.mem.read_u16(src); cpu.set_reg16(Reg16::Ax, v); }
-                    _ => { let v = cpu.mem.read_u8(src); cpu.set_reg8(Reg8::Al, v); }
-                }
-                si = string_advance(si, step, a32);
+                let v = mem_read_w(cpu, src, bits);
+                cpu.set_reg_w(0, bits, v);
+                si = string_advance(si, step, asize);
                 cnt -= 1;
             }
-            string_set_si(cpu, a32, si);
-            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
+            string_set_si(cpu, asize, si);
+            if rep != Rep::None { string_set_count(cpu, asize, cnt); }
         }
         Inst::Cmps { rep, w } => {
-            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let bits = if w { cpu.osize() } else { 8 };
+            let esize = bits / 8;
             let step = string_step(cpu, esize);
-            let a32 = cpu.addrsize;
-            let (mut si, mut di) = (string_si(cpu, a32), string_di(cpu, a32));
-            let mut cnt = string_count(cpu, a32, rep);
+            let asize = cpu.asize();
+            let (mut si, mut di) = (string_si(cpu, asize), string_di(cpu, asize));
+            let mut cnt = string_count(cpu, asize, rep);
             while cnt > 0 {
-                let src = cpu.translate(cpu.operand_seg_for_exec(SegReg::Ds), si);
+                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
+                let src = cpu.translate(seg, si);
                 let dst = cpu.translate(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
-                match esize {
-                    4 => {
-                        let (a, b) = (cpu.mem.read_u32(src), cpu.mem.read_u32(dst));
-                        alu32(cpu, AluOp::Cmp, a, b);
-                    }
-                    2 => {
-                        let (a, b) = (cpu.mem.read_u16(src), cpu.mem.read_u16(dst));
-                        alu16(cpu, AluOp::Cmp, a, b);
-                    }
-                    _ => {
-                        let (a, b) = (cpu.mem.read_u8(src), cpu.mem.read_u8(dst));
-                        alu8(cpu, AluOp::Cmp, a, b);
-                    }
-                }
-                si = string_advance(si, step, a32);
-                di = string_advance(di, step, a32);
+                let a = mem_read_w(cpu, src, bits);
+                let b = mem_read_w(cpu, dst, bits);
+                alu_w(cpu, AluOp::Cmp, a, b, bits);
+                si = string_advance(si, step, asize);
+                di = string_advance(di, step, asize);
                 cnt -= 1;
                 if !string_repeat(cpu, rep, cnt) { break; }
             }
-            string_set_si(cpu, a32, si);
-            string_set_di(cpu, a32, di);
-            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
+            string_set_si(cpu, asize, si);
+            string_set_di(cpu, asize, di);
+            if rep != Rep::None { string_set_count(cpu, asize, cnt); }
         }
         Inst::Scas { rep, w } => {
-            let esize = if w { if cpu.opsize { 4u32 } else { 2 } } else { 1 };
+            let bits = if w { cpu.osize() } else { 8 };
+            let esize = bits / 8;
             let step = string_step(cpu, esize);
-            let a32 = cpu.addrsize;
-            let mut di = string_di(cpu, a32);
-            let mut cnt = string_count(cpu, a32, rep);
+            let asize = cpu.asize();
+            let mut di = string_di(cpu, asize);
+            let mut cnt = string_count(cpu, asize, rep);
             while cnt > 0 {
                 let dst = cpu.translate(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
-                match esize {
-                    4 => {
-                        let (a, b) = (cpu.reg32(Reg32::Eax), cpu.mem.read_u32(dst));
-                        alu32(cpu, AluOp::Cmp, a, b);
-                    }
-                    2 => {
-                        let (a, b) = (cpu.reg16(Reg16::Ax), cpu.mem.read_u16(dst));
-                        alu16(cpu, AluOp::Cmp, a, b);
-                    }
-                    _ => {
-                        let (a, b) = (cpu.reg8(Reg8::Al), cpu.mem.read_u8(dst));
-                        alu8(cpu, AluOp::Cmp, a, b);
-                    }
-                }
-                di = string_advance(di, step, a32);
+                let a = cpu.reg_w(0, bits);
+                let b = mem_read_w(cpu, dst, bits);
+                alu_w(cpu, AluOp::Cmp, a, b, bits);
+                di = string_advance(di, step, asize);
                 cnt -= 1;
                 if !string_repeat(cpu, rep, cnt) { break; }
             }
-            string_set_di(cpu, a32, di);
-            if rep != Rep::None { string_set_count(cpu, a32, cnt); }
+            string_set_di(cpu, asize, di);
+            if rep != Rep::None { string_set_count(cpu, asize, cnt); }
         }
 
         // ---- LGDT / LIDT ----
@@ -2255,18 +2502,29 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // segment, 16-bit (modrm_addr) otherwise. The decoder already
         // fetched the ModR/M, SIB, and displacement bytes according to
         // addrsize; the executor must compute the address the same way.
+        // The pseudo-descriptor is a 16-bit limit followed by the table
+        // base -- four bytes of it in a legacy mode, eight in long mode,
+        // where a descriptor table can live anywhere in the 64-bit space.
         Inst::Lgdt { m } => {
-            let base = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
-            let limit = cpu.mem.read_u16(base);
-            let base32 = cpu.mem.read_u32(base + 2);
-            cpu.gdt_base = base32;
+            let addr = cpu.rm_addr(&m, false);
+            let limit = cpu.mem.read_u16(addr);
+            let base = if cpu.long_mode() {
+                cpu.mem.read_u64(addr + 2)
+            } else {
+                cpu.mem.read_u32(addr + 2) as u64
+            };
+            cpu.gdt_base = base;
             cpu.gdt_limit = limit;
         }
         Inst::Lidt { m } => {
-            let base = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
-            let limit = cpu.mem.read_u16(base);
-            let base32 = cpu.mem.read_u32(base + 2);
-            cpu.idt_base = base32;
+            let addr = cpu.rm_addr(&m, false);
+            let limit = cpu.mem.read_u16(addr);
+            let base = if cpu.long_mode() {
+                cpu.mem.read_u64(addr + 2)
+            } else {
+                cpu.mem.read_u32(addr + 2) as u64
+            };
+            cpu.idt_base = base;
             cpu.idt_limit = limit;
         }
 
@@ -2275,70 +2533,153 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // operand. The linear address is computed the same way as a normal
         // memory operand (segment + offset), then we invalidate that page.
         Inst::Invlpg { m } => {
-            // Compute the linear address (segment base + offset), not the
-            // physical address, since INVLPG operates on linear addresses.
-            let linear = if cpu.pe {
-                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
-                let offset = if cpu.addrsize {
-                    cpu.modrm_offset32(&m)
-                } else {
-                    cpu.modrm_offset(&m)
-                };
-                cpu.seg_desc[seg as usize].base.wrapping_add(offset)
-            } else {
-                let seg = cpu.operand_seg_for_exec(SegReg::Ds);
-                let offset = if cpu.addrsize {
-                    cpu.modrm_offset32(&m)
-                } else {
-                    cpu.modrm_offset(&m)
-                };
-                ((cpu.seg(seg) as u32) << 4).wrapping_add(offset)
-            };
+            // INVLPG names a *linear* address, not a physical one, so the
+            // operand is resolved through the segment but not through the
+            // page tables -- which is the whole point: the mapping it is
+            // dropping may be the one that no longer works.
+            let linear = cpu.modrm_linear(&m);
             cpu.invlpg(linear);
         }
 
         // ---- MOV to/from control registers ----
+        // A control-register move is always the full width of the mode: 64
+        // bits in long mode, 32 otherwise, with no way to ask for anything
+        // else (REX.W is redundant and 0x66 is ignored).
         Inst::MovCr { cr, reg } => {
-            let v = match cr {
-                0 => cpu.cr0,
+            let v: u64 = match cr {
+                0 => cpu.cr0 as u64,
                 2 => cpu.cr2,
                 3 => cpu.cr3,
-                _ => cpu.cr4,
+                4 => cpu.cr4 as u64,
+                // CR8 is the task-priority register, which exists only in
+                // long mode and only alongside a local APIC. There is no APIC
+                // here, so it reads back as the zero it was written.
+                _ => cpu.cr8,
             };
-            cpu.set_reg32(Reg::reg32(reg), v);
+            let w = if cpu.long_mode() { 64 } else { 32 };
+            cpu.set_reg_w(reg, w, v);
         }
         Inst::MovToCr { cr, reg } => {
-            let v = cpu.reg32(Reg::reg32(reg));
+            let w = if cpu.long_mode() { 64 } else { 32 };
+            let v = cpu.reg_w(reg, w);
             match cr {
                 0 => {
                     // If paging is being toggled (PG bit changes), flush TLB.
-                    let old_pg = cpu.cr0 & 0x8000_0000 != 0;
-                    let new_pg = v & 0x8000_0000 != 0;
+                    let old_pg = cpu.cr0 & crate::cpu::CR0_PG != 0;
+                    let new_pg = v as u32 & crate::cpu::CR0_PG != 0;
+                    cpu.cr0 = v as u32;
+                    cpu.pe = cpu.cr0 & crate::cpu::CR0_PE != 0;
                     if old_pg != new_pg {
                         cpu.flush_tlb();
                     }
-                    cpu.cr0 = v;
+                    // Turning paging on with EFER.LME set is what *enters*
+                    // long mode; turning it off is what leaves.
+                    cpu.update_long_mode();
                 }
                 2 => cpu.cr2 = v,
                 3 => {
                     cpu.cr3 = v;
                     cpu.flush_tlb();
                 }
-                _ => {
+                4 => {
                     // Writing CR4 flushes the TLB. Linux's
                     // `__flush_tlb_global()` is *literally* a CR4 write with
                     // PGE toggled off and back on -- the flush is the whole
                     // point of the sequence, and without it every global
-                    // mapping keeps a stale translation.
-                    cpu.cr4 = v;
+                    // mapping keeps a stale translation. Toggling PAE changes
+                    // the shape of the page tables, so the flush is not
+                    // optional there either.
+                    cpu.cr4 = v as u32;
                     cpu.flush_tlb();
                 }
+                _ => cpu.cr8 = v & 0xF,
             }
         }
 
         // ---- CLTS (0x0F 0x06) ----
         Inst::Clts => {
             cpu.cr0 &= !0x8; // clear CR0.TS (bit 3)
+        }
+
+        // Instructions with nothing to do on this machine: memory fences (no
+        // store buffer to drain), prefetch and cache hints (no cache), and
+        // the multi-byte NOP compilers use for alignment.
+        Inst::NopHint => {}
+
+        // ---- SYSCALL / SYSRET (0F 05 / 0F 07) ----
+        //
+        // The fast system-call pair, and the only way into a 64-bit kernel:
+        // 64-bit Linux does not install an `int 0x80` path for 64-bit
+        // processes at all. What makes it fast is that it consults no table
+        // and touches no memory -- the entry point and the segments come out
+        // of MSRs, and the return address goes in a register instead of onto
+        // a stack the kernel would have to trust.
+        //
+        // The cost of that is spelled out in the semantics: **SYSCALL does
+        // not switch stacks**. It lands in the kernel still running on the
+        // user stack, with RSP under user control, which is exactly why every
+        // 64-bit kernel entry stub begins with SWAPGS and a load of the real
+        // stack out of per-CPU data.
+        Inst::Syscall => {
+            if cpu.efer & crate::cpu::efer::SCE == 0 {
+                // SYSCALL is disabled: #UD, not a silent fall-through.
+                cpu.pending_exception = Some((0x06, None));
+                return;
+            }
+            // RCX takes the return address and R11 the flags -- both are
+            // clobbered, which is why the 64-bit ABI lists them as
+            // caller-saved and why no system call passes an argument in them.
+            cpu.set_reg64_raw(1, cpu.rip);
+            cpu.set_reg64_raw(11, cpu.flags as u64);
+            // STAR bits 47:32 hold the kernel CS; SS is the next descriptor.
+            let sel = ((cpu.star >> 32) & 0xFFFF) as u16;
+            cpu.flags &= !(cpu.sfmask as u32);
+            cpu.flags |= flags::ALWAYS_SET;
+            cpu.load_seg(SegReg::Cs, sel & 0xFFFC);
+            cpu.load_seg(SegReg::Ss, (sel & 0xFFFC).wrapping_add(8));
+            cpu.rip = cpu.lstar;
+            cpu.ring_switches += 1;
+            cpu.invalidate_phys_ip();
+        }
+        Inst::Sysret => {
+            // Returning: RCX back to RIP, R11 back to RFLAGS, and the user
+            // segments from STAR bits 63:48. REX.W selects the 64-bit form;
+            // without it the return is to compatibility mode.
+            let sel = ((cpu.star >> 48) & 0xFFFF) as u16;
+            let (cs, ss) = if cpu.rex_w {
+                // 64-bit: CS is base+16, SS is base+8, both with RPL 3.
+                ((sel + 16) | 3, (sel + 8) | 3)
+            } else {
+                (sel | 3, (sel + 8) | 3)
+            };
+            cpu.rip = cpu.reg64(1);
+            cpu.flags = write_flags(cpu.flags, cpu.reg64(11) as u32);
+            cpu.load_seg(SegReg::Cs, cs);
+            cpu.load_seg(SegReg::Ss, ss);
+            cpu.invalidate_phys_ip();
+        }
+
+        // ---- SWAPGS (0F 01 F8) ----
+        //
+        // Exchange the GS base with the one parked in KERNEL_GS_BASE. It
+        // exists because a kernel entered by SYSCALL has no trustworthy
+        // register and no stack of its own: this is the one instruction that
+        // gets it a pointer to its per-CPU data without reading anything the
+        // user could have arranged. It is a #UD outside 64-bit mode.
+        Inst::Swapgs => {
+            if !cpu.long64() {
+                cpu.pending_exception = Some((0x06, None));
+                return;
+            }
+            std::mem::swap(&mut cpu.gs_base, &mut cpu.kernel_gs_base);
+        }
+
+        // RDTSCP: RDTSC, plus the processor id (always 0 here) in ECX.
+        Inst::Rdtscp => {
+            let tsc = cpu.rdtsc();
+            cpu.set_reg32(Reg32::Eax, tsc as u32);
+            cpu.set_reg32(Reg32::Edx, (tsc >> 32) as u32);
+            cpu.set_reg32(Reg32::Ecx, 0);
         }
 
         // ---- CPUID (0x0F 0xA2) ----
@@ -2367,12 +2708,45 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                     // here: FPU(0), PSE(3), TSC(4), MSR(5), CX8(8), PGE(13),
                     // CMOV(15), CLFSH(19), FXSR(24).
                     //
+                    // PAE(6) is on because the page-table walk implements
+                    // it, and a 64-bit boot will not even start without it.
+                    //
                     // Left OFF on purpose, because claiming them would make
                     // the kernel issue instructions this CPU does not have:
-                    // PAE(6), APIC(9), SEP(11) -- so system calls arrive as
+                    // APIC(9), SEP(11) -- so 32-bit system calls arrive as
                     // int 0x80 rather than SYSENTER -- MTRR(12), PAT(16),
                     // MMX(23), SSE(25) and SSE2(26).
-                    cpu.set_reg32(Reg32::Edx, 0x0108_A139);
+                    cpu.set_reg32(Reg32::Edx, 0x0108_A179);
+                }
+                0x8000_0000 => {
+                    // Highest extended leaf. A CPU that does not answer this
+                    // one is a CPU without long mode as far as any bootloader
+                    // is concerned -- the check is "is 0x80000001 reachable",
+                    // long before anything looks at its feature bits.
+                    cpu.set_reg32(Reg32::Eax, 0x8000_0008);
+                    cpu.set_reg32(Reg32::Ebx, 0);
+                    cpu.set_reg32(Reg32::Ecx, 0);
+                    cpu.set_reg32(Reg32::Edx, 0);
+                }
+                0x8000_0001 => {
+                    cpu.set_reg32(Reg32::Eax, 0);
+                    cpu.set_reg32(Reg32::Ebx, 0);
+                    // ECX: LAHF/SAHF valid in 64-bit mode (bit 0).
+                    cpu.set_reg32(Reg32::Ecx, 0x0000_0001);
+                    // EDX extended features, again only the implemented ones:
+                    // FPU(0), PSE(3), TSC(4), MSR(5), PAE(6), CX8(8), PGE(13),
+                    // CMOV(15), NX(20), SYSCALL(11), 1 GiB pages(26),
+                    // RDTSCP left off, and **LM (bit 29)** -- the bit that
+                    // says this CPU has long mode at all.
+                    cpu.set_reg32(Reg32::Edx, 0x2010_A97B);
+                }
+                0x8000_0008 => {
+                    // Physical and linear address sizes: 52 and 48, which is
+                    // what the page-table walk actually implements.
+                    cpu.set_reg32(Reg32::Eax, 0x0000_3034);
+                    cpu.set_reg32(Reg32::Ebx, 0);
+                    cpu.set_reg32(Reg32::Ecx, 0);
+                    cpu.set_reg32(Reg32::Edx, 0);
                 }
                 _ => {
                     // Unknown leaf: report 0.
@@ -2392,14 +2766,20 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
 
         // ---- RDMSR (0x0F 0x32) / WRMSR (0x0F 0x30) ----
+        // ECX names the MSR; the value is EDX:EAX, high half first. The
+        // registers this CPU actually keeps are the ones long mode needs:
+        // EFER, the SYSCALL configuration, and the FS/GS bases. Everything
+        // else reads back as zero and swallows writes, which is what lets a
+        // kernel probe for features without faulting.
         Inst::Rdmsr => {
-            // ECX = MSR index. Return 0 for all MSRs (a real CPU would
-            // return specific values; 0 is enough for early boot probing).
-            cpu.set_reg32(Reg32::Eax, 0);
-            cpu.set_reg32(Reg32::Edx, 0);
+            let v = cpu.read_msr(cpu.reg32(Reg32::Ecx));
+            cpu.set_reg32(Reg32::Eax, v as u32);
+            cpu.set_reg32(Reg32::Edx, (v >> 32) as u32);
         }
         Inst::Wrmsr => {
-            // Ignore writes (no-op).
+            let v = (cpu.reg32(Reg32::Eax) as u64) | ((cpu.reg32(Reg32::Edx) as u64) << 32);
+            let idx = cpu.reg32(Reg32::Ecx);
+            cpu.write_msr(idx, v);
         }
 
         // ---- Bit tests: BT / BTS / BTR / BTC ----
@@ -2572,21 +2952,31 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // differs from the full signed product (i.e. it did not fit).
         Inst::ImulRegRm16 { m, dst } => {
             let a = cpu.read_rm16(&m) as i16 as i32;
-            let b = cpu.reg16(Reg::reg16(dst)) as i16 as i32;
+            let b = cpu.reg16_idx(dst) as i16 as i32;
             imul_store16(cpu, dst, a * b);
         }
         Inst::ImulRegRm32 { m, dst } => {
-            let a = cpu.read_rm32(&m) as i32 as i64;
-            let b = cpu.reg32(Reg::reg32(dst)) as i32 as i64;
-            imul_store32(cpu, dst, a * b);
+            let w = cpu.osize();
+            let a = sign_extend(cpu.read_rm_w(&m, w), w);
+            let b = sign_extend(cpu.reg_w(dst, w), w);
+            if w == 64 {
+                imul_store64(cpu, dst, (a as i128) * (b as i128));
+            } else {
+                imul_store32(cpu, dst, a.wrapping_mul(b));
+            }
         }
         Inst::ImulRegRmImm16 { m, dst, imm } => {
             let a = cpu.read_rm16(&m) as i16 as i32;
             imul_store16(cpu, dst, a * imm as i32);
         }
         Inst::ImulRegRmImm32 { m, dst, imm } => {
-            let a = cpu.read_rm32(&m) as i32 as i64;
-            imul_store32(cpu, dst, a * imm as i64);
+            let w = cpu.osize();
+            let a = sign_extend(cpu.read_rm_w(&m, w), w);
+            if w == 64 {
+                imul_store64(cpu, dst, (a as i128) * (imm as i128));
+            } else {
+                imul_store32(cpu, dst, a.wrapping_mul(imm as i64));
+            }
         }
 
         // SHLD/SHRD: shift the destination, feeding in bits from the source
@@ -2594,18 +2984,28 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // count >= the operand width is architecturally undefined, and like
         // real hardware we mask it to 5 bits and let it fall out.
         Inst::Shld { m, reg, count, w32 } => {
-            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) } & 0x1F;
+            let w = cpu.osize();
+            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) }
+                & if w == 64 { 0x3F } else { 0x1F };
             if n != 0 {
-                if w32 {
+                if w == 64 {
+                    let d = cpu.read_rm_w(&m, 64);
+                    let src = cpu.reg_w(reg, 64);
+                    let nn = n as u32;
+                    let res = (d << nn) | (src >> (64 - nn));
+                    let cf = (d >> (64 - nn)) & 1 != 0;
+                    cpu.write_rm_w(&m, 64, res);
+                    set_shift_flags64(cpu, res, cf, (d ^ res) >> 63 & 1 != 0);
+                } else if w32 {
                     let d = cpu.read_rm32(&m);
-                    let src = cpu.reg32(Reg::reg32(reg));
+                    let src = cpu.reg32_idx(reg);
                     let res = (d << n) | (src >> (32 - n));
                     let cf = (d >> (32 - n)) & 1 != 0;
                     cpu.write_rm32(&m, res);
                     set_shift_flags32(cpu, res, cf, (d ^ res) >> 31 & 1 != 0);
                 } else {
                     let d = cpu.read_rm16(&m);
-                    let src = cpu.reg16(Reg::reg16(reg));
+                    let src = cpu.reg16_idx(reg);
                     // A 16-bit SHLD with count > 16 feeds in bits that a real
                     // CPU leaves undefined; do the shift in 32 bits so the
                     // in-range cases are exact.
@@ -2618,18 +3018,28 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             }
         }
         Inst::Shrd { m, reg, count, w32 } => {
-            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) } & 0x1F;
+            let w = cpu.osize();
+            let n = match count { ShiftCount::One => 1, ShiftCount::Imm(i) => i, ShiftCount::Cl => cpu.reg8(Reg8::Cl) }
+                & if w == 64 { 0x3F } else { 0x1F };
             if n != 0 {
-                if w32 {
+                if w == 64 {
+                    let d = cpu.read_rm_w(&m, 64);
+                    let src = cpu.reg_w(reg, 64);
+                    let nn = n as u32;
+                    let res = (d >> nn) | (src << (64 - nn));
+                    let cf = (d >> (nn - 1)) & 1 != 0;
+                    cpu.write_rm_w(&m, 64, res);
+                    set_shift_flags64(cpu, res, cf, (d ^ res) >> 63 & 1 != 0);
+                } else if w32 {
                     let d = cpu.read_rm32(&m);
-                    let src = cpu.reg32(Reg::reg32(reg));
+                    let src = cpu.reg32_idx(reg);
                     let res = (d >> n) | (src << (32 - n));
                     let cf = (d >> (n - 1)) & 1 != 0;
                     cpu.write_rm32(&m, res);
                     set_shift_flags32(cpu, res, cf, (d ^ res) >> 31 & 1 != 0);
                 } else {
                     let d = cpu.read_rm16(&m);
-                    let src = cpu.reg16(Reg::reg16(reg));
+                    let src = cpu.reg16_idx(reg);
                     let wide = ((src as u32) << 16) | d as u32;
                     let res = (wide >> n) as u16;
                     let cf = (d >> (n - 1).min(15)) & 1 != 0;
@@ -2670,10 +3080,15 @@ pub(crate) fn protected_int(cpu: &mut Cpu, vector: u8) {
 /// every field by one slot and the kernel reports the fault at the CS
 /// selector's "address" with the real EIP as the error code.
 pub(crate) fn protected_int_err(cpu: &mut Cpu, vector: u8, error_code: Option<u32>) {
+    if cpu.long_mode() {
+        return long_int(cpu, vector, error_code);
+    }
     // IDT entry: 8 bytes. offset = (bytes 0-1) | (bytes 6-7 << 16), the
     // segment selector is bytes 2-3, and byte 5 holds the type/attributes.
-    let entry = cpu.idt_base.wrapping_add((vector as u32) * 8);
-    let addr = Memory::phys32(entry);
+    let entry = cpu.idt_base.wrapping_add((vector as u64) * 8);
+    // The IDT base is a *linear* address, so a kernel that runs in the higher
+    // half keeps its IDT up there too. Resolve it the way the CPU does.
+    let addr = cpu.linear_to_phys_ro(entry as u64);
     let off_lo = cpu.mem.read_u16(addr) as u32;
     let off_hi = cpu.mem.read_u16(addr + 6) as u32;
     let target = off_lo | (off_hi << 16);
@@ -2689,15 +3104,15 @@ pub(crate) fn protected_int_err(cpu: &mut Cpu, vector: u8, error_code: Option<u3
 
     // Everything pushed is the state as it was *before* the gate.
     let old_cs = cpu.cs;
-    let old_eip = cpu.eip;
+    let old_eip = cpu.eip();
     let old_flags = cpu.flags;
-    let (old_ss, old_esp) = (cpu.ss, cpu.esp);
+    let (old_ss, old_esp) = (cpu.ss, cpu.esp());
 
     if switching {
         cpu.ring_switches += 1;
         let (ss0, esp0) = cpu.tss_stack0();
         cpu.load_seg(SegReg::Ss, ss0);
-        cpu.esp = esp0;
+        cpu.set_esp(esp0);
     }
     // Enter the handler's privilege level BEFORE writing the frame. The
     // pushes are part of the gate transition and happen at the new CPL: done
@@ -2722,8 +3137,132 @@ pub(crate) fn protected_int_err(cpu: &mut Cpu, vector: u8, error_code: Option<u3
     }
     cpu.set_flag(flags::TF, false);
     cpu.set_flag(flags::RF, false);
-    cpu.eip = target;
+    cpu.set_eip(target);
     cpu.invalidate_phys_ip();
+}
+
+/// Dispatch an interrupt or exception through a **long-mode** IDT.
+///
+/// Three things differ from the 32-bit form, and all three are load-bearing:
+///
+/// 1. A gate is **sixteen** bytes, with the 64-bit offset in three pieces and
+///    an interrupt-stack-table index sharing a byte with the reserved field.
+/// 2. The frame is five 8-byte words and **SS:RSP are always pushed**, even
+///    when the privilege level did not change. That is what makes `IRETQ` a
+///    single shape rather than two, and a handler that pops only three words
+///    returns to nonsense.
+/// 3. A stack switch loads a **null** SS. There is no SS0 in a 64-bit TSS to
+///    load anything else from; the segment is not used for anything but its
+///    selector, and long mode is happy to run on a null one at ring 0.
+fn long_int(cpu: &mut Cpu, vector: u8, error_code: Option<u32>) {
+    let entry = cpu.idt_base.wrapping_add((vector as u64) * 16);
+    let addr = cpu.linear_to_phys_ro(entry);
+    let off_lo = cpu.mem.read_u16(addr) as u64;
+    let selector = cpu.mem.read_u16(addr + 2);
+    // Bits 0-2 of byte 4 are the IST index; the rest of the byte is reserved.
+    let ist = cpu.mem.read_u8(addr + 4) & 7;
+    let gate_type = cpu.mem.read_u8(addr + 5) & 0x0F;
+    let off_mid = cpu.mem.read_u16(addr + 6) as u64;
+    let off_hi = cpu.mem.read_u32(addr + 8) as u64;
+    let target = off_lo | (off_mid << 16) | (off_hi << 32);
+
+    let target_dpl = cpu.descriptor_for(selector).dpl();
+    let switching = target_dpl < cpu.cpl();
+
+    // Everything pushed is the state as it was *before* the gate.
+    let old_cs = cpu.cs;
+    let old_rip = cpu.rip;
+    let old_flags = cpu.flags as u64;
+    let old_ss = cpu.ss;
+    let old_rsp = cpu.rsp();
+
+    // Which stack to land on. An IST entry is taken *unconditionally* -- that
+    // is the point of it: a double fault or an NMI must reach a stack that is
+    // known good even when the one in RSP is what broke.
+    if ist != 0 {
+        let sp = cpu.tss_ist(ist);
+        if switching { cpu.ring_switches += 1; }
+        cpu.load_seg(SegReg::Ss, 0);
+        cpu.set_rsp(sp);
+    } else if switching {
+        cpu.ring_switches += 1;
+        let sp = cpu.tss_rsp0();
+        cpu.load_seg(SegReg::Ss, 0);
+        cpu.set_rsp(sp);
+    }
+    // Enter the handler's privilege level BEFORE writing the frame, for the
+    // same reason as the 32-bit path: the pushes are part of the transition
+    // and happen at the new CPL.
+    cpu.load_seg(SegReg::Cs, selector);
+    // The frame is aligned to 16 bytes before anything is pushed.
+    let sp = cpu.rsp() & !0xF;
+    cpu.set_rsp(sp);
+    cpu.push64(old_ss as u64);
+    cpu.push64(old_rsp);
+    cpu.push64(old_flags);
+    cpu.push64(old_cs as u64);
+    cpu.push64(old_rip);
+    if let Some(code) = error_code {
+        cpu.push64(code as u64);
+    }
+    // An interrupt gate (type 14) clears IF on entry; a trap gate (15) leaves
+    // it alone. Long mode has no 16-bit gates, so those are the only two.
+    if gate_type == 0xE {
+        cpu.set_flag(flags::IF, false);
+    }
+    cpu.set_flag(flags::TF, false);
+    cpu.set_flag(flags::RF, false);
+    cpu.rip = target;
+    cpu.invalidate_phys_ip();
+}
+
+/// All-ones for the low `width` bits. `1 << 64` is undefined, so the widest
+/// case cannot be written as `(1 << w) - 1`.
+#[inline]
+fn mask_w(width: u32) -> u64 {
+    if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+}
+
+/// Read `width` bits from a physical address.
+fn mem_read_w(cpu: &Cpu, addr: usize, width: u32) -> u64 {
+    match width {
+        64 => cpu.mem.read_u64(addr),
+        32 => cpu.mem.read_u32(addr) as u64,
+        16 => cpu.mem.read_u16(addr) as u64,
+        _ => cpu.mem.read_u8(addr) as u64,
+    }
+}
+
+/// Write `width` bits to a physical address.
+fn mem_write_w(cpu: &mut Cpu, addr: usize, width: u32, v: u64) {
+    match width {
+        64 => cpu.mem.write_u64(addr, v),
+        32 => cpu.mem.write_u32(addr, v as u32),
+        16 => cpu.mem.write_u16(addr, v as u16),
+        _ => cpu.mem.write_u8(addr, v as u8),
+    }
+}
+
+/// Sign-extend the low `width` bits of `v` to a full 64-bit value.
+#[inline]
+fn sext(v: u64, width: u32) -> u64 {
+    sign_extend(v, width) as u64
+}
+
+/// Branch by a signed displacement, at the width of the current mode.
+///
+/// A near branch in 64-bit mode moves the whole of RIP; in a legacy mode it
+/// wraps at 32 bits (or 16, with a 16-bit operand size). Doing it at one
+/// fixed width is how a jump in the high half of a 64-bit address space lands
+/// four gigabytes from where it meant to.
+fn branch_rel(cpu: &mut Cpu, rel: i64) {
+    if cpu.long64() {
+        cpu.rip = cpu.rip.wrapping_add(rel as u64);
+    } else if cpu.opsize {
+        cpu.set_eip(cpu.eip().wrapping_add(rel as u32));
+    } else {
+        cpu.ip = cpu.ip.wrapping_add(rel as u16);
+    }
 }
 
 // ---- ALU flag computation ----
@@ -2849,10 +3388,69 @@ fn alu32(cpu: &mut Cpu, op: AluOp, a: u32, b: u32) -> u32 {
 /// are set when the full signed product did not fit in 16 bits; SF/ZF/PF are
 /// architecturally undefined but we set them from the truncated result, which
 /// is what real CPUs do.
+fn alu64(cpu: &mut Cpu, op: AluOp, a: u64, b: u64) -> u64 {
+    use flags::*;
+    match op {
+        AluOp::Add => {
+            let (r, c) = a.overflowing_add(b);
+            set_logic_flags64(cpu, r);
+            set_add_carry64(cpu, a, b, r, c);
+            r
+        }
+        AluOp::Adc => {
+            let cin = cpu.get_flag(CF) as u64;
+            let r = a.wrapping_add(b).wrapping_add(cin);
+            // Carry out of a 64-bit add cannot be found by widening -- there
+            // is nothing wider to widen into -- so it is read off the result:
+            // the sum wrapped if it came out below either input, and the
+            // equality case is the one where the carry-in did it alone.
+            let c = r < a || (cin == 1 && r == a);
+            set_logic_flags64(cpu, r);
+            set_add_carry64(cpu, a, b, r, c);
+            r
+        }
+        AluOp::Sub | AluOp::Cmp => {
+            let (r, c) = a.overflowing_sub(b);
+            set_logic_flags64(cpu, r);
+            set_sub_borrow64(cpu, a, b, r, c);
+            r
+        }
+        AluOp::Sbb => {
+            let cin = cpu.get_flag(CF) as u64;
+            let r = a.wrapping_sub(b).wrapping_sub(cin);
+            // Borrow iff a < b + cin, written so that b + cin cannot itself
+            // overflow out of the comparison.
+            let c = a < b || (a == b && cin == 1);
+            set_logic_flags64(cpu, r);
+            set_sub_borrow64(cpu, a, b, r, c);
+            r
+        }
+        AluOp::And => { let r = a & b; set_logic_flags64(cpu, r); cpu.set_flag(CF, false); cpu.set_flag(OF, false); r }
+        AluOp::Or  => { let r = a | b; set_logic_flags64(cpu, r); cpu.set_flag(CF, false); cpu.set_flag(OF, false); r }
+        AluOp::Xor => { let r = a ^ b; set_logic_flags64(cpu, r); cpu.set_flag(CF, false); cpu.set_flag(OF, false); r }
+    }
+}
+
+/// An ALU operation at whatever width the instruction is running: 8, 16, 32
+/// or 64 bits.
+///
+/// Each width has its own implementation rather than one masked one, because
+/// the flags are where the subtleties live and a masked version gets the
+/// carry out of the widest case wrong -- there is nothing wider than u64 to
+/// widen into. The dispatch is what the width-generic execute arms call.
+fn alu_w(cpu: &mut Cpu, op: AluOp, a: u64, b: u64, width: u32) -> u64 {
+    match width {
+        32 => alu32(cpu, op, a as u32, b as u32) as u64,
+        64 => alu64(cpu, op, a, b),
+        16 => alu16(cpu, op, a as u16, b as u16) as u64,
+        _ => alu8(cpu, op, a as u8, b as u8) as u64,
+    }
+}
+
 fn imul_store16(cpu: &mut Cpu, dst: u8, full: i32) {
     use flags::*;
     let r = full as u16;
-    cpu.set_reg16(Reg::reg16(dst), r);
+    cpu.set_reg16_idx(dst, r);
     let overflow = full != (r as i16) as i32;
     cpu.set_flag(CF, overflow);
     cpu.set_flag(OF, overflow);
@@ -2863,7 +3461,7 @@ fn imul_store16(cpu: &mut Cpu, dst: u8, full: i32) {
 fn imul_store32(cpu: &mut Cpu, dst: u8, full: i64) {
     use flags::*;
     let r = full as u32;
-    cpu.set_reg32(Reg::reg32(dst), r);
+    cpu.set_reg32_idx(dst, r);
     let overflow = full != (r as i32) as i64;
     cpu.set_flag(CF, overflow);
     cpu.set_flag(OF, overflow);
@@ -2905,6 +3503,48 @@ fn set_logic_flags32(cpu: &mut Cpu, r: u32) {
     cpu.set_flag(SF, (r as i32) < 0);
     cpu.set_flag(ZF, r == 0);
     cpu.set_flag(PF, parity(r as u8));
+}
+
+fn set_logic_flags64(cpu: &mut Cpu, r: u64) {
+    use flags::*;
+    cpu.set_flag(SF, (r as i64) < 0);
+    cpu.set_flag(ZF, r == 0);
+    cpu.set_flag(PF, parity(r as u8));
+}
+
+fn set_add_carry64(cpu: &mut Cpu, a: u64, b: u64, r: u64, c: bool) {
+    use flags::*;
+    cpu.set_flag(CF, c);
+    cpu.set_flag(AF, ((a ^ b ^ r) & 0x10) != 0);
+    let of = ((a ^ r) & (b ^ r)) & 0x8000_0000_0000_0000 != 0;
+    cpu.set_flag(OF, of);
+}
+
+fn set_sub_borrow64(cpu: &mut Cpu, a: u64, b: u64, r: u64, c: bool) {
+    use flags::*;
+    cpu.set_flag(CF, c);
+    cpu.set_flag(AF, ((a ^ b ^ r) & 0x10) != 0);
+    let of = ((a ^ b) & (a ^ r)) & 0x8000_0000_0000_0000 != 0;
+    cpu.set_flag(OF, of);
+}
+
+/// Flags after a 64-bit double-precision shift (SHLD/SHRD).
+fn set_shift_flags64(cpu: &mut Cpu, r: u64, cf: bool, of: bool) {
+    use flags::*;
+    cpu.set_flag(CF, cf);
+    cpu.set_flag(OF, of);
+    set_logic_flags64(cpu, r);
+}
+
+/// 64-bit counterpart of `imul_store16`.
+fn imul_store64(cpu: &mut Cpu, dst: u8, full: i128) {
+    use flags::*;
+    let r = full as u64;
+    cpu.set_reg_w(dst, 64, r);
+    let overflow = full != (r as i64) as i128;
+    cpu.set_flag(CF, overflow);
+    cpu.set_flag(OF, overflow);
+    set_logic_flags64(cpu, r);
 }
 
 fn set_add_carry(cpu: &mut Cpu, a: u16, b: u16, r: u16, c: bool) {
@@ -2960,53 +3600,26 @@ fn load_far_pointer(cpu: &mut Cpu, m: &ModRm, seg: SegReg) {
         // 32-bit offset + 16-bit segment.
         let off = cpu.mem.read_u32(addr);
         let sel = cpu.mem.read_u16(addr + 4);
-        cpu.set_reg32(Reg::reg32(m.reg), off);
+        cpu.set_reg32_idx(m.reg, off);
         cpu.load_seg(seg, sel);
     } else {
         // 16-bit offset + 16-bit segment.
         let off = cpu.mem.read_u16(addr);
         let sel = cpu.mem.read_u16(addr + 2);
-        cpu.set_reg16(Reg::reg16(m.reg), off);
+        cpu.set_reg16_idx(m.reg, off);
         cpu.load_seg(seg, sel);
     }
 }
 
 /// Compute the effective address (offset only, no segment) of a ModR/M
-/// memory operand, for LEA.
-fn lea_offset(m: &ModRm, cpu: &Cpu) -> u32 {
+/// memory operand, for LEA. This is the same computation the addressing path
+/// does, minus the segment and the page tables -- including RIP-relative,
+/// which is how 64-bit code takes the address of its own data.
+fn lea_offset(m: &ModRm, cpu: &Cpu) -> u64 {
     if cpu.addrsize {
-        let mut ea: u32 = 0;
-        if let Some(sib) = m.sib {
-            let scale = 1u32 << ((sib >> 6) & 3);
-            let index = (sib >> 3) & 7;
-            let base = sib & 7;
-            if index != 4 {
-                ea = ea.wrapping_add(cpu.reg32(Reg::reg32(index)).wrapping_mul(scale));
-            }
-            if !(m.mod_field == 0 && base == 5) {
-                ea = ea.wrapping_add(cpu.reg32(Reg::reg32(base)));
-            }
-        } else if m.mod_field != 3 && !(m.mod_field == 0 && m.rm == 5) {
-            // mod=00, rm=101 is disp32 with no base register.
-            ea = ea.wrapping_add(cpu.reg32(Reg::reg32(m.rm)));
-        }
-        if let Some(d32) = m.disp32 { ea = ea.wrapping_add(d32); }
-        ea
+        cpu.modrm_ea32(m).0
     } else {
-        let base = match m.rm {
-            0 => cpu.bx().wrapping_add(cpu.si()),
-            1 => cpu.bx().wrapping_add(cpu.di()),
-            2 => cpu.bp().wrapping_add(cpu.si()),
-            3 => cpu.bp().wrapping_add(cpu.di()),
-            4 => cpu.si(),
-            5 => cpu.di(),
-            6 => cpu.bp(),
-            _ => cpu.bx(),
-        };
-        let mut ea = base as u32;
-        if let Some(d8) = m.disp8 { ea = ea.wrapping_add(d8 as u32); }
-        if let Some(d16) = m.disp16 { ea = ea.wrapping_add(d16 as u32); }
-        ea
+        cpu.modrm_offset(m) as u64
     }
 }
 
@@ -3019,29 +3632,30 @@ fn lea_offset(m: &ModRm, cpu: &Cpu) -> u32 {
 /// silently shifting only the low byte.
 ///
 /// Rules worth stating, because they are easy to get subtly wrong:
-/// - The count is masked to 5 bits on 386+ **for every operand size**, so a
-///   16-bit shift by 20 shifts a 16-bit value 20 places (result 0) rather
-///   than wrapping the count. Rust's `wrapping_shl` masks the count to the
-///   type's width, which is *not* the same thing — so the shift is done in
-///   `u64` and truncated.
+/// - The count is masked to 5 bits on 386+ for every operand size **except
+///   64-bit, where it is masked to 6** -- otherwise `shl $32,%rax` would be a
+///   no-op instead of clearing the low half. Rust's `wrapping_shl` masks the
+///   count to the type's width, which is *not* the same thing as either — so
+///   the shift is done wide and truncated.
 /// - A count of 0 changes nothing, flags included.
 /// - RCL/RCR rotate through a `width + 1`-bit quantity (the operand plus CF),
 ///   so their effective count is taken modulo `width + 1` for 8- and 16-bit
 ///   operands. For 32-bit the 5-bit mask already keeps it in range.
 /// - OF is architecturally defined only for a count of 1; we leave it clear
 ///   otherwise, which is what the shape `n == 1 && ..` below expresses.
-fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
+fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u64, n: u32, width: u32) -> u64 {
     use flags::*;
-    let n = n & 0x1F;
+    let n = n & if width == 64 { 0x3F } else { 0x1F };
     if n == 0 { return v; }
-    let mask: u64 = if width == 32 { 0xFFFF_FFFF } else { (1u64 << width) - 1 };
-    let msb: u32 = 1u32 << (width - 1);
-    let v64 = v as u64 & mask;
+    let mask: u64 = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let msb: u64 = 1u64 << (width - 1);
+    let v = v & mask;
+    let v64 = v;
 
     match op {
         ShiftOp::Shl => {
             let wide = v64 << n.min(63);
-            let r = (wide & mask) as u32;
+            let r = wide & mask;
             let cf = n <= width && (v64 >> (width - n.min(width))) & 1 != 0;
             cpu.set_flag(CF, cf);
             set_logic_flags_width(cpu, r, width);
@@ -3050,7 +3664,7 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
             r
         }
         ShiftOp::Shr => {
-            let r = if n >= width { 0 } else { (v64 >> n) as u32 };
+            let r = if n >= width { 0 } else { v64 >> n };
             let cf = n <= width && (v64 >> (n - 1)) & 1 != 0;
             cpu.set_flag(CF, cf);
             set_logic_flags_width(cpu, r, width);
@@ -3062,7 +3676,7 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
             // Sign-extend to i64, shift, truncate. A count at or past the
             // width saturates to all-sign-bits, which the min() gives us.
             let sv = sign_extend(v, width);
-            let r = ((sv >> n.min(width - 1)) as u64 & mask) as u32;
+            let r = (sv >> n.min(width - 1)) as u64 & mask;
             let cf = ((sv >> (n - 1).min(width - 1)) & 1) != 0;
             cpu.set_flag(CF, cf);
             set_logic_flags_width(cpu, r, width);
@@ -3071,7 +3685,7 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
         }
         ShiftOp::Rol => {
             let k = n % width;
-            let r = if k == 0 { v } else { (((v64 << k) | (v64 >> (width - k))) & mask) as u32 };
+            let r = if k == 0 { v } else { ((v64 << k) | (v64 >> (width - k))) & mask };
             let cf = r & 1 != 0;
             cpu.set_flag(CF, cf);
             cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != cf));
@@ -3079,7 +3693,7 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
         }
         ShiftOp::Ror => {
             let k = n % width;
-            let r = if k == 0 { v } else { (((v64 >> k) | (v64 << (width - k))) & mask) as u32 };
+            let r = if k == 0 { v } else { ((v64 >> k) | (v64 << (width - k))) & mask };
             let cf = r & msb != 0;
             cpu.set_flag(CF, cf);
             // OF (count 1) = XOR of the two most significant result bits.
@@ -3088,10 +3702,24 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
             r
         }
         ShiftOp::Rcl | ShiftOp::Rcr => {
-            // Rotate through carry: a (width + 1)-bit quantity.
+            // Rotate through carry: a (width + 1)-bit quantity. At 64
+            // bits that quantity is 65 wide and does not fit in a u64, so
+            // the rotate is done with an explicit carry bit alongside.
             let bits = width + 1;
             let k = n % bits;
-            let wide = v64 | ((cpu.get_flag(CF) as u64) << width);
+            let carry = cpu.get_flag(CF) as u64;
+            if width == 64 {
+                let (r, cf) = rcl_rcr64(v64, carry, k, op == ShiftOp::Rcl);
+                cpu.set_flag(CF, cf);
+                if op == ShiftOp::Rcl {
+                    cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != cf));
+                } else {
+                    let second = (r >> (width - 2)) & 1 != 0;
+                    cpu.set_flag(OF, n == 1 && (((r & msb) != 0) != second));
+                }
+                return r;
+            }
+            let wide = v64 | (carry << width);
             let full: u64 = (1u64 << bits) - 1;
             let rot = if k == 0 {
                 wide
@@ -3100,7 +3728,7 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
             } else {
                 ((wide >> k) | (wide << (bits - k))) & full
             };
-            let r = (rot & mask) as u32;
+            let r = rot & mask;
             let cf = (rot >> width) & 1 != 0;
             cpu.set_flag(CF, cf);
             if op == ShiftOp::Rcl {
@@ -3115,21 +3743,48 @@ fn shift_width(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32, width: u32) -> u32 {
     }
 }
 
+/// Rotate a 65-bit quantity (a 64-bit operand plus the carry flag) left or
+/// right by `k`, returning the operand and the new carry.
+///
+/// It gets its own function because 65 bits do not fit anywhere: the trick
+/// the narrower widths use -- park the carry in bit `width` of a u64 -- has
+/// nowhere to park it here.
+fn rcl_rcr64(v: u64, carry: u64, k: u32, left: bool) -> (u64, bool) {
+    let mut val = v;
+    let mut c = carry != 0;
+    if left {
+        for _ in 0..k {
+            let out = val >> 63 != 0;
+            val = (val << 1) | (c as u64);
+            c = out;
+        }
+    } else {
+        for _ in 0..k {
+            let out = val & 1 != 0;
+            val = (val >> 1) | ((c as u64) << 63);
+            c = out;
+        }
+    }
+    (val, c)
+}
+
 /// Sign-extend the low `width` bits of `v` to i64.
-fn sign_extend(v: u32, width: u32) -> i64 {
+fn sign_extend(v: u64, width: u32) -> i64 {
     match width {
         8 => v as u8 as i8 as i64,
         16 => v as u16 as i16 as i64,
-        _ => v as i32 as i64,
+        32 => v as u32 as i32 as i64,
+        _ => v as i64,
     }
 }
 
 /// SF/ZF/PF for a result of the given width.
-fn set_logic_flags_width(cpu: &mut Cpu, r: u32, width: u32) {
+fn set_logic_flags_width(cpu: &mut Cpu, r: u64, width: u32) {
     match width {
         8 => set_logic_flags8(cpu, r as u8),
         16 => set_logic_flags16(cpu, r as u16),
-        _ => set_logic_flags32(cpu, r),
+        32 => set_logic_flags32(cpu, r as u32),
+        _ => set_logic_flags64(cpu, r),
     }
 }
 
@@ -3146,29 +3801,21 @@ enum BitOp { Test, Set, Reset, Complement }
 /// into an array that may run far past the addressed word -- which is exactly
 /// how the kernel's bitmaps (`test_bit`, `set_bit`) are addressed.
 fn bit_op(cpu: &mut Cpu, m: &ModRm, bit: BitOffset, op: BitOp) {
-    let width: i64 = if cpu.opsize { 32 } else { 16 };
+    let w = cpu.osize();
+    let width = w as i64;
     let offset: i64 = match bit {
         BitOffset::Imm(i) => i as i64,
-        BitOffset::Reg(r) => {
-            if cpu.opsize { cpu.reg32(Reg::reg32(r)) as i32 as i64 }
-            else { cpu.reg16(Reg::reg16(r)) as i16 as i64 }
-        }
+        BitOffset::Reg(r) => sign_extend(cpu.reg_w(r, w), w),
     };
 
     if m.is_reg() {
         // Register destination: the offset is taken modulo the width.
         let b = offset.rem_euclid(width) as u32;
-        let (old, new) = if cpu.opsize {
-            let v = cpu.reg32(Reg::reg32(m.rm));
-            (v >> b & 1 != 0, apply_bit(v, b, op))
-        } else {
-            let v = cpu.reg16(Reg::reg16(m.rm)) as u32;
-            (v >> b & 1 != 0, apply_bit(v, b, op))
-        };
+        let v = cpu.reg_w(m.rm, w);
+        let (old, new) = (v >> b & 1 != 0, apply_bit(v, b, op));
         cpu.set_flag(flags::CF, old);
         if op != BitOp::Test {
-            if cpu.opsize { cpu.set_reg32(Reg::reg32(m.rm), new); }
-            else { cpu.set_reg16(Reg::reg16(m.rm), new as u16); }
+            cpu.set_reg_w(m.rm, w, new);
         }
         return;
     }
@@ -3178,26 +3825,27 @@ fn bit_op(cpu: &mut Cpu, m: &ModRm, bit: BitOffset, op: BitOp) {
     let bytes = width / 8;
     let word = offset.div_euclid(width);
     let b = offset.rem_euclid(width) as u32;
-    let disp = (word * bytes) as i32;
-    let base = if cpu.addrsize { cpu.modrm_addr32_access_pub(m, op != BitOp::Test) }
-               else { cpu.modrm_addr_access_pub(m, op != BitOp::Test) };
+    let disp = (word * bytes) as i64;
+    let base = cpu.rm_addr(m, op != BitOp::Test);
     let addr = base.wrapping_add(disp as isize as usize);
 
-    let (old, new) = if cpu.opsize {
-        let v = cpu.mem.read_u32(addr);
-        (v >> b & 1 != 0, apply_bit(v, b, op))
-    } else {
-        let v = cpu.mem.read_u16(addr) as u32;
-        (v >> b & 1 != 0, apply_bit(v, b, op))
+    let v = match w {
+        64 => cpu.mem.read_u64(addr),
+        32 => cpu.mem.read_u32(addr) as u64,
+        _ => cpu.mem.read_u16(addr) as u64,
     };
+    let (old, new) = (v >> b & 1 != 0, apply_bit(v, b, op));
     cpu.set_flag(flags::CF, old);
     if op != BitOp::Test {
-        if cpu.opsize { cpu.mem.write_u32(addr, new); }
-        else { cpu.mem.write_u16(addr, new as u16); }
+        match w {
+            64 => cpu.mem.write_u64(addr, new),
+            32 => cpu.mem.write_u32(addr, new as u32),
+            _ => cpu.mem.write_u16(addr, new as u16),
+        }
     }
 }
 
-fn apply_bit(v: u32, b: u32, op: BitOp) -> u32 {
+fn apply_bit(v: u64, b: u32, op: BitOp) -> u64 {
     match op {
         BitOp::Test => v,
         BitOp::Set => v | (1 << b),
@@ -3212,39 +3860,40 @@ fn string_step(cpu: &Cpu, esize: u32) -> i32 {
 }
 
 /// Advance a string index register, wrapping at the address size.
-fn string_advance(v: u32, step: i32, a32: bool) -> u32 {
-    let n = v.wrapping_add(step as u32);
-    if a32 { n } else { n & 0xFFFF }
+fn string_advance(v: u64, step: i32, asize: u32) -> u64 {
+    let n = v.wrapping_add(step as i64 as u64);
+    match asize {
+        64 => n,
+        32 => n & 0xFFFF_FFFF,
+        _ => n & 0xFFFF,
+    }
 }
 
-fn string_si(cpu: &Cpu, a32: bool) -> u32 { if a32 { cpu.esi } else { cpu.si() as u32 } }
-fn string_di(cpu: &Cpu, a32: bool) -> u32 { if a32 { cpu.edi } else { cpu.di() as u32 } }
-fn string_set_si(cpu: &mut Cpu, a32: bool, v: u32) {
+fn string_si(cpu: &Cpu, asize: u32) -> u64 { cpu.reg_w(6, asize) }
+fn string_di(cpu: &Cpu, asize: u32) -> u64 { cpu.reg_w(7, asize) }
+fn string_set_si(cpu: &mut Cpu, asize: u32, v: u64) {
     // `_raw`: this write records *where the fault stopped*, so it has to land
     // even though a fault is pending.
-    if a32 { cpu.set_reg32_raw(Reg32::Esi, v); }
-    else { cpu.set_reg16_raw(Reg16::Si, v as u16); }
+    cpu.set_reg_w_raw(6, asize, v);
 }
-fn string_set_di(cpu: &mut Cpu, a32: bool, v: u32) {
-    if a32 { cpu.set_reg32_raw(Reg32::Edi, v); }
-    else { cpu.set_reg16_raw(Reg16::Di, v as u16); }
+fn string_set_di(cpu: &mut Cpu, asize: u32, v: u64) {
+    cpu.set_reg_w_raw(7, asize, v);
 }
 
 /// Iteration count: the count register under a REP prefix, one without.
 /// A REP with a zero count does nothing at all, which the `while cnt > 0`
 /// loops express directly.
-fn string_count(cpu: &Cpu, a32: bool, rep: Rep) -> u32 {
-    if rep == Rep::None { 1 } else if a32 { cpu.ecx } else { cpu.cx() as u32 }
+fn string_count(cpu: &Cpu, asize: u32, rep: Rep) -> u64 {
+    if rep == Rep::None { 1 } else { cpu.reg_w(1, asize) }
 }
-fn string_set_count(cpu: &mut Cpu, a32: bool, v: u32) {
-    if a32 { cpu.set_reg32_raw(Reg32::Ecx, v); }
-    else { cpu.set_reg16_raw(Reg16::Cx, v as u16); }
+fn string_set_count(cpu: &mut Cpu, asize: u32, v: u64) {
+    cpu.set_reg_w_raw(1, asize, v);
 }
 
 /// Should a REPE/REPNE comparison keep going? REP alone always continues
 /// (the count test is the loop condition); the conditional forms also stop
 /// on ZF.
-fn string_repeat(cpu: &Cpu, rep: Rep, remaining: u32) -> bool {
+fn string_repeat(cpu: &Cpu, rep: Rep, remaining: u64) -> bool {
     match rep {
         Rep::None => false,
         _ if remaining == 0 => false,
@@ -3255,32 +3904,20 @@ fn string_repeat(cpu: &Cpu, rep: Rep, remaining: u32) -> bool {
 
 /// Read the r/m operand at `width` bits, shift it, and write it back.
 fn do_shift(cpu: &mut Cpu, op: ShiftOp, m: &ModRm, width: u32, n: u32) {
-    match width {
-        8 => { let v = cpu.read_rm8(m); let r = shift8(cpu, op, v, n); cpu.write_rm8(m, r); }
-        16 => { let v = cpu.read_rm16(m); let r = shift16(cpu, op, v, n); cpu.write_rm16(m, r); }
-        _ => { let v = cpu.read_rm32(m); let r = shift32(cpu, op, v, n); cpu.write_rm32(m, r); }
-    }
+    let v = cpu.read_rm_w(m, width);
+    let r = shift_width(cpu, op, v, n, width);
+    cpu.write_rm_w(m, width, r);
 }
 
-fn shift8(cpu: &mut Cpu, op: ShiftOp, v: u8, n: u32) -> u8 {
-    shift_width(cpu, op, v as u32, n, 8) as u8
-}
 
 /// Perform a 16-bit shift/rotate, setting flags, and return the result.
-fn shift16(cpu: &mut Cpu, op: ShiftOp, v: u16, n: u32) -> u16 {
-    shift_width(cpu, op, v as u32, n, 16) as u16
-}
 
 /// Perform a 32-bit shift/rotate, setting flags, and return the result.
-fn shift32(cpu: &mut Cpu, op: ShiftOp, v: u32, n: u32) -> u32 {
-    shift_width(cpu, op, v, n, 32)
-}
-
-use crate::memory::Memory;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::Memory;
     use crate::cpu::{Cpu, flags};
     use crate::protected::Descriptor;
 
@@ -3621,7 +4258,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 0x12345678);
+        assert_eq!(cpu.eax(), 0x12345678);
         assert_eq!(cpu.ax(), 0x5678);
     }
 
@@ -3635,7 +4272,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 3);
+        assert_eq!(cpu.eax(), 3);
     }
 
     #[test]
@@ -3650,8 +4287,8 @@ mod tests {
         ]);
         cpu.run(16);
         // 0x10000000 * 0x10 = 0x100000000 -> EAX=0, EDX=1
-        assert_eq!(cpu.eax, 0);
-        assert_eq!(cpu.edx, 1);
+        assert_eq!(cpu.eax(), 0);
+        assert_eq!(cpu.edx(), 1);
     }
 
     #[test]
@@ -3662,14 +4299,14 @@ mod tests {
         // modrm = 00 000 100 (reg=EAX, rm=100 -> SIB follows)
         // sib = 10 000 101 (scale=4, index=EAX, base=101 -> disp32)
         // disp32 = 0x1000
-        cpu.eax = 0x10;
+        cpu.set_eax(0x10);
         cpu.mem.write_u32(0x1000 + 0x10 * 4, 0xDEADBEEF);
         load(&mut cpu, &[
             0x66, 0x67, 0x8B, 0x04, 0x85, 0x00, 0x10, 0x00, 0x00,
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 0xDEADBEEF);
+        assert_eq!(cpu.eax(), 0xDEADBEEF);
     }
 
     #[test]
@@ -3711,7 +4348,7 @@ mod tests {
         // DS base should be 0x10000.
         assert_eq!(cpu.seg_desc[SegReg::Ds as usize].base, 0x10000);
         // Translate DS:0x1234 -> 0x11234.
-        assert_eq!(cpu.translate(SegReg::Ds, 0x1234), 0x11234);
+        assert_eq!(cpu.translate(SegReg::Ds, (0x1234) as u64), 0x11234);
     }
 
     #[test]
@@ -3719,7 +4356,7 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.pe = true;
         cpu.ss = 0;
-        cpu.esp = 0x0100;
+        cpu.set_esp(0x0100);
         // IDT at 0x3000, vector 0x20 entry at 0x3000 + 0x20*8 = 0x3100.
         // offset_lo = 0x5000, selector = 0x08, offset_hi = 0x0000.
         cpu.idt_base = 0x3000;
@@ -3739,11 +4376,11 @@ mod tests {
             0xF4,
         ]);
         cpu.cs = 0x08;
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         cpu.run(32);
-        assert_eq!(cpu.eax, 0x99);
+        assert_eq!(cpu.eax(), 0x99);
         assert!(cpu.halted);
-        assert_eq!(cpu.esp, 0x0100);
+        assert_eq!(cpu.esp(), 0x0100);
     }
 
     #[test]
@@ -3753,9 +4390,9 @@ mod tests {
         cpu.cs = 0x08;
         // Flat 32-bit code segment (D=1) so opsize defaults to 32-bit.
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // mov ecx, 3 ; loop $ (E2 FE) ; hlt
         // (no 0x66 prefix: opsize already 32-bit in this segment)
         cpu.mem.load(0x1000, &[
@@ -3765,8 +4402,8 @@ mod tests {
         ]);
         cpu.run(64);
         assert!(cpu.halted);
-        assert_eq!(cpu.ecx, 0);
-        assert_eq!(cpu.eip, 0x1008);
+        assert_eq!(cpu.ecx(), 0);
+        assert_eq!(cpu.eip(), 0x1008);
     }
 
     #[test]
@@ -3775,9 +4412,9 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // mov eax, 1 ; test eax, eax ; jz +1 (74 01) ; hlt ; hlt
         cpu.mem.load(0x1000, &[
             0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
@@ -3789,7 +4426,7 @@ mod tests {
         cpu.run(32);
         assert!(cpu.halted);
         // mov(5) + test(2) + jz(2) = 0x1009, then hlt advances to 0x100A.
-        assert_eq!(cpu.eip, 0x100A);
+        assert_eq!(cpu.eip(), 0x100A);
     }
 
     #[test]
@@ -3798,9 +4435,9 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // jmp +1 (EB 01) over a hlt, landing on a second hlt.
         cpu.mem.load(0x1000, &[
             0xEB, 0x01, // jmp +1
@@ -3809,7 +4446,7 @@ mod tests {
         ]);
         cpu.run(32);
         assert!(cpu.halted);
-        assert_eq!(cpu.eip, 0x1004);
+        assert_eq!(cpu.eip(), 0x1004);
     }
 
     #[test]
@@ -3818,22 +4455,22 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
         cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         // Far pointer at 0x2000: offset=0x8000, selector=0x10.
         cpu.mem.write_u32(0x2000, 0x8000);
         cpu.mem.write_u16(0x2004, 0x10);
         // lss eax, [0x2000] = 0F B2 05 disp32
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         cpu.mem.load(0x1000, &[
             0x0F, 0xB2, 0x05, 0x00, 0x20, 0x00, 0x00, // lss eax, [0x2000]
             0xF4,
         ]);
         cpu.run(32);
-        assert_eq!(cpu.eax, 0x8000);
+        assert_eq!(cpu.eax(), 0x8000);
         assert_eq!(cpu.ss, 0x10);
         assert!(cpu.halted);
     }
@@ -3844,16 +4481,16 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
         cpu.seg_desc[SegReg::Es as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
-        cpu.ecx = 4;
-        cpu.edi = 0x3000;
-        cpu.eax = 0xDEADBEEF;
+        cpu.set_ecx(4);
+        cpu.set_edi(0x3000);
+        cpu.set_eax(0xDEADBEEF);
         // rep stosd (F3 AB) ; hlt
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         cpu.mem.load(0x1000, &[
             0xF3, 0xAB,
             0xF4,
@@ -3863,8 +4500,8 @@ mod tests {
         for i in 0..4 {
             assert_eq!(cpu.mem.read_u32(0x3000 + i * 4), 0xDEADBEEF);
         }
-        assert_eq!(cpu.ecx, 0);
-        assert_eq!(cpu.edi, 0x3010);
+        assert_eq!(cpu.ecx(), 0);
+        assert_eq!(cpu.edi(), 0x3010);
         assert!(cpu.halted);
     }
 
@@ -3977,10 +4614,10 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 1); // highest basic leaf
-        assert_eq!(cpu.ebx, 0x756E6547); // "Genu"
-        assert_eq!(cpu.edx, 0x49656E69); // "ineI"
-        assert_eq!(cpu.ecx, 0x6C65746E); // "ntel"
+        assert_eq!(cpu.eax(), 1); // highest basic leaf
+        assert_eq!(cpu.ebx(), 0x756E6547); // "Genu"
+        assert_eq!(cpu.edx(), 0x49656E69); // "ineI"
+        assert_eq!(cpu.ecx(), 0x6C65746E); // "ntel"
     }
 
     #[test]
@@ -3994,9 +4631,9 @@ mod tests {
         ]);
         cpu.run(16);
         // Family 6, model 0, stepping 0.
-        assert_eq!(cpu.eax, 0x00000600);
+        assert_eq!(cpu.eax(), 0x00000600);
         // TSC bit (bit 4) must be set in EDX.
-        assert!(cpu.edx & (1 << 4) != 0);
+        assert!(cpu.edx() & (1 << 4) != 0);
     }
 
     #[test]
@@ -4009,8 +4646,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 0x9ABC_DEF0);
-        assert_eq!(cpu.edx, 0x1234_5678);
+        assert_eq!(cpu.eax(), 0x9ABC_DEF0);
+        assert_eq!(cpu.edx(), 0x1234_5678);
     }
 
     #[test]
@@ -4038,8 +4675,8 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 0);
-        assert_eq!(cpu.edx, 0);
+        assert_eq!(cpu.eax(), 0);
+        assert_eq!(cpu.edx(), 0);
     }
 
     #[test]
@@ -4052,24 +4689,27 @@ mod tests {
             0xF4,
         ]);
         cpu.run(16);
-        assert_eq!(cpu.eax, 0x8); // bit 3 set
+        assert_eq!(cpu.eax(), 0x8); // bit 3 set
         assert!(!cpu.get_flag(flags::CF)); // was 0 before
     }
 
     #[test]
     fn mov_moffs32_uses_addrsize() {
-        let mut cpu = Cpu::new();
+        // 0x12345678 is past the default 128 MiB, so this also pins that a
+        // machine can be built with enough RAM to reach it -- it used to
+        // "work" only because every address was masked back into the store.
+        let mut cpu = Cpu::with_ram(320 << 20);
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
         cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         // mov [0x12345678], al (A2 moffs32) ; hlt
         // In 32-bit addressing mode the moffs is 32-bit.
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         cpu.mem.load(0x1000, &[
             0xA2, 0x78, 0x56, 0x34, 0x12,
             0xF4,
@@ -4086,9 +4726,9 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // mov eax, 1 ; test eax, eax ; jz rel32 (0F 84) not taken ; hlt
         cpu.mem.load(0x1000, &[
             0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
@@ -4100,7 +4740,7 @@ mod tests {
         cpu.run(32);
         assert!(cpu.halted);
         // mov(5) + test(2) + jz(6) = 0x100D, then hlt advances to 0x100E.
-        assert_eq!(cpu.eip, 0x100E);
+        assert_eq!(cpu.eip(), 0x100E);
     }
 
     #[test]
@@ -4109,9 +4749,9 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // movzx eax, al (0F B6 C0) ; hlt
         cpu.mem.load(0x1000, &[
             0x0F, 0xB6, 0xC0,
@@ -4119,7 +4759,7 @@ mod tests {
         ]);
         cpu.set_reg8(Reg8::Al, 0xFF);
         cpu.run(32);
-        assert_eq!(cpu.eax, 0xFF);
+        assert_eq!(cpu.eax(), 0xFF);
         assert!(cpu.halted);
     }
 
@@ -4129,9 +4769,9 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.seg_desc[SegReg::Cs as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false,
         };
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         // movsx eax, al (0F BE C0) ; hlt
         cpu.mem.load(0x1000, &[
             0x0F, 0xBE, 0xC0,
@@ -4139,7 +4779,7 @@ mod tests {
         ]);
         cpu.set_reg8(Reg8::Al, 0xFF);
         cpu.run(32);
-        assert_eq!(cpu.eax, 0xFFFF_FFFF);
+        assert_eq!(cpu.eax(), 0xFFFF_FFFF);
         assert!(cpu.halted);
     }
 
@@ -4169,7 +4809,7 @@ mod tests {
         ]);
         cpu.run(16);
         assert_eq!(cpu.cr3, 0x12345000);
-        assert_eq!(cpu.ebx, 0x12345000);
+        assert_eq!(cpu.ebx(), 0x12345000);
     }
 
     #[test]
@@ -4178,7 +4818,7 @@ mod tests {
         cpu.pe = true;
         // Flat data segment: base 0, limit 4 GiB.
         cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         // Page directory at 0x1000, page table at 0x2000.
         // Map linear 0x0040_0000 (PD 1, PT 0) to physical 0x1000.
@@ -4188,7 +4828,7 @@ mod tests {
         cpu.cr0 = 0x8000_0000; // PG set
         // Write a value at physical 0x1000, read it via linear 0x0040_0000.
         cpu.mem.write_u32(0x1000, 0xCAFEBABE);
-        let phys = cpu.translate(SegReg::Ds, 0x0040_0000);
+        let phys = cpu.translate(SegReg::Ds, (0x0040_0000) as u64);
         assert_eq!(phys, 0x1000);
         assert_eq!(cpu.mem.read_u32(phys), 0xCAFEBABE);
     }
@@ -4198,11 +4838,11 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.pe = true;
         cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         // PG clear: linear == physical.
         cpu.cr0 = 0;
-        assert_eq!(cpu.translate(SegReg::Ds, 0x1234), 0x1234);
+        assert_eq!(cpu.translate(SegReg::Ds, (0x1234) as u64), 0x1234);
     }
 
     // ---- Exception tests ----
@@ -4317,10 +4957,10 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.pe = true;
         cpu.ss = 0;
-        cpu.esp = 0x0100;
+        cpu.set_esp(0x0100);
         // Flat data segment: base 0.
         cpu.seg_desc[SegReg::Ds as usize] = Descriptor {
-            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         // IDT at 0x3000, vector 0x0E (#PF) entry at 0x3000 + 0x0E*8 = 0x3070.
         cpu.idt_base = 0x3000;
@@ -4354,10 +4994,10 @@ mod tests {
             0xF4,
         ]);
         cpu.cs = 0x08;
-        cpu.eip = 0x1000;
+        cpu.set_eip(0x1000);
         cpu.run(32);
         // The #PF handler ran: EAX = 0xCAFE.
-        assert_eq!(cpu.eax, 0xCAFE);
+        assert_eq!(cpu.eax(), 0xCAFE);
         // CR2 holds the faulting linear address.
         assert_eq!(cpu.cr2, 0x0040_0000);
         assert!(cpu.halted);
@@ -4380,14 +5020,14 @@ mod tests {
         cpu.pe = true;
         cpu.cs = 0x08;
         cpu.ss = 0x10;
-        let code = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true };
-        let data = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true };
+        let code = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x9A, g: true, d_b: true, l: false };
+        let data = Descriptor { base: 0, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false };
         cpu.seg_desc[SegReg::Cs as usize] = code;
         for s in [SegReg::Ds, SegReg::Es, SegReg::Ss, SegReg::Fs, SegReg::Gs] {
             cpu.seg_desc[s as usize] = data;
         }
-        cpu.eip = 0x1000;
-        cpu.esp = 0x8000;
+        cpu.set_eip(0x1000);
+        cpu.set_esp(0x8000);
         cpu
     }
 
@@ -4408,8 +5048,8 @@ mod tests {
             0x39, 0xD8,                   // cmp eax, ebx
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 10, "CMP must not modify its destination");
-        assert_eq!(cpu.ebx, 3);
+        assert_eq!(cpu.eax(), 10, "CMP must not modify its destination");
+        assert_eq!(cpu.ebx(), 3);
         assert!(!cpu.get_flag(flags::ZF));
         assert!(!cpu.get_flag(flags::CF));
     }
@@ -4422,7 +5062,7 @@ mod tests {
             0x3B, 0xC3,                   // cmp eax, ebx  (Dir::RegRm)
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 3);
+        assert_eq!(cpu.eax(), 3);
         assert!(cpu.get_flag(flags::CF), "3 - 10 borrows");
     }
 
@@ -4437,7 +5077,7 @@ mod tests {
             0xD3, 0xEA,                   // shr edx, cl
             0xF4,
         ]);
-        assert_eq!(cpu.edx, 0x0E11_A000);
+        assert_eq!(cpu.edx(), 0x0E11_A000);
     }
 
     #[test]
@@ -4449,8 +5089,8 @@ mod tests {
             0xC1, 0xEB, 0x01,             // shr ebx, 1
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 0x4000_0000);
-        assert_eq!(cpu.ebx, 0x4000_0000);
+        assert_eq!(cpu.eax(), 0x4000_0000);
+        assert_eq!(cpu.ebx(), 0x4000_0000);
     }
 
     #[test]
@@ -4475,7 +5115,7 @@ mod tests {
             0xC1, 0xF8, 0x04,             // sar eax, 4
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 0xF800_0000);
+        assert_eq!(cpu.eax(), 0xF800_0000);
     }
 
     #[test]
@@ -4491,7 +5131,7 @@ mod tests {
         // Worked through as a 33-bit rotate: (CF:EAX) = 0_80000001 rotated
         // left twice gives 0_00000005, so EAX = 5 and CF comes back clear.
         // A plain 32-bit rotate would give 6 and lose the carry.
-        assert_eq!(cpu.eax, 0x0000_0005);
+        assert_eq!(cpu.eax(), 0x0000_0005);
         assert!(!cpu.get_flag(flags::CF));
     }
 
@@ -4508,10 +5148,10 @@ mod tests {
             0x61,                         // popad
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 0x1111_1111);
-        assert_eq!(cpu.ebx, 0x2222_2222);
-        assert_eq!(cpu.ecx, 0x3333_3333);
-        assert_eq!(cpu.esp, 0x8000, "POPAD must restore the stack pointer");
+        assert_eq!(cpu.eax(), 0x1111_1111);
+        assert_eq!(cpu.ebx(), 0x2222_2222);
+        assert_eq!(cpu.ecx(), 0x3333_3333);
+        assert_eq!(cpu.esp(), 0x8000, "POPAD must restore the stack pointer");
     }
 
     #[test]
@@ -4522,7 +5162,7 @@ mod tests {
             0xF4,
         ]);
         assert_eq!(cpu.mem.read_u32(0x3000), 0xDEAD_BEEF);
-        assert_eq!(cpu.esp, 0x8000);
+        assert_eq!(cpu.esp(), 0x8000);
     }
 
     #[test]
@@ -4532,7 +5172,7 @@ mod tests {
             0x6A, 0xFF, // push -1
             0xF4,
         ]);
-        assert_eq!(cpu.esp, 0x7FFC);
+        assert_eq!(cpu.esp(), 0x7FFC);
         assert_eq!(cpu.mem.read_u32(0x7FFC), 0xFFFF_FFFF, "sign-extended");
     }
 
@@ -4545,8 +5185,8 @@ mod tests {
             0x0F, 0x95, 0xC7,             // setne bh
             0xF4,
         ]);
-        assert_eq!(cpu.ebx & 0xFF, 1);
-        assert_eq!((cpu.ebx >> 8) & 0xFF, 0);
+        assert_eq!(cpu.ebx() & 0xFF, 1);
+        assert_eq!((cpu.ebx() >> 8) & 0xFF, 0);
     }
 
     #[test]
@@ -4558,8 +5198,8 @@ mod tests {
             0x0F, 0xAF, 0xC8,             // imul ecx, eax
             0xF4,
         ]);
-        assert_eq!(cpu.ebx, 42);
-        assert_eq!(cpu.ecx, 21);
+        assert_eq!(cpu.ebx(), 42);
+        assert_eq!(cpu.ecx(), 21);
     }
 
     #[test]
@@ -4569,7 +5209,7 @@ mod tests {
             0x6B, 0xC0, 0x04,             // imul eax, eax, 4
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 0, "low half of the product");
+        assert_eq!(cpu.eax(), 0, "low half of the product");
         assert!(cpu.get_flag(flags::CF));
         assert!(cpu.get_flag(flags::OF));
     }
@@ -4584,7 +5224,7 @@ mod tests {
             0xF4,
         ]);
         // eax >> 4, with edx's low nibble shifted into the top.
-        assert_eq!(cpu.eax, 0x0000_FFFF);
+        assert_eq!(cpu.eax(), 0x0000_FFFF);
     }
 
     #[test]
@@ -4595,8 +5235,8 @@ mod tests {
             0x0F, 0xBD, 0xC8,             // bsr ecx, eax
             0xF4,
         ]);
-        assert_eq!(cpu.ebx, 8);
-        assert_eq!(cpu.ecx, 24);
+        assert_eq!(cpu.ebx(), 8);
+        assert_eq!(cpu.ecx(), 24);
         assert!(!cpu.get_flag(flags::ZF));
     }
 
@@ -4609,7 +5249,7 @@ mod tests {
             0xF4,
         ]);
         assert!(cpu.get_flag(flags::ZF));
-        assert_eq!(cpu.ebx, 0x99);
+        assert_eq!(cpu.ebx(), 0x99);
     }
 
     #[test]
@@ -4666,7 +5306,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(64);
-        assert_eq!(cpu.eax, 0xAAAA_AAAA);
+        assert_eq!(cpu.eax(), 0xAAAA_AAAA);
         assert_eq!(cpu.mem.read_u32(0x3000), 0xBBBB_BBBB);
     }
 
@@ -4697,7 +5337,7 @@ mod tests {
         ]);
         cpu.run(64);
         assert!(!cpu.get_flag(flags::ZF));
-        assert_eq!(cpu.eax, 7, "accumulator takes the destination's value");
+        assert_eq!(cpu.eax(), 7, "accumulator takes the destination's value");
         assert_eq!(cpu.mem.read_u32(0x3000), 7, "destination unchanged");
     }
 
@@ -4711,7 +5351,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(64);
-        assert_eq!(cpu.ebx, 10, "source register gets the old destination");
+        assert_eq!(cpu.ebx(), 10, "source register gets the old destination");
         assert_eq!(cpu.mem.read_u32(0x3000), 15);
     }
 
@@ -4741,7 +5381,7 @@ mod tests {
             0x0F, 0xC8,                   // bswap eax
             0xF4,
         ]);
-        assert_eq!(cpu.eax, 0x7856_3412);
+        assert_eq!(cpu.eax(), 0x7856_3412);
     }
 
     #[test]
@@ -4754,7 +5394,7 @@ mod tests {
             0x0F, 0x45, 0xD8,             // cmovne ebx, eax  (taken)
             0xF4,
         ]);
-        assert_eq!(cpu.ebx, 1);
+        assert_eq!(cpu.ebx(), 1);
     }
 
     #[test]
@@ -4767,8 +5407,8 @@ mod tests {
             0xC9,                         // leave
             0xF4,
         ]);
-        assert_eq!(cpu.ebp, 0x7000);
-        assert_eq!(cpu.esp, 0x8000);
+        assert_eq!(cpu.ebp(), 0x7000);
+        assert_eq!(cpu.esp(), 0x8000);
     }
 
     #[test]
@@ -4780,7 +5420,7 @@ mod tests {
             0xC2, 0x04, 0x00,             // ret 4
         ]);
         assert!(cpu.halted);
-        assert_eq!(cpu.esp, 0x8000, "the pushed argument was dropped too");
+        assert_eq!(cpu.esp(), 0x8000, "the pushed argument was dropped too");
     }
 
     #[test]
@@ -4837,8 +5477,8 @@ mod tests {
             0x5B,                               // pop ebx
             0xF4,
         ]);
-        assert_eq!(cpu.ebx & 0x0020_0000, 0x0020_0000, "ID bit is writable");
-        assert_eq!(cpu.esp, 0x8000);
+        assert_eq!(cpu.ebx() & 0x0020_0000, 0x0020_0000, "ID bit is writable");
+        assert_eq!(cpu.esp(), 0x8000);
     }
 
     #[test]
@@ -4851,7 +5491,7 @@ mod tests {
             0xF4,
         ]);
         assert!(cpu.unknown_ops.is_empty());
-        assert_eq!(cpu.esp, 0x8000);
+        assert_eq!(cpu.esp(), 0x8000);
     }
 
     #[test]
@@ -4862,7 +5502,7 @@ mod tests {
             0x0F, 0x21, 0xFB,             // mov ebx, dr7
             0xF4,
         ]);
-        assert_eq!(cpu.ebx, 0x55);
+        assert_eq!(cpu.ebx(), 0x55);
     }
 
     #[test]
@@ -4871,7 +5511,7 @@ mod tests {
         // Translating it through DS instead reads address 0xC.
         let mut cpu = flat32();
         cpu.seg_desc[SegReg::Gs as usize] = Descriptor {
-            base: 0x5000, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true,
+            base: 0x5000, limit: 0xFFFF_FFFF, attr: 0x92, g: true, d_b: true, l: false,
         };
         cpu.mem.write_u32(0x500C, 0xFEED_FACE);
         cpu.mem.write_u32(0x000C, 0xDEAD_0000);
@@ -4880,7 +5520,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(64);
-        assert_eq!(cpu.eax, 0xFEED_FACE);
+        assert_eq!(cpu.eax(), 0xFEED_FACE);
     }
 
     #[test]
@@ -4924,7 +5564,7 @@ mod tests {
         for i in 0..8 {
             cpu.mem.write_u8(0x41000 + i, 0x77);
         }
-        cpu.eip = 0x10000 + 0x1000 - 6;
+        cpu.set_eip(0x10000 + 0x1000 - 6);
         cpu.run(16);
         assert_eq!(cpu.mem.read_u32(0x3000), 0xAABB_CCDD);
     }
@@ -4959,7 +5599,7 @@ mod tests {
         ]);
         cpu.run(64);
         assert_eq!(cpu.cr2, 0x0003_0000, "the faulting address");
-        assert_eq!(cpu.edx, 10, "EDX must be untouched by the faulted add");
+        assert_eq!(cpu.edx(), 10, "EDX must be untouched by the faulted add");
     }
 
     #[test]
@@ -4994,8 +5634,8 @@ mod tests {
         ]);
         cpu.run(64);
         assert_eq!(cpu.cr2 & !0xFFF, 0x0001_0000, "faulted on the next page");
-        assert_eq!(cpu.edi, 0x1_0000, "EDI stops at the faulting element");
-        assert_eq!(cpu.ecx, 0x100 - 0x40, "and so does the count");
+        assert_eq!(cpu.edi(), 0x1_0000, "EDI stops at the faulting element");
+        assert_eq!(cpu.ecx(), 0x100 - 0x40, "and so does the count");
         // Everything before the fault really was written.
         assert_eq!(cpu.mem.read_u32(0xFFFC), 0xFFFF_FFFF);
     }
@@ -5079,7 +5719,7 @@ mod tests {
             0xF4,
         ]);
         cpu.run(32);
-        let esp = cpu.esp as usize;
+        let esp = cpu.esp() as usize;
         assert_eq!(cpu.mem.read_u32(esp), 0, "error code: not present, read");
         assert_eq!(cpu.mem.read_u32(esp + 4), 0x1000, "EIP: the faulting insn");
         assert_eq!(cpu.mem.read_u32(esp + 8), 0x08, "CS");
@@ -5098,7 +5738,7 @@ mod tests {
             0xB1, 0x04,                   // mov cl, 4
             0xF4,
         ]);
-        assert_eq!(cpu.ecx, 4, "CL must write into the register ECX shares");
+        assert_eq!(cpu.ecx(), 4, "CL must write into the register ECX shares");
     }
 
     #[test]
@@ -5125,6 +5765,626 @@ mod tests {
         cpu.set_flag(flags::IF, true);
         cpu.run(4096);
         assert_eq!(cpu.ax(), 0x42, "the timer woke the halted CPU");
+    }
+
+    // ================================================================
+    // Long mode (64-bit)
+    // ================================================================
+    //
+    // Every test here starts from the real boot path (`boot::load_flat64`),
+    // so it exercises the same long-mode entry a payload would get: PAE on,
+    // a 4-level page table identity-mapping the low 4 GiB, EFER.LME set,
+    // paging enabled, and a code segment with L set.
+
+    /// Where `long_cpu` loads its code.
+    const CODE64: u64 = 0x10_0000;
+
+    fn long_cpu(code: &[u8]) -> Cpu {
+        let mut cpu = Cpu::new();
+        crate::boot::load_flat64(&mut cpu, code, CODE64).unwrap();
+        cpu
+    }
+
+    /// Run until HLT, with a bound so a broken test fails instead of hanging.
+    fn run64(code: &[u8]) -> Cpu {
+        let mut cpu = long_cpu(code);
+        cpu.run(4096);
+        assert!(cpu.halted, "did not reach HLT (rip={:016X})", cpu.rip);
+        assert!(!cpu.triple_fault, "triple faulted at rip={:016X}", cpu.rip);
+        cpu
+    }
+
+    #[test]
+    fn entering_long_mode_takes_four_steps_in_order() {
+        let cpu = long_cpu(&[0xF4]);
+        // CR4.PAE, CR3, EFER.LME, CR0.PG -- and LMA set by the hardware in
+        // response to the last of them, not by software.
+        assert_ne!(cpu.cr4 & crate::cpu::CR4_PAE, 0, "PAE");
+        assert_ne!(cpu.cr0 & crate::cpu::CR0_PG, 0, "paging");
+        assert_ne!(cpu.efer & crate::cpu::efer::LME, 0, "LME");
+        assert_ne!(cpu.efer & crate::cpu::efer::LMA, 0, "LMA was not set by the CPU");
+        assert!(cpu.long_mode() && cpu.long64());
+        assert_eq!(cpu.mode(), crate::cpu::Mode::Long);
+        assert_eq!(cpu.paging_mode(), crate::paging::PagingMode::Long);
+        // The code segment is 64-bit: L set, D/B clear. Both set is illegal.
+        let cs = cpu.seg_desc[SegReg::Cs as usize];
+        assert!(cs.l && !cs.d_b);
+    }
+
+    #[test]
+    fn clearing_paging_leaves_long_mode() {
+        // LMA follows CR0.PG. `mov %rax,%cr0` with PG cleared drops the CPU
+        // out of long mode, which is what a kernel does on the way to a
+        // reboot or a 32-bit trampoline.
+        let mut cpu = long_cpu(&[0xF4]);
+        assert!(cpu.long_mode());
+        cpu.cr0 &= !crate::cpu::CR0_PG;
+        cpu.update_long_mode();
+        assert!(!cpu.long_mode());
+        assert_eq!(cpu.mode(), crate::cpu::Mode::Protected);
+    }
+
+    #[test]
+    fn rex_w_makes_the_operand_64_bits() {
+        // movabs $0x0123456789ABCDEF,%rax ; mov %rax,%rbx ; add %rax,%rbx ; hlt
+        let cpu = run64(&[
+            0x48, 0xB8, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+            0x48, 0x89, 0xC3,
+            0x48, 0x01, 0xC3,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 0x0123_4567_89AB_CDEF);
+        assert_eq!(cpu.reg64(3), 0x0123_4567_89AB_CDEFu64.wrapping_mul(2));
+    }
+
+    #[test]
+    fn rex_b_reaches_the_registers_rex_added() {
+        // mov $0x1234,%eax ; mov %rax,%r8 ; mov %r8,%r15 ; hlt
+        let cpu = run64(&[
+            0xB8, 0x34, 0x12, 0x00, 0x00,
+            0x49, 0x89, 0xC0,
+            0x4D, 0x89, 0xC7,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(8), 0x1234, "R8");
+        assert_eq!(cpu.reg64(15), 0x1234, "R15");
+    }
+
+    #[test]
+    fn a_32_bit_write_zero_extends_but_a_16_bit_one_does_not() {
+        // The asymmetry is x86-64's, and code generated for it depends on
+        // both halves: `mov $0,%eax` is the idiomatic way to clear RAX.
+        // movabs $-1,%rax ; mov $1,%eax ; hlt
+        let cpu = run64(&[
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 1, "a 32-bit write must clear the high half");
+
+        // movabs $-1,%rax ; mov $1,%ax ; hlt
+        let cpu = run64(&[
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x66, 0xB8, 0x01, 0x00,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 0xFFFF_FFFF_FFFF_0001,
+            "a 16-bit write must leave the bits above it alone");
+    }
+
+    #[test]
+    fn rip_relative_addressing_measures_from_the_end_of_the_instruction() {
+        // mov 0x9(%rip),%rax ; hlt ; <8 bytes of data>
+        //
+        // The displacement is from the *next* instruction, so it has to skip
+        // the HLT: seven bytes of MOV, one of HLT, and the data follows.
+        let mut code = vec![
+            0x48, 0x8B, 0x05, 0x01, 0x00, 0x00, 0x00, // mov 1(%rip),%rax
+            0xF4,                                     // hlt
+        ];
+        code.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
+        let cpu = run64(&code);
+        assert_eq!(cpu.reg64(0), 0xDEAD_BEEF_CAFE_F00D);
+    }
+
+    #[test]
+    fn lea_computes_a_rip_relative_address_without_reading_it() {
+        // lea 0x10(%rip),%rax ; hlt
+        let cpu = run64(&[
+            0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), CODE64 + 7 + 0x10);
+    }
+
+    #[test]
+    fn movsxd_sign_extends_a_32_bit_value() {
+        // mov $-2,%ecx ; movslq %ecx,%rax ; hlt
+        let cpu = run64(&[
+            0xB9, 0xFE, 0xFF, 0xFF, 0xFF,
+            0x48, 0x63, 0xC1,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 0xFFFF_FFFF_FFFF_FFFE);
+        // ECX itself was zero-extended by its own 32-bit write, so the value
+        // MOVSXD widened came from the low half alone.
+        assert_eq!(cpu.reg64(1), 0xFFFF_FFFE);
+    }
+
+    #[test]
+    fn push_and_pop_are_eight_bytes_wide_and_not_overridable() {
+        // movabs $0x1122334455667788,%rax ; push %rax ; pop %rbx ; hlt
+        let mut cpu = long_cpu(&[
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            0x50,
+            0x5B,
+            0xF4,
+        ]);
+        let rsp0 = cpu.rsp();
+        cpu.run(4096);
+        assert_eq!(cpu.reg64(3), 0x1122_3344_5566_7788);
+        assert_eq!(cpu.rsp(), rsp0, "the stack came back to where it started");
+    }
+
+    #[test]
+    fn a_call_pushes_a_64_bit_return_address() {
+        // call +1 ; hlt ; mov $7,%eax ; ret
+        let cpu = run64(&[
+            0xE8, 0x01, 0x00, 0x00, 0x00, // call .+1 (past the hlt)
+            0xF4,                         // hlt
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov $7,%eax
+            0xC3,                         // ret
+        ]);
+        assert_eq!(cpu.reg64(0), 7);
+        assert_eq!(cpu.rip, CODE64 + 6, "returned to the instruction after the call");
+    }
+
+    #[test]
+    fn shifts_take_a_six_bit_count_at_64_bit_width() {
+        // A 5-bit mask would make `shl $32,%rax` a no-op, leaving the value
+        // where it was instead of moving it into the high half.
+        // mov $1,%eax ; shl $32,%rax ; hlt
+        let cpu = run64(&[
+            0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0xC1, 0xE0, 0x20,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 1u64 << 32);
+    }
+
+    #[test]
+    fn arithmetic_flags_are_computed_at_the_full_width() {
+        // movabs $-1,%rax ; add $1,%rax ; hlt  -> zero, with a carry out.
+        let cpu = run64(&[
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x48, 0x83, 0xC0, 0x01,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 0);
+        assert!(cpu.get_flag(flags::ZF));
+        assert!(cpu.get_flag(flags::CF), "the carry out of bit 63");
+        // The same addition at 32 bits would have carried out of bit 31 long
+        // before, which is the bug a masked-to-32 implementation produces.
+        assert!(!cpu.get_flag(flags::SF));
+    }
+
+    #[test]
+    fn multiply_and_divide_use_the_full_128_bit_intermediate() {
+        // movabs $0x100000000,%rax ; mov %rax,%rbx ; mul %rbx ; hlt
+        // 2^32 * 2^32 = 2^64: the whole product lives in RDX.
+        let cpu = run64(&[
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0xC3,
+            0x48, 0xF7, 0xE3,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(0), 0, "low half");
+        assert_eq!(cpu.reg64(2), 1, "high half");
+        assert!(cpu.get_flag(flags::CF), "the product did not fit in RAX");
+    }
+
+    #[test]
+    fn imul_sign_extends_across_the_whole_width() {
+        // mov $-1,%eax ; movslq %eax,%rax ; imul $3,%rax,%rbx ; hlt
+        let cpu = run64(&[
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x48, 0x63, 0xC0,
+            0x48, 0x6B, 0xD8, 0x03,
+            0xF4,
+        ]);
+        assert_eq!(cpu.reg64(3) as i64, -3);
+    }
+
+    #[test]
+    fn string_instructions_step_64_bit_index_registers() {
+        // lea 0x100(%rip),%rdi ; mov $4,%ecx ; movabs $0x1111...,%rax ;
+        // rep stosq ; hlt
+        let mut cpu = long_cpu(&[
+            0x48, 0x8D, 0x3D, 0x00, 0x01, 0x00, 0x00,      // lea 0x100(%rip),%rdi
+            0xB9, 0x04, 0x00, 0x00, 0x00,                  // mov $4,%ecx
+            0x48, 0xB8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0xF3, 0x48, 0xAB,                              // rep stos %rax,(%rdi)
+            0xF4,
+        ]);
+        cpu.run(4096);
+        assert!(cpu.halted);
+        let base = CODE64 + 7 + 0x100;
+        for i in 0..4u64 {
+            assert_eq!(cpu.mem.read_u64((base + i * 8) as usize), 0x1111_1111_1111_1111);
+        }
+        assert_eq!(cpu.reg64(7), base + 32, "RDI advanced eight bytes per element");
+        assert_eq!(cpu.reg64(1), 0, "RCX ran down to zero");
+    }
+
+    #[test]
+    fn four_level_paging_reaches_the_high_half_of_the_address_space() {
+        // Map linear 0xFFFF_8000_0000_0000 (PML4 entry 256) onto a 2 MiB page
+        // at physical 0x40_0000, then write through it and read the physical
+        // bytes back. This is the mapping every 64-bit kernel runs from.
+        use crate::paging::pte;
+        let mut cpu = long_cpu(&[0xF4]);
+        let pml4 = cpu.cr3 as usize;
+        // A fresh PDPT and PD above the identity map's tables.
+        let pdpt = 0x9000usize;
+        let pd = 0xA000usize;
+        cpu.mem.write_u64(pml4 + 256 * 8, pdpt as u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(pdpt, pd as u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(pd, 0x40_0000 | pte::P | pte::RW | pte::PS);
+        cpu.flush_tlb();
+
+        let high: u64 = 0xFFFF_8000_0000_0000;
+        let phys = cpu.apply_paging(high + 0x1234);
+        assert!(cpu.pending_exception.is_none(), "the high half must translate");
+        assert_eq!(phys, 0x40_0000 + 0x1234);
+
+        // And it is writable through the CPU's own store path.
+        let addr = cpu.translate_write(SegReg::Ds, high + 8);
+        cpu.mem.write_u64(addr, 0xFEED_FACE_1234_5678);
+        assert_eq!(cpu.mem.read_u64(0x40_0000 + 8), 0xFEED_FACE_1234_5678);
+    }
+
+    #[test]
+    fn a_non_canonical_address_is_a_general_protection_fault() {
+        // The unused middle of the 64-bit address space is a hole, not an
+        // alias: reaching into it is a #GP before the page tables are even
+        // consulted, which is what stops a 48-bit machine from pretending to
+        // have 64 bits of address space.
+        let mut cpu = long_cpu(&[0xF4]);
+        let phys = cpu.apply_paging(0x0000_8000_0000_0000);
+        assert_eq!(cpu.pending_exception, Some((0x0D, Some(0))));
+        assert_eq!(phys, crate::memory::UNBACKED);
+        // A canonical address gets past this check and on to the page tables,
+        // where being unmapped is an ordinary page fault -- a different
+        // exception, reported differently, and fixable by a handler.
+        cpu.pending_exception = None;
+        cpu.apply_paging(0xFFFF_8000_0000_0000);
+        assert_eq!(cpu.pending_exception.unwrap().0, 0x0E);
+        // And a canonical address that *is* mapped simply works.
+        cpu.pending_exception = None;
+        assert_eq!(cpu.apply_paging(0x1234), 0x1234);
+        assert!(cpu.pending_exception.is_none());
+    }
+
+    #[test]
+    fn no_execute_faults_on_a_fetch_and_only_on_a_fetch() {
+        // NX has to be checked on the fetch path alone: a no-execute page is
+        // still perfectly readable, and faulting on the read would break
+        // every string constant a kernel keeps in its data segment.
+        use crate::paging::pte;
+        let mut cpu = long_cpu(&[0xF4]);
+        // The identity map's second 2 MiB page, marked no-execute.
+        let pd = 0x4000usize;
+        let e = cpu.mem.read_u64(pd + 8);
+        cpu.mem.write_u64(pd + 8, e | pte::NX);
+        cpu.flush_tlb();
+
+        let target = 0x20_0000u64;
+        // A read is fine.
+        let phys = cpu.apply_paging(target);
+        assert!(cpu.pending_exception.is_none(), "a read of an NX page must work");
+        assert_eq!(phys, target as usize);
+        // A fetch is not.
+        let _ = cpu.apply_paging_fetch(target);
+        let (vector, code) = cpu.pending_exception.expect("fetch from NX must fault");
+        assert_eq!(vector, 0x0E);
+        assert_eq!(code.unwrap() & (1 << 4), 1 << 4, "the I/D bit says it was a fetch");
+        assert_eq!(cpu.cr2, target);
+    }
+
+    #[test]
+    fn cpuid_reports_long_mode() {
+        // Bit 29 of leaf 0x80000001's EDX is the long-mode bit, and reaching
+        // that leaf at all requires 0x80000000 to answer with a high enough
+        // maximum. A bootloader checks both, in that order.
+        let mut cpu = long_cpu(&[0x0F, 0xA2, 0xF4]);
+        cpu.set_reg32(Reg32::Eax, 0x8000_0000);
+        cpu.run(8);
+        assert!(cpu.reg32(Reg32::Eax) >= 0x8000_0001);
+
+        let mut cpu = long_cpu(&[0x0F, 0xA2, 0xF4]);
+        cpu.set_reg32(Reg32::Eax, 0x8000_0001);
+        cpu.run(8);
+        assert_ne!(cpu.reg32(Reg32::Edx) & (1 << 29), 0, "LM");
+        assert_ne!(cpu.reg32(Reg32::Edx) & (1 << 20), 0, "NX");
+        assert_ne!(cpu.reg32(Reg32::Edx) & (1 << 11), 0, "SYSCALL");
+        // And PAE, in the basic leaf: a 64-bit boot will not start without it.
+        let mut cpu = long_cpu(&[0x0F, 0xA2, 0xF4]);
+        cpu.set_reg32(Reg32::Eax, 1);
+        cpu.run(8);
+        assert_ne!(cpu.reg32(Reg32::Edx) & (1 << 6), 0, "PAE");
+    }
+
+    #[test]
+    fn efer_round_trips_through_wrmsr_but_lma_is_the_cpus_to_set() {
+        // mov $0xC0000080,%ecx ; rdmsr ; hlt
+        let mut cpu = long_cpu(&[0xB9, 0x80, 0x00, 0x00, 0xC0, 0x0F, 0x32, 0xF4]);
+        cpu.run(16);
+        let efer = (cpu.reg32(Reg32::Eax) as u64) | ((cpu.reg32(Reg32::Edx) as u64) << 32);
+        assert_eq!(efer, cpu.efer);
+        assert_ne!(efer & crate::cpu::efer::LMA, 0);
+
+        // Software cannot clear LMA by writing EFER: it follows CR0.PG.
+        let mut cpu = long_cpu(&[0xF4]);
+        cpu.write_msr(crate::cpu::msr::EFER, crate::cpu::efer::LME);
+        assert_ne!(cpu.efer & crate::cpu::efer::LMA, 0,
+            "LMA must not be clearable by a plain EFER write");
+    }
+
+    #[test]
+    fn fs_and_gs_bases_come_from_msrs_and_actually_offset_an_access() {
+        // In 64-bit mode FS and GS are the only segments with a base, and it
+        // is set through an MSR because it no longer fits in a descriptor.
+        let mut cpu = long_cpu(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xF4]);
+        // ^ mov %fs:0x0,%rax
+        cpu.write_msr(crate::cpu::msr::FS_BASE, 0x30_0000);
+        cpu.mem.write_u64(0x30_0000, 0xABCD_1234_5678_9EF0);
+        cpu.run(16);
+        assert_eq!(cpu.reg64(0), 0xABCD_1234_5678_9EF0);
+    }
+
+    #[test]
+    fn swapgs_exchanges_the_two_gs_bases() {
+        // swapgs ; swapgs ; hlt -- one swap moves the kernel base into GS,
+        // the second puts it back, which is the pattern at every kernel entry
+        // and exit.
+        let mut cpu = long_cpu(&[0x0F, 0x01, 0xF8, 0x0F, 0x01, 0xF8, 0xF4]);
+        cpu.gs_base = 0x1111_0000;
+        cpu.kernel_gs_base = 0x2222_0000;
+        // Step one instruction at a time so the intermediate state is visible.
+        cpu.step();
+        assert_eq!(cpu.gs_base, 0x2222_0000);
+        assert_eq!(cpu.kernel_gs_base, 0x1111_0000);
+        cpu.step();
+        assert_eq!(cpu.gs_base, 0x1111_0000);
+        assert_eq!(cpu.kernel_gs_base, 0x2222_0000);
+    }
+
+    /// Add the user code/data descriptors SYSRET expects to the long-mode GDT.
+    fn add_user_descriptors(cpu: &mut Cpu) {
+        let g = crate::boot::GDT64_ADDR as usize;
+        // 0x18: 32-bit user code (the SYSRET base; unused by the 64-bit form)
+        cpu.mem.write_u64(g + 0x18, 0x00CF_FA00_0000_FFFF);
+        // 0x20: user data
+        cpu.mem.write_u64(g + 0x20, 0x00CF_F200_0000_FFFF);
+        // 0x28: 64-bit user code (L set, DPL 3)
+        cpu.mem.write_u64(g + 0x28, 0x00AF_FA00_0000_FFFF);
+        cpu.gdt_limit = 0x2F;
+    }
+
+    #[test]
+    fn syscall_and_sysret_round_trip_through_the_msrs() {
+        // syscall ; hlt ; <handler> mov $0x99,%eax ; sysretq
+        let handler = CODE64 + 0x40;
+        let mut code = vec![
+            0x0F, 0x05, // syscall
+            0xF4,       // hlt
+        ];
+        code.resize(0x40, 0x90);
+        code.extend_from_slice(&[
+            0xB8, 0x99, 0x00, 0x00, 0x00, // mov $0x99,%eax
+            0x48, 0x0F, 0x07,             // sysretq
+        ]);
+        let mut cpu = long_cpu(&code);
+        add_user_descriptors(&mut cpu);
+        cpu.write_msr(crate::cpu::msr::LSTAR, handler);
+        // STAR: kernel CS in 47:32, the SYSRET selector base in 63:48.
+        cpu.write_msr(crate::cpu::msr::STAR, (0x08u64 << 32) | (0x18u64 << 48));
+        // SYSCALL clears IF through SFMASK, as a kernel entry must.
+        cpu.write_msr(crate::cpu::msr::SFMASK, flags::IF as u64);
+        cpu.set_flag(flags::IF, true);
+
+        let expect_return = CODE64 + 2;
+        cpu.step(); // syscall
+        assert_eq!(cpu.rip, handler, "landed at LSTAR");
+        assert_eq!(cpu.reg64(1), expect_return, "RCX carries the return address");
+        assert_eq!(cpu.cs, 0x08, "kernel CS from STAR");
+        assert_eq!(cpu.ss, 0x10, "kernel SS is the next descriptor");
+        assert!(!cpu.get_flag(flags::IF), "SFMASK cleared IF");
+        assert!(cpu.long64(), "still 64-bit code");
+
+        cpu.step(); // mov $0x99,%eax
+        cpu.step(); // sysretq
+        assert_eq!(cpu.reg64(0), 0x99);
+        assert_eq!(cpu.rip, expect_return, "SYSRET returned to RCX");
+        assert!(cpu.get_flag(flags::IF), "R11 carried the flags back");
+        assert_eq!(cpu.cs, 0x2B, "user CS with RPL 3");
+        assert_eq!(cpu.ss, 0x23, "user SS with RPL 3");
+        assert!(cpu.long64(), "the user segment is 64-bit too");
+    }
+
+    #[test]
+    fn syscall_without_efer_sce_is_an_invalid_opcode() {
+        let mut cpu = long_cpu(&[0x0F, 0x05, 0xF4]);
+        cpu.efer &= !crate::cpu::efer::SCE;
+        cpu.step();
+        assert_eq!(cpu.pending_exception, Some((0x06, None)));
+    }
+
+    /// Install a 64-bit interrupt gate: sixteen bytes, offset in three
+    /// pieces, with an IST index sharing a byte with the reserved field.
+    fn install_gate64(cpu: &mut Cpu, idt: u64, vector: u8, handler: u64, ist: u8) {
+        let e = idt as usize + (vector as usize) * 16;
+        cpu.mem.write_u16(e, handler as u16);
+        cpu.mem.write_u16(e + 2, 0x08); // kernel CS
+        cpu.mem.write_u8(e + 4, ist & 7);
+        cpu.mem.write_u8(e + 5, 0x8E); // present, DPL 0, interrupt gate
+        cpu.mem.write_u16(e + 6, (handler >> 16) as u16);
+        cpu.mem.write_u32(e + 8, (handler >> 32) as u32);
+        cpu.mem.write_u32(e + 12, 0);
+        cpu.idt_base = idt;
+        cpu.idt_limit = 0xFFF;
+    }
+
+    #[test]
+    fn an_interrupt_in_long_mode_uses_a_16_byte_gate_and_iretq_returns() {
+        // int $0x80 ; hlt ; <handler> mov $0x55,%eax ; iretq
+        let handler = CODE64 + 0x40;
+        let mut code = vec![0xCD, 0x80, 0xF4];
+        code.resize(0x40, 0x90);
+        code.extend_from_slice(&[
+            0xB8, 0x55, 0x00, 0x00, 0x00, // mov $0x55,%eax
+            0x48, 0xCF,                   // iretq
+        ]);
+        let mut cpu = long_cpu(&code);
+        install_gate64(&mut cpu, 0xB000, 0x80, handler, 0);
+        let rsp0 = cpu.rsp();
+
+        cpu.step(); // int $0x80
+        assert_eq!(cpu.rip, handler, "vectored through the 16-byte gate");
+        // The frame is five 8-byte words: RIP, CS, RFLAGS, RSP, SS -- SS and
+        // RSP are pushed even though the privilege level did not change.
+        let sp = cpu.rsp() as usize;
+        assert_eq!(cpu.mem.read_u64(sp), CODE64 + 2, "saved RIP");
+        assert_eq!(cpu.mem.read_u64(sp + 8), 0x08, "saved CS");
+        assert_eq!(cpu.mem.read_u64(sp + 24), rsp0, "saved RSP");
+        assert!(!cpu.get_flag(flags::IF), "an interrupt gate clears IF");
+
+        cpu.run(16);
+        assert!(cpu.halted);
+        assert_eq!(cpu.reg64(0), 0x55);
+        assert_eq!(cpu.rip, CODE64 + 3, "IRETQ returned past the INT");
+        assert_eq!(cpu.rsp(), rsp0, "IRETQ restored the stack pointer");
+    }
+
+    #[test]
+    fn a_gate_with_an_ist_index_switches_to_the_table_stack() {
+        // The IST is what makes a fault on a broken stack survivable: the
+        // gate names a stack unconditionally, with no privilege change
+        // needed. Without it, a double fault has nowhere to land.
+        let handler = CODE64 + 0x40;
+        let mut code = vec![0xCD, 0x80, 0xF4];
+        code.resize(0x40, 0x90);
+        code.extend_from_slice(&[0xF4]);
+        let mut cpu = long_cpu(&code);
+        install_gate64(&mut cpu, 0xB000, 0x80, handler, 1);
+        // A 64-bit TSS at 0xC000 with IST1 pointing at a known stack.
+        let tss = 0xC000u64;
+        cpu.tr_base = tss;
+        cpu.mem.write_u64(tss as usize + 0x24, 0x7_0000); // IST1
+        cpu.step();
+        assert_eq!(cpu.rip, handler);
+        // The frame landed on the IST stack, not the one it came in on.
+        assert_eq!(cpu.rsp(), 0x7_0000 - 40);
+    }
+
+    #[test]
+    fn a_page_fault_in_long_mode_records_a_64_bit_cr2() {
+        // CR2 has to be 64 bits wide, or a fault in the high half of the
+        // address space reports an address in the low half -- and the
+        // handler fixes up the wrong page.
+        let mut cpu = long_cpu(&[0xF4]);
+        let bad: u64 = 0xFFFF_8800_1234_5000;
+        let _ = cpu.apply_paging(bad);
+        assert_eq!(cpu.pending_exception.unwrap().0, 0x0E);
+        assert_eq!(cpu.cr2, bad);
+    }
+
+    #[test]
+    fn the_tlb_caches_a_64_bit_translation_and_invlpg_drops_it() {
+        use crate::paging::pte;
+        let mut cpu = long_cpu(&[0xF4]);
+        let pml4 = cpu.cr3 as usize;
+        let pdpt = 0x9000usize;
+        let pd = 0xA000usize;
+        cpu.mem.write_u64(pml4 + 256 * 8, pdpt as u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(pdpt, pd as u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(pd, 0x40_0000 | pte::P | pte::RW | pte::PS);
+        cpu.flush_tlb();
+
+        let high: u64 = 0xFFFF_8000_0000_0000;
+        assert_eq!(cpu.apply_paging(high), 0x40_0000);
+        // Repoint the mapping without telling the CPU: the TLB still answers
+        // with the old translation, which is the whole point of INVLPG.
+        cpu.mem.write_u64(pd, 0x60_0000 | pte::P | pte::RW | pte::PS);
+        assert_eq!(cpu.apply_paging(high), 0x40_0000, "served from the TLB");
+        cpu.invlpg(high);
+        assert_eq!(cpu.apply_paging(high), 0x60_0000, "re-walked after INVLPG");
+    }
+
+    #[test]
+    fn ram_above_four_gib_is_reachable_through_the_page_tables() {
+        // The point of the whole exercise: a machine with more RAM than fits
+        // below the MMIO hole, addressed from 64-bit code.
+        use crate::paging::pte;
+        let ram = crate::memory::MMIO_HOLE_START as usize + (32 << 20);
+        let mut cpu = Cpu::with_ram(ram);
+        crate::boot::load_flat64(&mut cpu, &[0xF4], CODE64).unwrap();
+        let high_phys = crate::memory::HIGH_RAM_BASE + 0x2_0000;
+
+        // Map linear 0xFFFF_8000_0000_0000 onto a 2 MiB page up there.
+        let pml4 = cpu.cr3 as usize;
+        cpu.mem.write_u64(pml4 + 256 * 8, 0x9000u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(0x9000, 0xA000u64 | pte::P | pte::RW);
+        cpu.mem.write_u64(0xA000, (crate::memory::HIGH_RAM_BASE) | pte::P | pte::RW | pte::PS);
+        cpu.flush_tlb();
+
+        let linear = 0xFFFF_8000_0000_0000u64 + 0x2_0000;
+        let phys = cpu.translate_write(SegReg::Ds, linear);
+        assert!(cpu.pending_exception.is_none());
+        assert_eq!(phys as u64, high_phys);
+        cpu.mem.write_u64(phys, 0x0BAD_C0DE_0BAD_C0DE);
+        assert_eq!(cpu.mem.read_u64(high_phys as usize), 0x0BAD_C0DE_0BAD_C0DE);
+        // And the machine says so in its memory map.
+        let map = cpu.mem.e820();
+        assert!(map.iter().any(|e| e.0 == crate::memory::HIGH_RAM_BASE && e.2 == 1));
+    }
+
+    #[test]
+    fn compatibility_mode_runs_32_bit_code_under_a_64_bit_machine() {
+        // Long mode with a code segment whose L bit is clear: the machine is
+        // still in long mode (LMA set, 4-level paging) but the code runs with
+        // 32-bit defaults. This is how a 64-bit kernel runs a 32-bit process.
+        let mut cpu = long_cpu(&[0xF4]);
+        // Install a 32-bit code descriptor and load it.
+        let g = crate::boot::GDT64_ADDR as usize;
+        cpu.mem.write_u64(g + 0x18, 0x00CF_9A00_0000_FFFF); // D/B set, L clear
+        cpu.gdt_limit = 0x1F;
+        cpu.load_seg(SegReg::Cs, 0x18);
+        assert_eq!(cpu.mode(), crate::cpu::Mode::Compat);
+        assert!(cpu.long_mode(), "the machine is still in long mode");
+        assert!(!cpu.long64(), "but this code segment is not 64-bit");
+        // Paging is still the 4-level kind, which is what makes it long mode.
+        assert_eq!(cpu.paging_mode(), crate::paging::PagingMode::Long);
+    }
+
+    #[test]
+    fn pae_paging_works_without_long_mode() {
+        // The middle of the three paging modes: 8-byte entries and three
+        // levels, but a 32-bit linear address. A 32-bit kernel with more than
+        // 4 GiB of RAM runs here.
+        use crate::paging::pte;
+        let mut cpu = Cpu::new();
+        cpu.pe = true;
+        cpu.cr4 |= crate::cpu::CR4_PAE;
+        // PDPT at 0x1000 -> PD 0x2000 -> a 2 MiB page at 0x80_0000.
+        cpu.mem.write_u64(0x1000, 0x2000u64 | pte::P);
+        cpu.mem.write_u64(0x2000, 0x80_0000u64 | pte::P | pte::RW | pte::PS);
+        cpu.cr3 = 0x1000;
+        cpu.cr0 |= crate::cpu::CR0_PG;
+        cpu.flush_tlb();
+        assert_eq!(cpu.paging_mode(), crate::paging::PagingMode::Pae);
+        assert_eq!(cpu.apply_paging(0x1234), 0x80_0000 + 0x1234);
+        assert!(cpu.pending_exception.is_none());
     }
 
     #[test]

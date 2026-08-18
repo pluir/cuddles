@@ -15,5 +15,9 @@ path = "src/main.rs"
 name = "gen_add"
 path = "examples/gen_add.rs"
 
+[[example]]
+name = "gen_long64"
+path = "examples/gen_long64.rs"
+
 [profile.release]
 opt-level = 3

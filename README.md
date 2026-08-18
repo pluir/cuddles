@@ -5,13 +5,36 @@ emulator (CPU + memory + devices) that can eventually boot real firmware.
 We're starting with a solid 16-bit real-mode CPU core and layering on
 protected mode, paging, and devices.
 
-## Current stage: 64-bit, and boots Linux to a shell
+## Current stage: 64-bit with SSE and VT-x; boots 32-bit Linux to a shell and 64-bit Linux to userspace
 
 The CPU implements all three of x86's modes — 16-bit real, 32-bit protected,
 and **64-bit long mode** — with paging structures to match: two-level 32-bit
 paging, PAE, and long mode's four-level tables. RAM is sized at run time
 rather than compiled in, and a machine can be given **more than 4 GiB**, with
 the excess wired above the 32-bit MMIO hole exactly as a real chipset does.
+It has **SSE/SSE2/SSE3** (the sixteen XMM registers, MXCSR, FXSAVE/FXRSTOR)
+and **Intel VT-x** (VMXON, a VMCS, VMLAUNCH/VMRESUME and VM exits), so a
+64-bit userspace runs and a hypervisor can run a guest.
+
+A real **64-bit Alpine Linux kernel (6.18)** boots from `--kernel-elf64`
+through its whole init, unpacks its initramfs, runs `/init` — busybox on musl,
+in ring 3, SSE2 and all — loads its boot-driver modules, and goes looking for
+boot media:
+
+```
+[   63.754665] Run /init as init process
+[   65.232978] Alpine Init 3.14.0-r0
+ * Loading boot drivers: [   66.774632] loop: module loaded
+[   67.919385] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[   67.990152] Loading boot drivers: ok.
+ * Mounting boot media:
+```
+
+There is no boot media to find; Alpine's `nlplug-findfs` waits for it and
+currently never gives up — its two threads end in a pair of timeless
+`futex` waits (see the roadmap). With that step skipped, `/init` drops to the
+initramfs emergency shell (`~ #`), which is where the earlier iterations of
+this boot ended.
 
 A real 32-bit Linux kernel (buildroot, 2.6.34.14) boots on this emulator from
 `startup_32` to a busybox shell prompt: it brings up its devices, mounts an
@@ -49,6 +72,21 @@ cargo build --release
 The emulated text screen is printed when the run ends. A full boot to the
 shell prompt takes a little over 300 million instructions.
 
+**64-bit**: take the `vmlinuz-virt` and `initramfs-virt` pair from an Alpine
+Linux x86_64 netboot release directory, unpack the kernel with the same tool
+(the emulator does not run the in-kernel decompressor), and give the machine
+enough RAM for a 6.x kernel and a 30 MB initramfs:
+
+```sh
+python tools/unpack_bzimage.py images/vmlinuz-virt images/alpine_kernel.bin
+./target/release/x86emu --mem 2G --kernel-elf64 images/alpine_kernel.bin \
+    --initrd images/initramfs-virt --cmdline "console=tty0" 1600000000
+```
+
+Userspace starts at about 1.2 billion instructions and `/init` has loaded
+its modules by 1.6 billion. `X86EMU_TRACE_USER=1 X86EMU_TRACE_SYSCALLS=1`
+is the way to watch what it does from there.
+
 Debugging switches, all off by default and all environment variables:
 
 | Variable | Effect |
@@ -56,6 +94,8 @@ Debugging switches, all off by default and all environment variables:
 | `X86EMU_DEBUG=<n>` | Exception log, interrupt counts, device state, and the last `n` instruction pointers. |
 | `X86EMU_TRACE=1` | One line per instruction to `trace.txt`. |
 | `X86EMU_TRACE_FROM=<n>` | Start tracing at instruction `n` (a whole boot is billions of lines). |
+| `X86EMU_TRACE_USER=1` | Trace only ring-3 instructions, with R8-R15 too — the trace that fits a userspace bug. |
+| `X86EMU_TRACE_SYSCALLS=1` | With the above: only each `syscall` and the instruction after it — arguments in, RAX back. |
 | `X86EMU_TRAP_EIP=<hex>` | Stop the moment execution reaches an address. |
 | `X86EMU_TRAP_USER=<n>` | Stop before the `n`th user-mode instruction. |
 | `X86EMU_WATCH=<hex>` / `X86EMU_WATCH_PHYS=<hex>` | Log stores covering a linear / physical address. |
@@ -63,6 +103,7 @@ Debugging switches, all off by default and all environment variables:
 | `X86EMU_DUMP_PHYS`, `X86EMU_DUMP_LINEAR` | Dump `<hexaddr>:<hexlen>:<path>` at the end of the run. |
 | `X86EMU_EPOCH=<secs>` | Pin the RTC so a boot is reproducible instruction for instruction. |
 | `X86EMU_NO_TLB=1` | Walk the page tables on every access, to rule the TLB in or out. |
+| `X86EMU_NO_SPLIT=1` | Let a page-straddling operand read the physically next page (the old behaviour), to rule unaligned accesses in or out. |
 
 `tools/kallsyms.py` extracts a symbol table from the (stripped) kernel image
 and `tools/sym.py` turns an address into a name — between them, "stuck at
@@ -172,8 +213,11 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
     `REP/REPE/REPNE` prefixes.
   - `LGDT`/`LIDT` (0x0F 0x01 /2 and /3) — the memory operand address
     follows the current addressing mode (16-bit `modrm_addr` or 32-bit
-    `modrm_addr32`), so `lidt [disp32]` works correctly in 32-bit mode.
-  - `MOV r32, cr` / `MOV cr, r32` (0x0F 0x20 / 0x0F 0x22) for CR0/CR2/CR3/CR4.
+    `modrm_addr32`), so `lidt [disp32]` works correctly in 32-bit mode —
+    and their store twins `SGDT`/`SIDT` (/0, /1), `SMSW`/`LMSW` (/4, /6),
+    `XGETBV`/`XSETBV`, `CLAC`/`STAC`, `MONITOR`/`MWAIT` and `MOVNTI`.
+  - `MOV r, cr` / `MOV cr, r` (0x0F 0x20 / 0x0F 0x22) for CR0/CR2/CR3/CR4
+    and, with REX.R, CR8; REX.B reaches R8-R15 as the operand.
   - `CPUID` (0x0F 0xA2) — returns the vendor string "GenuineIntel" (leaf 0)
     and family/model/feature flags (leaf 1, including the TSC bit).
   - `RDTSC` (0x0F 0x31) — reads the time-stamp counter (incremented each
@@ -210,9 +254,51 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
   - **x87 FPU** (`src/fpu.rs`): the D8-DF escape opcodes — `FNINIT`,
     `FSTCW`/`FLDCW`, `FSTSW` (AX and m16), `FLD`/`FST`/`FSTP` (m32/m64 and
     ST(i)), `FILD`/`FISTP` (m16/m32), simplified `FADD/FSUB/FMUL/FDIV`
-    (ST0 op m), and `FXSAVE`/`FXRSTOR` (0x0F 0xAE /0 and /1). The FPU has
-    the control/status/tag words and eight 80-bit data registers (stored as
-    `f64`). Enough for the Linux kernel's early FPU probing.
+    (ST0 op m). The FPU has the control/status/tag words and eight 80-bit
+    data registers (stored as `f64`). Enough for the Linux kernel's early
+    FPU probing.
+  - **SSE / SSE2 / SSE3** (`src/sse.rs`): the sixteen 128-bit XMM registers,
+    MXCSR (`LDMXCSR`/`STMXCSR`), and `FXSAVE`/`FXRSTOR` with the full
+    512-byte image (x87 state as 80-bit values, MXCSR and its mask, XMM0-15).
+    The moves (`MOVUPS/APS/UPD/APD`, `MOVDQU/DQA`, `MOVSS/SD`,
+    `MOVLPS/HPS/LPD/HPD`, `MOVHLPS/LHPS`, `MOVD/MOVQ` to and from general
+    registers, `MOVNT*`, `MOVMSKPS/PD`, `PMOVMSKB`, `MASKMOVDQU`, the SSE3
+    `MOVDDUP/SHDUP/SLDUP` and `LDDQU`), the bitwise ops, packed and scalar
+    `ADD/SUB/MUL/DIV/MIN/MAX/SQRT`, `RSQRT`/`RCP`, `CMPPS`-family with all
+    eight predicates, `COMISS/UCOMISS`, `SHUFPS/PD`, `UNPCK*`, the SSE3
+    `ADDSUB/HADD/HSUB`, every conversion (`CVTSI2SS/SD`, `CVT(T)SS2SI`,
+    `CVTSS2SD`, `CVTPS2PD`, `CVTDQ2PS`, `CVT(T)PS2DQ`, `CVTDQ2PD`,
+    `CVT(T)PD2DQ` and their inverses, rounding under MXCSR.RC), and the
+    packed integer set (`PADD/PSUB` with signed and unsigned saturation,
+    `PMULLW/HW/HUW/UDQ`, `PMADDWD`, `PSADBW`, `PAVGB/W`, `PMAX/PMIN`,
+    `PCMPEQ/GT`, `PACKSS/US`, `PUNPCKL/H`, `PSHUFD/HW/LW`, `PINSRW/PEXTRW`,
+    the shifts by immediate and by register, `PSLLDQ/PSRLDQ`). Scalar forms
+    read exactly 4 or 8 bytes; the aligned moves `#GP` on a misaligned
+    address; SSE is `#UD` until the OS sets CR4.OSFXSR and `#NM` while CR0.TS
+    is set. The MMX forms (no prefix on an integer opcode) are `#UD` — there
+    is no MMX unit. Not modelled: MXCSR's exception flags, DAZ/FTZ, and
+    rounding modes other than nearest in the arithmetic (the conversions
+    honour them).
+  - **Intel VT-x** (`src/vmx.rs`): `VMXON`/`VMXOFF`, `VMCLEAR`/`VMPTRLD`/
+    `VMPTRST`, `VMREAD`/`VMWRITE` on a VMCS with the architectural field
+    encodings, `VMLAUNCH`/`VMRESUME`, `VMCALL`, `INVEPT`/`INVVPID`;
+    IA32_FEATURE_CONTROL and the IA32_VMX_* capability MSRs; CPUID.1:ECX.VMX.
+    A VM entry loads the guest-state area (including EFER/long mode from the
+    entry controls) and injects the pending event; a VM exit saves it back,
+    records the reason, qualification, instruction length and interruption
+    information, and loads the host-state area. Exits: CPUID, VMCALL and the
+    VMX instructions, XSETBV and INVD unconditionally; HLT, INVLPG, RDTSC(P),
+    MWAIT/MONITOR/PAUSE, MOV to/from CR3 and CR8, MOV DR, I/O (unconditional
+    or through the I/O bitmaps), RDMSR/WRMSR (unconditional or through the
+    MSR bitmap), WBINVD, external interrupts (with acknowledge-on-exit), the
+    interrupt window and the exceptions in the exception bitmap (with the
+    page-fault mask/match) under their control bits; CR0/CR4 have the
+    guest/host mask and read shadow; a guest triple fault is an exit. Every
+    VMX instruction reports through RFLAGS as VMsucceed / VMfailInvalid /
+    VMfailValid with the instruction error. Not there, and not advertised:
+    EPT, unrestricted guest (a guest starts in protected mode), the
+    preemption timer, posted interrupts, APIC virtualization, SMM, nested
+    VMX, the MSR load/store lists.
 - **Linux boot-protocol loader** (`src/boot.rs`): parses a bzImage setup
   header, loads the protected-mode kernel at `code32_start`, builds a
   `boot_params` structure at `0x90000` (setup header, E820 memory map,
@@ -260,7 +346,13 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
   nothing — no register write, no memory write, no stack-pointer movement, and
   a `REP` string stops at the element that faulted with its index and count
   registers pointing at it. This is what makes demand paging, copy-on-write
-  and the kernel's exception-table fixups work.
+  and the kernel's exception-table fixups work. A fault raised while
+  *delivering* a fault escalates to `#DF`, and a fault while delivering `#DF`
+  is a triple fault.
+- **Operands that straddle a page** are translated twice — once for each
+  page — and split, so an unaligned 8- or 16-byte access into a vmalloc'd
+  region (where the next linear page is not the next physical one) reads and
+  writes the bytes it names.
 - **Ring 3**: an interrupt or exception taken at CPL 3 switches to the ring-0
   stack recorded in the **TSS** and pushes the outer SS:ESP below the usual
   frame; `IRET` to a less privileged code segment restores them. Gate types
@@ -268,8 +360,13 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
   LDT is consulted for selectors with the table-indicator bit set.
 - **Devices**:
   - **8254 PIT** (`src/pit.rs`): three 16-bit countdown channels. Channel 0
-    is wired to the PIC's IRQ0 (the system timer); the timer ticks once per
-    emulated instruction. Channel 2's gate and output line are visible on
+    is wired to the PIC's IRQ0 (the system timer). The 1.193182 MHz input
+    clock runs at **sixteen emulated instructions per PIT clock** — the
+    machine's speed as the guest experiences it (a 19 MIPS CPU). At one
+    instruction per clock a kernel with a 250 Hz tick got fewer instructions
+    between timer interrupts than its timer handler and softirqs cost, and
+    lived inside the interrupt (BogoMIPS 0.01, jiffies running away).
+    Channel 2's gate and output line are visible on
     port `0x61`, which is what the kernel's PIT-based TSC calibration spins
     on. I/O ports `0x40`-`0x43` and `0x61`.
   - **MC146818 CMOS RTC** (`src/cmos.rs`): the real-time clock and
@@ -278,8 +375,14 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
     boot and spins until the update-in-progress bit clears — a machine
     without one hangs there, before it ever reaches the timer.
   - **8259 PIC** (`src/pic.rs`): master + slave, 15 hardware IRQs mapped onto
-    configurable base vectors. I/O ports `0x20`/`0x21` (master) and
-    `0xA0`/`0xA1` (slave).
+    configurable base vectors, with the in-service register doing what it
+    does on the hardware: a request of equal or lower priority than one in
+    service waits for the handler's EOI (non-specific `0x20` or Linux's
+    specific `0x60|irq`), and OCW3 selects IRR or ISR for the next read.
+    There is no separate "in a handler" flag on the CPU — a kernel that
+    leaves an interrupt's aftermath through `SYSRET` clears nothing, and
+    that is correct. I/O ports `0x20`/`0x21` (master) and `0xA0`/`0xA1`
+    (slave).
   - **VGA** (`src/vga.rs`): text mode (80x25) plus graphics modes 12h
     (640x480, 16 colours) and 13h (320x200, 256 colours), with a
     memory-mapped-style framebuffer, plus the CRTC registers on `0x3D4`/
@@ -298,9 +401,10 @@ reaching the top of an 8 GiB machine needs 64-bit addressing.
     channel (ports `0x1F0`-`0x1F7`, `0x3F6`), LBA28 read/write sectors,
     raises IRQ14.
   - **Hardware interrupts**: the CPU checks for a pending IRQ before each
-    instruction; a pending interrupt is dispatched through the IVT (real
-    mode) or IDT (protected mode), and `IRET` clears the in-service state.
-    IRQ0 (timer), IRQ1 (keyboard) and IRQ14 (IDE) are wired.
+    instruction (in batches of 64); a pending interrupt is dispatched through
+    the IVT (real mode) or IDT (protected mode) when IF is set and the PIC's
+    priority logic lets it through. IRQ0 (timer), IRQ1 (keyboard) and IRQ14
+    (IDE) are wired.
   - **IN/OUT instructions** (`0xE4`-`0xE7`, `0xEC`-`0xEF`) for port I/O.
 - **Minimal BIOS** (native Rust handlers, dispatched from `INT`):
   - `INT 0x10` video: `AH=0x0E` teletype (prints a char at the cursor and
@@ -444,9 +548,8 @@ Hello from x86emu!
    prefixes, RIP-relative addressing, PAE and 4-level paging with NX and
    1 GiB pages, 64-bit interrupt gates with an IST, `SYSCALL`/`SYSRET`,
    `SWAPGS`, the FS/GS base MSRs, compatibility mode, and a `--long` /
-   `--kernel-elf64` boot path. What is *not* there is SSE: the x86-64 ABI
-   requires it, so a 64-bit Linux userspace needs it before it will run, and
-   it is the next layer rather than part of this one.
+   `--kernel-elf64` boot path. SSE, which the x86-64 ABI requires before a
+   userspace will run, is the next entry.
 
    What it took, beyond the earlier stages, was mostly *correctness* rather
    than new features — a kernel exercises the parts of an emulator that a
@@ -526,3 +629,58 @@ Hello from x86emu!
    so `--kernel-elf` loads the decompressed ELF directly. The 8042 keyboard
    controller does not implement the command interface the kernel probes
    (`i8042: probe failed`), so the shell has no keyboard input yet.
+10. **SSE / SSE2 / SSE3** — *done* (`src/sse.rs`). The x86-64 ABI requires
+    SSE2, and a 64-bit libc uses it for things that have nothing to do with
+    floating point: musl's malloc initialises a bin sentinel with
+    `movq %rax,%xmm0; punpcklqdq %xmm0,%xmm0; movups %xmm0,(%rax)`. The
+    first version of the SSE table decoded that store as a load, and init
+    segfaulted in `malloc` forty thousand instructions in — found with the
+    ring-3-only trace and a histogram of the opcodes it contained. The module
+    now has one decode table keyed on opcode + mandatory prefix, one executor
+    with lane helpers, FXSAVE/FXRSTOR with the 80-bit conversions, and
+    twenty-odd tests that hand-assemble each family.
+11. **Boot a real OS (Linux, 64-bit)** — *done to userspace*. Alpine's 6.18
+    kernel boots, unpacks its initramfs, runs `/init` (busybox on musl, in
+    ring 3), execs applets and loads modules; the initramfs shell was reached
+    while a bug kept `nlplug-findfs` from running, and with that fixed
+    `nlplug-findfs` now waits forever for boot media — a userspace deadlock
+    (two threads, two timeless `futex` waits) still to be explained. Beyond
+    SSE, what it took was again correctness in things that already existed:
+
+    - **`SGDT`/`SIDT` were missing.** `cpu_init` stores the GDTR to verify
+      it; the `#UD` that produced went to a `#UD` handler that then...
+    - **...clobbered its own stack**: `mov %cr4,%r12` in `__show_regs`
+      decoded with `m.rm & 7` — REX.B dropped — and wrote CR4 into RSP.
+    - **A fault during fault delivery re-delivered forever.** The frame push
+      on that broken stack faulted, and the same `#PF` was dispatched again
+      and again, one instruction of progress each. It is a `#DF` now, and a
+      fault while delivering `#DF` is a triple fault.
+    - **The trace was not side-effect-free.** Peeking at the next
+      instruction's bytes could raise a page fault the untraced run never
+      took, so a traced run diverged from the crash it was meant to explain.
+    - **Operands that straddle a page translated once.** Right by accident
+      in the direct map, wrong in a vmalloc'd region — module images copied
+      with unaligned tails came out corrupt (`x86/modules: Invalid relocation
+      target`). They are split across both pages now.
+    - **The interrupt model was a flag, not a PIC.** A CPU-side "servicing
+      an interrupt" bit, cleared by `IRET`, stood in for the 8259's
+      in-service register — and a 64-bit kernel that switches tasks inside
+      a timer interrupt and returns the new task through `SYSRET` never
+      clears it: interrupts stopped until the next `IRETQ`, or for good if
+      the idle loop's `HLT` came first. Busybox could no longer exec a
+      thing. The PIC now has in-service priority, specific EOI and OCW3.
+    - **Which exposed the machine's speed.** With ticks no longer throttled
+      to one per `IRET`, a 250 Hz timer at one instruction per PIT clock
+      gave the kernel 4.8k instructions per tick — fewer than its timer
+      handler and softirqs cost — and it lived inside the interrupt
+      (`Calibrating delay loop... 0.01 BogoMIPS (lpj=9)`). The PIT is now
+      clocked at sixteen instructions per input clock: a 19 MIPS machine,
+      and a kernel clock that reads seconds where it read minutes.
+12. **Intel VT-x** — *done* (`src/vmx.rs`): the instruction set, the VMCS,
+    VM entry and exit with the full state switch, event injection, the exit
+    reasons and qualifications a hypervisor acts on, and the capability MSRs
+    that say precisely what is there. Eleven tests build a hypervisor, a
+    guest and an exit handler into one flat 64-bit program each. Not built:
+    EPT and unrestricted guest — a hypervisor on this CPU shadows its guests'
+    page tables and starts them in protected mode, as hypervisors did before
+    either existed.

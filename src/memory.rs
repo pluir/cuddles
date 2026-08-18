@@ -397,6 +397,42 @@ impl Memory {
         }
     }
 
+    /// Read a little-endian u128 at a physical address (SSE/SSE2 128-bit
+    /// operands: `movaps`, `movdqa`, `movdqu`, etc.).
+    #[inline]
+    pub fn read_u128(&self, addr: usize) -> u128 {
+        if let Some(a) = self.slot(addr) {
+            if a + 15 < self.ram_size {
+                // SAFETY: a..a+15 are within bounds, unaligned-safe read.
+                unsafe {
+                    let p = self.data.as_ptr().add(a) as *const [u8; 16];
+                    return u128::from_le_bytes(std::ptr::read_unaligned(p));
+                }
+            }
+        }
+        let lo = self.read_u64(addr) as u128;
+        let hi = self.read_u64(addr.wrapping_add(8)) as u128;
+        lo | (hi << 64)
+    }
+
+    /// Write a little-endian u128 to a physical address (SSE/SSE2 stores).
+    #[inline]
+    pub fn write_u128(&mut self, addr: usize, val: u128) {
+        if self.watch_store.is_some() { self.note_store(addr, val as u64, 16); }
+        if let Some(a) = self.slot(addr) {
+            if a + 15 < self.ram_size {
+                // SAFETY: a..a+15 are within bounds, unaligned-safe write.
+                unsafe {
+                    let p = self.data.as_mut_ptr().add(a) as *mut [u8; 16];
+                    std::ptr::write_unaligned(p, val.to_le_bytes());
+                }
+                return;
+            }
+        }
+        self.write_u64(addr, val as u64);
+        self.write_u64(addr.wrapping_add(8), (val >> 64) as u64);
+    }
+
     /// Read a 32-bit IEEE single from a physical address.
     pub fn read_f32(&self, addr: usize) -> f32 {
         f32::from_bits(self.read_u32(addr))

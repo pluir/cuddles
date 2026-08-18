@@ -5,7 +5,7 @@
 //! addressing forms, LGDT/LIDT, and protected-mode interrupt dispatch
 //! through the IDT.
 
-use crate::cpu::{Cpu, Reg8, Reg16, Reg32, SegReg, flags};
+use crate::cpu::{Cpu, Reg8, Reg16, Reg32, SegReg, flags, CR4_OSXSAVE};
 use crate::modrm::ModRm;
 
 /// A decoded instruction, kept simple for diagnostics and tests.
@@ -214,9 +214,24 @@ pub enum Inst {
     Lods { rep: Rep, w: bool },
     Cmps { rep: Rep, w: bool },
     Scas { rep: Rep, w: bool },
-    // LGDT / LIDT (0x0F 0x01 /2 and /3)
+    // LGDT / LIDT (0x0F 0x01 /2 and /3), and their store forms SGDT / SIDT
+    // (/0 and /1). The kernel reads its own GDTR back to verify it
+    // (`native_store_gdt`), so a CPU that loads but cannot store hangs
+    // `cpu_init` on a #UD.
     Lgdt { m: ModRm },
     Lidt { m: ModRm },
+    Sgdt { m: ModRm },
+    Sidt { m: ModRm },
+    /// SMSW (0F 01 /4) / LMSW (0F 01 /6): the 286-era views of CR0's low
+    /// 16 bits. LMSW can set PE and never clear it.
+    Smsw { m: ModRm },
+    Lmsw { m: ModRm },
+    /// XGETBV / XSETBV (0F 01 D0 / D1): the extended control register XCR0.
+    Xgetbv,
+    Xsetbv,
+    /// CLAC / STAC (0F 01 CA / CB): clear or set RFLAGS.AC (SMAP).
+    Clac,
+    Stac,
     // INVLPG (0x0F 0x01 /7): invalidate TLB entry for a linear address.
     Invlpg { m: ModRm },
     // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22)
@@ -235,6 +250,17 @@ pub enum Inst {
     /// Instructions with no architectural effect here: memory fences,
     /// prefetch hints, cache management, and the multi-byte NOP.
     NopHint,
+    /// INVD / WBINVD (0F 08 / 0F 09): no cache to invalidate, but a
+    /// hypervisor may ask to see them.
+    Invd,
+    Wbinvd,
+    /// MONITOR / MWAIT (0F 01 C8 / C9) and PAUSE (F3 90). One core and no
+    /// caches: MONITOR arms nothing, MWAIT is a HLT that also wakes on the
+    /// interrupt it would have waited for, PAUSE is a NOP -- but each is its
+    /// own instruction so a hypervisor can intercept it.
+    Monitor,
+    Mwait,
+    Pause,
     // CPUID (0x0F 0xA2) / RDTSC (0x0F 0x31)
     Cpuid,
     Rdtsc,
@@ -283,13 +309,15 @@ pub enum Inst {
     Fistp { m: ModRm },
     // FADD/FSUB/FMUL/FDIV (D8/DC groups) — simplified: operate on ST0.
     Fop { op: FpuOp, m: ModRm },
-    // FXSAVE (0F AE /0) / FXRSTOR (0F AE /1)
-    Fxsave { m: ModRm },
-    Fxrstor { m: ModRm },
+    /// An SSE/SSE2/SSE3 instruction, decoded and executed in `sse.rs`
+    /// (which also owns FXSAVE/FXRSTOR and MXCSR).
+    Sse(crate::sse::SseInst),
+    /// A VT-x instruction (VMXON ... VMCALL), decoded and executed in
+    /// `vmx.rs`.
+    Vmx(crate::vmx::VmxInst),
     Unknown { opcode: u16 },
 }
 
-/// x87 arithmetic operation (simplified: ST0 op m).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FpuOp { Add, Sub, Mul, Div }
 
@@ -417,8 +445,12 @@ pub fn decode(cpu: &mut Cpu) -> Inst {
     cpu.rex_r = false;
     cpu.rex_x = false;
     cpu.rex_b = false;
+    cpu.sse_pfx = None;
     // Handle prefixes: REP/REPNE (0xF3/0xF2), operand-size (0x66),
     // address-size (0x67), segment overrides, and — in 64-bit mode — REX.
+    // The 0x66/0xF3/0xF2 bytes also serve as SSE mandatory prefixes; the
+    // *last* one before the opcode (or before REX) is what SSE uses, so we
+    // record it in `sse_pfx` and let the 0F-escape decoder read it.
     let mut rep = Rep::None;
     loop {
         let peek = cpu.peek_u8();
@@ -448,10 +480,11 @@ pub fn decode(cpu: &mut Cpu) -> Inst {
             // normally -- but it must be consumed, or `lock cmpxchg` decodes
             // 0xF0 as an opcode and faults.
             0xF0 => { cpu.fetch_u8(); }
-            0xF3 => { rep = Rep::Repe; cpu.fetch_u8(); }
-            0xF2 => { rep = Rep::Repne; cpu.fetch_u8(); }
+            0xF3 => { rep = Rep::Repe; cpu.sse_pfx = Some(0xF3); cpu.fetch_u8(); }
+            0xF2 => { rep = Rep::Repne; cpu.sse_pfx = Some(0xF2); cpu.fetch_u8(); }
             0x66 => {
                 if long64 { cpu.opsize = false; } else { cpu.opsize = !cpu.opsize; }
+                cpu.sse_pfx = Some(0x66);
                 cpu.fetch_u8();
             }
             0x67 => {
@@ -651,7 +684,10 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
         0xC4 => { let m = cpu.fetch_modrm(); Inst::Les { m } }
 
         // XCHG AX/EAX, reg (0x90 = NOP when reg is AX)
-        0x90 => Inst::Nop,
+        // 0x90 is NOP -- and, with REX.B, `xchg %rax,%r8`, which shares
+        // the encoding; with an F3 prefix it is PAUSE.
+        0x90 if cpu.rex_b => { if w32 { Inst::XchgEaxReg { reg: 8 } } else { Inst::XchgAxReg { reg: 8 } } }
+        0x90 => if rep == Rep::Repe { Inst::Pause } else { Inst::Nop },
         0x91..=0x97 => { let r = (op - 0x90) | rb(cpu); if w32 { Inst::XchgEaxReg { reg: r } } else { Inst::XchgAxReg { reg: r } } }
 
         // CBW (0x98) / CWD (0x99) / CWDE / CDQ
@@ -881,16 +917,43 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                     // The register forms of /7 are not INVLPG at all: F8 is
                     // SWAPGS and F9 is RDTSCP, which is why the mod field has
                     // to be looked at before the reg field is trusted.
-                    if m.mod_field == 3 && (m.reg & 7) == 7 {
-                        return match m.rm_raw {
-                            0 => Inst::Swapgs,
-                            1 => Inst::Rdtscp,
+                    if m.mod_field == 3 {
+                        return match (m.reg & 7, m.rm_raw) {
+                            (7, 0) => Inst::Swapgs,
+                            (7, 1) => Inst::Rdtscp,
+                            // /0 register forms: VMCALL (C1), VMLAUNCH (C2),
+                            // VMRESUME (C3), VMXOFF (C4).
+                            (0, 1) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmcall, m, reg: 0 }),
+                            (0, 2) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmlaunch, m, reg: 0 }),
+                            (0, 3) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmresume, m, reg: 0 }),
+                            (0, 4) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmxoff, m, reg: 0 }),
+                            // /1 register forms: MONITOR (C8) and MWAIT (C9).
+                            // One core and no caches: MONITOR arms nothing,
+                            // and MWAIT is a HLT that also wakes on the
+                            // interrupt it would have waited for.
+                            (1, 0) => Inst::Monitor,
+                            (1, 1) => Inst::Mwait,
+                            // /1: CLAC (CA) and STAC (CB).
+                            (1, 2) => Inst::Clac,
+                            (1, 3) => Inst::Stac,
+                            // /2: XGETBV (D0) and XSETBV (D1).
+                            (2, 0) => Inst::Xgetbv,
+                            (2, 1) => Inst::Xsetbv,
+                            // /4 and /6 have register forms too: SMSW r and
+                            // LMSW r are the same instructions with a
+                            // register operand.
+                            (4, _) => Inst::Smsw { m },
+                            (6, _) => Inst::Lmsw { m },
                             _ => Inst::Unknown { opcode: 0x0F01 },
                         };
                     }
                     match m.reg & 7 {
+                        0 => Inst::Sgdt { m },
+                        1 => Inst::Sidt { m },
                         2 => Inst::Lgdt { m },
                         3 => Inst::Lidt { m },
+                        4 => Inst::Smsw { m },
+                        6 => Inst::Lmsw { m },
                         7 => Inst::Invlpg { m },
                         _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
                     }
@@ -904,7 +967,8 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 // one core, no caches and no store buffer, so they are
                 // architecturally complete as no-ops -- but they must be
                 // *decoded*, or a kernel's `mfence` reads as a bad opcode.
-                0x08 | 0x09 => Inst::NopHint,       // INVD / WBINVD
+                0x08 => Inst::Invd,
+                0x09 => Inst::Wbinvd,
                 0x0D => { cpu.fetch_modrm(); Inst::NopHint }  // prefetch hints
                 0x18 => { cpu.fetch_modrm(); Inst::NopHint }  // PREFETCHh
                 // The multi-byte NOP (0F 1F /0). Compilers emit it by the
@@ -950,14 +1014,21 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 }
                 // CLTS (0x0F 0x06)
                 0x06 => Inst::Clts,
-                // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22)
+                // MOV r32, cr (0x0F 0x20) / MOV cr, r32 (0x0F 0x22). The
+                // ModR/M mod field is ignored (the operand is always a
+                // register), so REX.B is applied to the raw rm bits here
+                // rather than trusting `m.rm`, which only carries it when
+                // mod == 3. Masking to three bits turned `mov %cr4,%r12`
+                // into a write to RSP -- inside the kernel's own crash
+                // reporter, which then faulted on the stack it had just lost.
+                // REX.R on the reg field is what names CR8.
                 0x20 => {
                     let m = cpu.fetch_modrm();
-                    Inst::MovCr { cr: m.reg & 7, reg: m.rm & 7 }
+                    Inst::MovCr { cr: m.reg, reg: m.rm_raw | rb(cpu) }
                 }
                 0x22 => {
                     let m = cpu.fetch_modrm();
-                    Inst::MovToCr { cr: m.reg & 7, reg: m.rm & 7 }
+                    Inst::MovToCr { cr: m.reg, reg: m.rm_raw | rb(cpu) }
                 }
                 // CPUID (0x0F 0xA2)
                 0xA2 => Inst::Cpuid,
@@ -1017,8 +1088,8 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0xA8 => Inst::PushSeg { seg: SegReg::Gs },
                 0xA9 => Inst::PopSeg { seg: SegReg::Gs },
                 // MOV r32, DRx (0F 21) / MOV DRx, r32 (0F 23)
-                0x21 => { let m = cpu.fetch_modrm(); Inst::MovDr { dr: m.reg & 7, reg: m.rm & 7 } }
-                0x23 => { let m = cpu.fetch_modrm(); Inst::MovToDr { dr: m.reg & 7, reg: m.rm & 7 } }
+                0x21 => { let m = cpu.fetch_modrm(); Inst::MovDr { dr: m.reg & 7, reg: m.rm_raw | rb(cpu) } }
+                0x23 => { let m = cpu.fetch_modrm(); Inst::MovToDr { dr: m.reg & 7, reg: m.rm_raw | rb(cpu) } }
                 // Bit scan forward / reverse (0F BC / 0F BD)
                 0xBC => { let m = cpu.fetch_modrm(); Inst::Bsf { m, dst: m.reg, w32 } }
                 0xBD => { let m = cpu.fetch_modrm(); Inst::Bsr { m, dst: m.reg, w32 } }
@@ -1032,7 +1103,27 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                 0xC7 => {
                     let m = cpu.fetch_modrm();
                     if m.reg & 7 == 1 { Inst::Cmpxchg8b { m } }
-                    else { Inst::Unknown { opcode: 0x0FC7 } }
+                    else {
+                        // /6 and /7 memory forms are VMPTRLD/VMCLEAR/VMXON
+                        // and VMPTRST; the register forms would be
+                        // RDRAND/RDSEED, which this CPU does not claim.
+                        crate::vmx::decode_0f_c7(cpu, m).unwrap_or(Inst::Unknown { opcode: 0x0FC7 })
+                    }
+                }
+                // VMREAD r/m64, r64 (0F 78) and VMWRITE r64, r/m64 (0F 79):
+                // the field encoding is in `reg` for both.
+                0x78 => { let m = cpu.fetch_modrm(); Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmread, m, reg: m.reg }) }
+                0x79 => { let m = cpu.fetch_modrm(); Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Vmwrite, m, reg: m.reg }) }
+                // The 0F 38 three-byte escape: INVEPT (66 0F 38 80) and
+                // INVVPID (66 0F 38 81) are the only forms here.
+                0x38 => {
+                    let op3 = cpu.fetch_u8();
+                    let m = cpu.fetch_modrm();
+                    match (cpu.sse_pfx, op3) {
+                        (Some(0x66), 0x80) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Invept, m, reg: m.reg }),
+                        (Some(0x66), 0x81) => Inst::Vmx(crate::vmx::VmxInst { op: crate::vmx::VmxOp::Invvpid, m, reg: m.reg }),
+                        _ => Inst::Unknown { opcode: 0x0F38 },
+                    }
                 }
                 // BSWAP r32 (0F C8+r)
                 0xC8..=0xCF => Inst::Bswap { reg: (op2 - 0xC8) | rb(cpu) },
@@ -1066,13 +1157,23 @@ fn decode_op(cpu: &mut Cpu, op: u8, rep: Rep) -> Inst {
                     // state over whatever a register number resolved to.
                     if m.mod_field == 3 {
                         Inst::NopHint
+                    } else if (m.reg & 7) == 7 {
+                        // CLFLUSH: no cache to flush.
+                        Inst::NopHint
                     } else {
-                        match m.reg & 7 {
-                            0 => Inst::Fxsave { m },
-                            1 => Inst::Fxrstor { m },
-                            _ => Inst::NopHint,
-                        }
+                        // The memory forms are FXSAVE/FXRSTOR/LDMXCSR/STMXCSR;
+                        // /4-/6 are XSAVE-family forms this CPU does not have.
+                        crate::sse::decode_0f_ae(m)
+                            .unwrap_or(Inst::Unknown { opcode: 0x0FAE })
                     }
+                }
+                // ---- SSE/SSE2/SSE3 (0F 10-17, 28-2F, 50-7F, C2-C6, D0-FE) ----
+                // Everything on an XMM register lives in `sse.rs`; the
+                // mandatory prefix the loop above recorded picks the form.
+                0x10..=0x17 | 0x28..=0x2F | 0x50..=0x76 | 0x7C..=0x7F | 0xC2..=0xC6
+                | 0xD0..=0xFE => {
+                    crate::sse::decode_sse(cpu, op2)
+                        .unwrap_or(Inst::Unknown { opcode: 0x0F00 | op2 as u16 })
                 }
                 _ => Inst::Unknown { opcode: 0x0F00 | op2 as u16 },
             }
@@ -1187,7 +1288,8 @@ fn seg_from_index(i: u8) -> SegReg {
 pub fn execute(cpu: &mut Cpu, inst: &Inst) {
     use flags::*;
     match *inst {
-        Inst::Nop => {}
+        Inst::Nop | Inst::Pause | Inst::Monitor | Inst::Invd | Inst::Wbinvd => {}
+        Inst::Mwait => { cpu.halted = true; }
         Inst::Hlt => { cpu.halted = true; }
 
         // ---- MOV ----
@@ -1612,7 +1714,6 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             // A 16-bit IRET restores only the low half; the high half of
             // EFLAGS is left as it was.
             cpu.flags = write_flags(cpu.flags, (cpu.flags & 0xFFFF_0000) | f as u32);
-            cpu.servicing_irq = false;
         }
         // IRETQ: in long mode the frame is always five 8-byte words --
         // SS:RSP included, whether or not the privilege level changes -- so
@@ -1620,18 +1721,21 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         // bytes off on every kernel-to-kernel return, which unwinds into
         // nonsense a few interrupts later.
         Inst::Iret32 if cpu.long_mode() => {
-            let w = if cpu.rex_w { 64 } else { 32 };
-            let rip = cpu.pop_w(w);
-            let cs = cpu.pop_w(w) as u16;
-            let f = cpu.pop_w(w) as u32;
-            let rsp = cpu.pop_w(w);
-            let ss = cpu.pop_w(w) as u16;
+            // In 64-bit long mode, IRET always pops 64-bit words — REX.W
+            // is redundant and the operand-size prefix is ignored. Getting
+            // this wrong truncates the 64-bit RIP to 32 bits on every
+            // kernel-to-kernel return, which sends the CPU to a low address
+            // that the page tables do not map.
+            let rip = cpu.pop_w(64);
+            let cs = cpu.pop_w(64) as u16;
+            let f = cpu.pop_w(64) as u32;
+            let rsp = cpu.pop_w(64);
+            let ss = cpu.pop_w(64) as u16;
             cpu.load_seg(SegReg::Cs, cs);
             cpu.load_seg(SegReg::Ss, ss);
             cpu.set_rsp(rsp);
             cpu.rip = rip;
             cpu.flags = write_flags(cpu.flags, f);
-            cpu.servicing_irq = false;
             cpu.invalidate_phys_ip();
         }
         Inst::Iret32 => {
@@ -1650,7 +1754,6 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.set_eip(eip);
             cpu.load_seg(SegReg::Cs, cs);
             cpu.flags = write_flags(cpu.flags, f);
-            cpu.servicing_irq = false;
             cpu.invalidate_phys_ip();
         }
         // PUSHF/PUSHFD and POPF/POPFD follow the operand size. In 32-bit mode
@@ -2043,15 +2146,17 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
 
         // ---- Far control flow ----
         Inst::JmpFar { off, seg } => {
-            cpu.cs = seg;
+            cpu.load_seg(SegReg::Cs, seg);
             cpu.ip = off;
+            cpu.invalidate_phys_ip();
         }
         Inst::CallFar { off, seg } => {
             let ip = cpu.ip;
             cpu.push16(cpu.cs);
             cpu.push16(ip);
-            cpu.cs = seg;
+            cpu.load_seg(SegReg::Cs, seg);
             cpu.ip = off;
+            cpu.invalidate_phys_ip();
         }
         // The far jump is how a boot sequence *leaves* the mode it is in:
         // it is the instruction that makes a newly loaded CS take effect, and
@@ -2073,12 +2178,26 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         }
         Inst::Retf => {
             cpu.ip = cpu.pop16();
-            cpu.cs = cpu.pop16();
+            let cs = cpu.pop16();
+            cpu.load_seg(SegReg::Cs, cs);
+        }
+        Inst::Retf32 if cpu.long_mode() => {
+            // In 64-bit long mode, RETF pops a 64-bit RIP and 16-bit CS,
+            // and loading CS must update the descriptor cache so the L bit
+            // is read — without that, long64() returns false and every
+            // address is truncated to 32 bits.
+            let rip = cpu.pop_w(64);
+            let cs = cpu.pop_w(64) as u16;
+            cpu.load_seg(SegReg::Cs, cs);
+            cpu.rip = rip;
+            cpu.invalidate_phys_ip();
         }
         Inst::Retf32 => {
             let t = cpu.pop32();
+            let cs = cpu.pop32() as u16;
+            cpu.load_seg(SegReg::Cs, cs);
             cpu.set_eip(t);
-            cpu.cs = cpu.pop16();
+            cpu.invalidate_phys_ip();
         }
 
         // ---- Group 5 (0xFF): INC / DEC / CALL / JMP / PUSH r/m ----
@@ -2404,8 +2523,9 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 let src = cpu.translate(seg, si);
                 let dst = cpu.translate_write(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
-                let v = mem_read_w(cpu, src, bits);
-                mem_write_w(cpu, dst, bits, v);
+                let v = str_read(cpu, src, seg, si, bits);
+                str_write(cpu, dst, SegReg::Es, di, bits, v);
+                if cpu.pending_exception.is_some() { break; }
                 si = string_advance(si, step, asize);
                 di = string_advance(di, step, asize);
                 cnt -= 1;
@@ -2425,7 +2545,8 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 let dst = cpu.translate_write(SegReg::Es, di);
                 if cpu.pending_exception.is_some() { break; }
                 let v = cpu.reg_w(0, bits);
-                mem_write_w(cpu, dst, bits, v);
+                str_write(cpu, dst, SegReg::Es, di, bits, v);
+                if cpu.pending_exception.is_some() { break; }
                 di = string_advance(di, step, asize);
                 cnt -= 1;
             }
@@ -2443,7 +2564,8 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                 let seg = cpu.operand_seg_for_exec(SegReg::Ds);
                 let src = cpu.translate(seg, si);
                 if cpu.pending_exception.is_some() { break; }
-                let v = mem_read_w(cpu, src, bits);
+                let v = str_read(cpu, src, seg, si, bits);
+                if cpu.pending_exception.is_some() { break; }
                 cpu.set_reg_w(0, bits, v);
                 si = string_advance(si, step, asize);
                 cnt -= 1;
@@ -2527,6 +2649,68 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             cpu.idt_base = base;
             cpu.idt_limit = limit;
         }
+        // SGDT / SIDT store the register the way LGDT / LIDT read it: a
+        // 16-bit limit and then the base, 8 bytes wide in long mode and 4
+        // otherwise (a 16-bit operand size does not narrow the base on any
+        // CPU newer than a 286, and neither does it here).
+        Inst::Sgdt { m } | Inst::Sidt { m } => {
+            let (base, limit) = if matches!(inst, Inst::Sgdt { .. }) {
+                (cpu.gdt_base, cpu.gdt_limit)
+            } else {
+                (cpu.idt_base, cpu.idt_limit)
+            };
+            let addr = cpu.rm_addr(&m, true);
+            if cpu.pending_exception.is_some() { return; }
+            cpu.mem.write_u16(addr, limit);
+            if cpu.long_mode() {
+                cpu.mem.write_u64(addr + 2, base);
+            } else {
+                cpu.mem.write_u32(addr + 2, base as u32);
+            }
+        }
+        // SMSW: the low 16 bits of CR0 (a 32/64-bit register destination
+        // gets the whole of CR0; a memory destination is always 16 bits).
+        Inst::Smsw { m } => {
+            if m.is_reg() {
+                let w = cpu.osize();
+                let v = if w == 16 { cpu.cr0 as u64 & 0xFFFF } else { cpu.cr0 as u64 };
+                cpu.write_rm_w(&m, w, v);
+            } else {
+                let v = cpu.cr0 as u16;
+                cpu.write_rm16(&m, v);
+            }
+        }
+        // LMSW writes CR0's low four bits (PE, MP, EM, TS) and can set PE
+        // but never clear it -- the 286 had no way back to real mode.
+        Inst::Lmsw { m } => {
+            if cpu.cpl() != 0 { cpu.raise_gp(0); return; }
+            let v = cpu.read_rm16(&m) as u32;
+            if cpu.pending_exception.is_some() { return; }
+            let pe = cpu.cr0 & 1;
+            let new = (cpu.cr0 & !0xE) | (v & 0xE) | pe | (v & 1);
+            cpu.write_cr0(new);
+        }
+        // XGETBV / XSETBV: XCR0 says which register state XSAVE manages. Only
+        // XCR0 exists (ECX must be 0), bit 0 (x87) can never be cleared, and
+        // this CPU has no state past SSE, so only bits 0-1 may be set.
+        Inst::Xgetbv => {
+            if cpu.cr4 & CR4_OSXSAVE == 0 { cpu.raise_ud(); return; }
+            if cpu.reg32(Reg32::Ecx) != 0 { cpu.raise_gp(0); return; }
+            let v = cpu.xcr0;
+            cpu.set_reg32(Reg32::Eax, v as u32);
+            cpu.set_reg32(Reg32::Edx, (v >> 32) as u32);
+        }
+        Inst::Xsetbv => {
+            if cpu.cr4 & CR4_OSXSAVE == 0 { cpu.raise_ud(); return; }
+            if cpu.cpl() != 0 || cpu.reg32(Reg32::Ecx) != 0 { cpu.raise_gp(0); return; }
+            let v = (cpu.reg32(Reg32::Edx) as u64) << 32 | cpu.reg32(Reg32::Eax) as u64;
+            if v & 1 == 0 || v & !0x3 != 0 { cpu.raise_gp(0); return; }
+            cpu.xcr0 = v;
+        }
+        // CLAC / STAC: RFLAGS.AC is the SMAP override in supervisor mode.
+        // Privileged, and #UD rather than #GP outside ring 0.
+        Inst::Clac => { if cpu.cpl() != 0 { cpu.raise_ud(); return; } cpu.flags &= !flags::AC; }
+        Inst::Stac => { if cpu.cpl() != 0 { cpu.raise_ud(); return; } cpu.flags |= flags::AC; }
 
         // ---- INVLPG (0x0F 0x01 /7) ----
         // Invalidate the TLB entry for the linear address of the memory
@@ -2563,19 +2747,10 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let w = if cpu.long_mode() { 64 } else { 32 };
             let v = cpu.reg_w(reg, w);
             match cr {
-                0 => {
-                    // If paging is being toggled (PG bit changes), flush TLB.
-                    let old_pg = cpu.cr0 & crate::cpu::CR0_PG != 0;
-                    let new_pg = v as u32 & crate::cpu::CR0_PG != 0;
-                    cpu.cr0 = v as u32;
-                    cpu.pe = cpu.cr0 & crate::cpu::CR0_PE != 0;
-                    if old_pg != new_pg {
-                        cpu.flush_tlb();
-                    }
-                    // Turning paging on with EFER.LME set is what *enters*
-                    // long mode; turning it off is what leaves.
-                    cpu.update_long_mode();
-                }
+                // `write_cr0` refreshes PE, flushes the TLB when PG toggles,
+                // and enters or leaves long mode (PG on with EFER.LME set is
+                // what enters).
+                0 => cpu.write_cr0(v as u32),
                 2 => cpu.cr2 = v,
                 3 => {
                     cpu.cr3 = v;
@@ -2703,20 +2878,21 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                     // to 0 -- which reaches reciprocal_value() as a divide
                     // by zero before the slab allocator is even up.
                     cpu.set_reg32(Reg32::Ebx, 0x0001_0800);
-                    cpu.set_reg32(Reg32::Ecx, 0x0000_0000);
+                    // ECX: SSE3 (0) and VMX (5). Not claimed, because they
+                    // are not implemented: SSSE3, SSE4.x, CX16, POPCNT,
+                    // XSAVE, AVX -- a userspace that dispatches on these
+                    // would then run instructions this CPU lacks.
+                    cpu.set_reg32(Reg32::Ecx, 0x0000_0021);
                     // Feature flags, deliberately only the ones implemented
-                    // here: FPU(0), PSE(3), TSC(4), MSR(5), CX8(8), PGE(13),
-                    // CMOV(15), CLFSH(19), FXSR(24).
-                    //
-                    // PAE(6) is on because the page-table walk implements
-                    // it, and a 64-bit boot will not even start without it.
+                    // here: FPU(0), PSE(3), TSC(4), MSR(5), PAE(6), CX8(8),
+                    // PGE(13), CMOV(15), CLFSH(19), MMX(23), FXSR(24),
+                    // SSE(25), SSE2(26).
                     //
                     // Left OFF on purpose, because claiming them would make
                     // the kernel issue instructions this CPU does not have:
                     // APIC(9), SEP(11) -- so 32-bit system calls arrive as
-                    // int 0x80 rather than SYSENTER -- MTRR(12), PAT(16),
-                    // MMX(23), SSE(25) and SSE2(26).
-                    cpu.set_reg32(Reg32::Edx, 0x0108_A179);
+                    // int 0x80 rather than SYSENTER -- MTRR(12), PAT(16).
+                    cpu.set_reg32(Reg32::Edx, 0x0788_A179);
                 }
                 0x8000_0000 => {
                     // Highest extended leaf. A CPU that does not answer this
@@ -2732,13 +2908,15 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
                     cpu.set_reg32(Reg32::Eax, 0);
                     cpu.set_reg32(Reg32::Ebx, 0);
                     // ECX: LAHF/SAHF valid in 64-bit mode (bit 0).
-                    cpu.set_reg32(Reg32::Ecx, 0x0000_0001);
+                    cpu.set_reg32(Reg32::Ecx, 0x0000_0021);
                     // EDX extended features, again only the implemented ones:
                     // FPU(0), PSE(3), TSC(4), MSR(5), PAE(6), CX8(8), PGE(13),
-                    // CMOV(15), NX(20), SYSCALL(11), 1 GiB pages(26),
-                    // RDTSCP left off, and **LM (bit 29)** -- the bit that
-                    // says this CPU has long mode at all.
-                    cpu.set_reg32(Reg32::Edx, 0x2010_A97B);
+                    // CMOV(15), NX(20), SYSCALL(11), MMX(23), 1 GiB pages(26),
+                    // SSE2(26 in the basic leaf is bit 26; here the AMD
+                    // extended leaf reuses the same bit positions), RDTSCP
+                    // left off, and **LM (bit 29)** -- the bit that says this
+                    // CPU has long mode at all.
+                    cpu.set_reg32(Reg32::Edx, 0x2490_A97B);
                 }
                 0x8000_0008 => {
                     // Physical and linear address sizes: 52 and 48, which is
@@ -2939,14 +3117,6 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             };
             cpu.fpu.set_st_i(0, result);
         }
-        Inst::Fxsave { m } => {
-            let a = if cpu.addrsize { cpu.modrm_addr32_write(&m) } else { cpu.modrm_addr_write(&m) };
-            cpu.fpu.fxsave(&mut cpu.mem, a);
-        }
-        Inst::Fxrstor { m } => {
-            let a = if cpu.addrsize { cpu.modrm_addr32(&m) } else { cpu.modrm_addr(&m) };
-            cpu.fpu.fxrstor(&cpu.mem, a);
-        }
 
         // Two/three-operand IMUL. CF = OF = 1 when the truncated result
         // differs from the full signed product (i.e. it did not fit).
@@ -3055,6 +3225,9 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let v = if cond.test(cpu) { 1u8 } else { 0u8 };
             cpu.write_rm8(&m, v);
         }
+
+        Inst::Sse(s) => crate::sse::execute_sse(cpu, &s),
+        Inst::Vmx(v) => crate::vmx::execute_vmx(cpu, &v),
 
         Inst::Unknown { opcode } => {
             // Invalid opcode exception (#UD, vector 0x06). No error code.
@@ -3221,6 +3394,26 @@ fn long_int(cpu: &mut Cpu, vector: u8, error_code: Option<u32>) {
 #[inline]
 fn mask_w(width: u32) -> u64 {
     if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+}
+
+/// Read a string element: `phys` is the translation of `(seg, off)`; a
+/// straddling element is split across its two pages.
+fn str_read(cpu: &mut Cpu, phys: usize, seg: SegReg, off: u64, width: u32) -> u64 {
+    if width > 8 && Cpu::straddles(phys, width / 8) {
+        let lin = cpu.linear_addr(seg, off);
+        return cpu.read_split(phys, lin, width / 8) as u64;
+    }
+    mem_read_w(cpu, phys, width)
+}
+
+/// The store side of `str_read`.
+fn str_write(cpu: &mut Cpu, phys: usize, seg: SegReg, off: u64, width: u32, v: u64) {
+    if width > 8 && Cpu::straddles(phys, width / 8) {
+        let lin = cpu.linear_addr(seg, off);
+        cpu.write_split(phys, lin, width / 8, v as u128);
+        return;
+    }
+    mem_write_w(cpu, phys, width, v)
 }
 
 /// Read `width` bits from a physical address.
@@ -3915,7 +4108,7 @@ fn do_shift(cpu: &mut Cpu, op: ShiftOp, m: &ModRm, width: u32, n: u32) {
 /// Perform a 32-bit shift/rotate, setting flags, and return the result.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::memory::Memory;
     use crate::cpu::{Cpu, flags};
@@ -5779,19 +5972,74 @@ mod tests {
     /// Where `long_cpu` loads its code.
     const CODE64: u64 = 0x10_0000;
 
-    fn long_cpu(code: &[u8]) -> Cpu {
+    pub(crate) fn long_cpu(code: &[u8]) -> Cpu {
         let mut cpu = Cpu::new();
         crate::boot::load_flat64(&mut cpu, code, CODE64).unwrap();
         cpu
     }
 
-    /// Run until HLT, with a bound so a broken test fails instead of hanging.
-    fn run64(code: &[u8]) -> Cpu {
-        let mut cpu = long_cpu(code);
+    /// Run an already-built machine until HLT, with a bound so a broken
+    /// test fails instead of hanging. Shared with `sse.rs`'s tests.
+    pub(crate) fn run64(cpu: &mut Cpu) {
         cpu.run(4096);
         assert!(cpu.halted, "did not reach HLT (rip={:016X})", cpu.rip);
         assert!(!cpu.triple_fault, "triple faulted at rip={:016X}", cpu.rip);
+    }
+
+    /// Build a long-mode machine from `code` and run it to HLT.
+    fn run64_code(code: &[u8]) -> Cpu {
+        let mut cpu = long_cpu(code);
+        run64(&mut cpu);
         cpu
+    }
+
+    /// Map linear 0x40_0000 and 0x40_1000 to two physically UNRELATED pages
+    /// (0x70_0000 and 0x90_0000), the way a vmalloc'd region is mapped, so
+    /// an access that straddles the boundary has to be split.
+    fn split_map(cpu: &mut Cpu) {
+        use crate::paging::pte;
+        // PD entry 2 of the first GiB (linear 0x40_0000-0x60_0000) becomes a
+        // 4 KiB page table at 0xA000 instead of a 2 MiB page.
+        let pt = 0xA000usize;
+        for i in 0..512 { cpu.mem.write_u64(pt + i * 8, 0); }
+        cpu.mem.write_u64(pt, 0x70_0000 | pte::P | pte::RW);
+        cpu.mem.write_u64(pt + 8, 0x90_0000 | pte::P | pte::RW);
+        cpu.mem.write_u64(0x4000 + 2 * 8, pt as u64 | pte::P | pte::RW);
+        cpu.flush_tlb();
+    }
+
+    #[test]
+    fn an_access_that_straddles_a_page_is_split_across_both_pages() {
+        // movups xmm0,[0x400FF8] ; movups [0x400FF4],xmm0 ;
+        // mov [0x400FFA],rbx ; mov rax,[0x400FFC] ; hlt
+        let code = [
+            0x0F, 0x10, 0x04, 0x25, 0xF8, 0x0F, 0x40, 0x00,          // movups xmm0,[0x400FF8]
+            0x0F, 0x11, 0x04, 0x25, 0xF4, 0x0F, 0x40, 0x00,          // movups [0x400FF4],xmm0
+            0x48, 0x89, 0x1C, 0x25, 0xFA, 0x0F, 0x40, 0x00,          // mov [0x400FFA],rbx
+            0x48, 0x8B, 0x04, 0x25, 0xFC, 0x0F, 0x40, 0x00,          // mov rax,[0x400FFC]
+            0xF4,
+        ];
+        let mut cpu = long_cpu(&code);
+        cpu.cr4 |= crate::cpu::CR4_OSFXSR;
+        split_map(&mut cpu);
+        // The two physical pages: distinct fill patterns.
+        for i in 0..0x1000 { cpu.mem.write_u8(0x70_0000 + i, 0xA0 | (i & 0xF) as u8); }
+        for i in 0..0x1000 { cpu.mem.write_u8(0x90_0000 + i, 0xB0 | (i & 0xF) as u8); }
+        cpu.regs[3] = 0x1122_3344_5566_7788;
+        run64(&mut cpu);
+        // The 16-byte load: 8 bytes from the end of the first page, 8 from
+        // the start of the second (never from 0x70_1000, which is not
+        // mapped here).
+        assert_eq!(cpu.xmm[0], 0xB7B6_B5B4_B3B2_B1B0_AFAE_ADAC_ABAA_A9A8);
+        // The 16-byte store, 12 + 4: bytes the later mov did not overwrite.
+        assert_eq!(cpu.mem.read_u32(0x70_0FF4), 0xABAA_A9A8);
+        assert_eq!(cpu.mem.read_u16(0x70_0FF8), 0xADAC);
+        assert_eq!(cpu.mem.read_u16(0x90_0002), 0xB7B6);
+        // The 8-byte store, 6 + 2.
+        assert_eq!(cpu.mem.read_u16(0x70_0FFA), 0x7788);
+        assert_eq!(cpu.mem.read_u16(0x90_0000), 0x1122);
+        // The 8-byte load, 4 + 4, sees both stores.
+        assert_eq!(cpu.regs[0], 0xB7B6_1122_3344_5566);
     }
 
     #[test]
@@ -5827,7 +6075,7 @@ mod tests {
     #[test]
     fn rex_w_makes_the_operand_64_bits() {
         // movabs $0x0123456789ABCDEF,%rax ; mov %rax,%rbx ; add %rax,%rbx ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0xB8, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
             0x48, 0x89, 0xC3,
             0x48, 0x01, 0xC3,
@@ -5840,7 +6088,7 @@ mod tests {
     #[test]
     fn rex_b_reaches_the_registers_rex_added() {
         // mov $0x1234,%eax ; mov %rax,%r8 ; mov %r8,%r15 ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0xB8, 0x34, 0x12, 0x00, 0x00,
             0x49, 0x89, 0xC0,
             0x4D, 0x89, 0xC7,
@@ -5855,7 +6103,7 @@ mod tests {
         // The asymmetry is x86-64's, and code generated for it depends on
         // both halves: `mov $0,%eax` is the idiomatic way to clear RAX.
         // movabs $-1,%rax ; mov $1,%eax ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
             0xB8, 0x01, 0x00, 0x00, 0x00,
             0xF4,
@@ -5863,7 +6111,7 @@ mod tests {
         assert_eq!(cpu.reg64(0), 1, "a 32-bit write must clear the high half");
 
         // movabs $-1,%rax ; mov $1,%ax ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
             0x66, 0xB8, 0x01, 0x00,
             0xF4,
@@ -5883,14 +6131,14 @@ mod tests {
             0xF4,                                     // hlt
         ];
         code.extend_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
-        let cpu = run64(&code);
+        let cpu = run64_code(&code);
         assert_eq!(cpu.reg64(0), 0xDEAD_BEEF_CAFE_F00D);
     }
 
     #[test]
     fn lea_computes_a_rip_relative_address_without_reading_it() {
         // lea 0x10(%rip),%rax ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,
             0xF4,
         ]);
@@ -5900,7 +6148,7 @@ mod tests {
     #[test]
     fn movsxd_sign_extends_a_32_bit_value() {
         // mov $-2,%ecx ; movslq %ecx,%rax ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0xB9, 0xFE, 0xFF, 0xFF, 0xFF,
             0x48, 0x63, 0xC1,
             0xF4,
@@ -5929,7 +6177,7 @@ mod tests {
     #[test]
     fn a_call_pushes_a_64_bit_return_address() {
         // call +1 ; hlt ; mov $7,%eax ; ret
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0xE8, 0x01, 0x00, 0x00, 0x00, // call .+1 (past the hlt)
             0xF4,                         // hlt
             0xB8, 0x07, 0x00, 0x00, 0x00, // mov $7,%eax
@@ -5944,7 +6192,7 @@ mod tests {
         // A 5-bit mask would make `shl $32,%rax` a no-op, leaving the value
         // where it was instead of moving it into the high half.
         // mov $1,%eax ; shl $32,%rax ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0xB8, 0x01, 0x00, 0x00, 0x00,
             0x48, 0xC1, 0xE0, 0x20,
             0xF4,
@@ -5955,7 +6203,7 @@ mod tests {
     #[test]
     fn arithmetic_flags_are_computed_at_the_full_width() {
         // movabs $-1,%rax ; add $1,%rax ; hlt  -> zero, with a carry out.
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
             0x48, 0x83, 0xC0, 0x01,
             0xF4,
@@ -5972,7 +6220,7 @@ mod tests {
     fn multiply_and_divide_use_the_full_128_bit_intermediate() {
         // movabs $0x100000000,%rax ; mov %rax,%rbx ; mul %rbx ; hlt
         // 2^32 * 2^32 = 2^64: the whole product lives in RDX.
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
             0x48, 0x89, 0xC3,
             0x48, 0xF7, 0xE3,
@@ -5986,7 +6234,7 @@ mod tests {
     #[test]
     fn imul_sign_extends_across_the_whole_width() {
         // mov $-1,%eax ; movslq %eax,%rax ; imul $3,%rax,%rbx ; hlt
-        let cpu = run64(&[
+        let cpu = run64_code(&[
             0xB8, 0xFF, 0xFF, 0xFF, 0xFF,
             0x48, 0x63, 0xC0,
             0x48, 0x6B, 0xD8, 0x03,

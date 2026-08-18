@@ -4,6 +4,8 @@
 # Downloaded OS images (large binaries, not source)
 /images/*.iso
 /images/*.bin
+/images/vmlinuz*
+/images/initramfs*
 # Symbol table extracted from a kernel image (derived; regenerate with
 # tools/kallsyms.py)
 /images/*.syms
@@ -19,8 +21,9 @@
 /images/elfinfo.py
 /images/layout.py
 
-# Trace output
+# Trace output and memory dumps at the repo root
 /trace.txt
+/*.bin
 
 # Scratch files at the repo root
 /analysis*.txt

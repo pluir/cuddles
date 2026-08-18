@@ -15,6 +15,9 @@ use crate::protected::Descriptor;
 const TLB_SIZE: usize = 256;
 /// Size of the debug EIP ring buffer (see `Cpu::eip_ring`).
 pub const EIP_RING: usize = 4096;
+/// X86EMU_NO_SPLIT (debug): treat a page-straddling access as if the next
+/// physical page followed, the pre-fix behaviour, for A/B comparison.
+static NO_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Cap on the number of exceptions recorded in `Cpu::exc_log`.
 pub const EXC_LOG_MAX: usize = 512;
 /// TLB index mask.
@@ -176,6 +179,15 @@ pub const CR0_WP: u32 = 1 << 16;
 pub const CR0_PG: u32 = 1 << 31;
 /// CR4.PAE — physical address extension: 8-byte page-table entries.
 pub const CR4_PAE: u32 = 1 << 5;
+/// CR4.OSFXSR — the OS saves SSE state with FXSAVE; SSE instructions #UD
+/// until it is set.
+pub const CR4_OSFXSR: u32 = 1 << 9;
+/// CR4.OSXMMEXCPT — the OS handles unmasked SSE exceptions (#XM).
+pub const CR4_OSXMMEXCPT: u32 = 1 << 10;
+/// CR4.VMXE — VMX enabled: VMXON is legal.
+pub const CR4_VMXE: u32 = 1 << 13;
+/// CR4.OSXSAVE — the OS uses XSAVE; XGETBV/XSETBV #UD until it is set.
+pub const CR4_OSXSAVE: u32 = 1 << 18;
 
 /// What the processor is running as. The four are not a spectrum: real and
 /// protected mode are the legacy pair, and long mode has two sub-modes
@@ -271,6 +283,11 @@ pub struct Cpu {
     /// REX.B: the high bit of the ModR/M `rm` field, of the SIB base, and of
     /// the register an opcode embeds in its low three bits.
     pub rex_b: bool,
+    /// SSE mandatory prefix: which of 0x66/0xF3/0xF2 was the last legacy
+    /// prefix before the opcode (after REX). SSE uses these as part of the
+    /// opcode encoding (ps/pd/dq/ss/sd), not as operand-size or REP. `None`
+    /// means no mandatory prefix was present.
+    pub sse_pfx: Option<u8>,
 
     // ---- Protected-mode state ----
     /// True when protected mode is enabled (CR0.PE).
@@ -352,7 +369,7 @@ pub struct Cpu {
     pub pic: crate::pic::Pic,
     /// True when a hardware interrupt is currently being serviced (so we
     /// don't re-enter on the same instruction).
-    pub servicing_irq: bool,
+
 
     // ---- Exceptions ----
     /// A pending exception raised during decode/execute, dispatched at the
@@ -373,6 +390,16 @@ pub struct Cpu {
     pub ide: crate::ide::Ide,
     /// x87 FPU.
     pub fpu: crate::fpu::Fpu,
+    /// SSE/SSE2: the sixteen 128-bit XMM registers (XMM0–XMM15).
+    pub xmm: [u128; 16],
+    /// SSE/SSE2: MXCSR control/status register. Default: all exceptions
+    /// masked, round-to-nearest, flush-to-zero off, denormals-are-zero off.
+    pub mxcsr: u32,
+    /// XCR0: which register state XSAVE manages. Bit 0 (x87) is always set;
+    /// bit 1 (SSE) is the only other one this CPU has.
+    pub xcr0: u64,
+    /// VT-x state: VMXON, the current VMCS, and whether a guest is running.
+    pub vmx: crate::vmx::Vmx,
 
     // ---- Debug tracing ----
     /// Cached trace file handle (opened once when X86EMU_TRACE is set).
@@ -384,6 +411,18 @@ pub struct Cpu {
     /// Tracing every instruction of a boot is billions of lines; a window is
     /// what makes a trace usable that far in.
     pub trace_from: u64,
+    /// X86EMU_TRACE_USER: trace only ring-3 instructions, with R8-R15 too.
+    /// A userspace bug is thousands of user instructions spread over
+    /// millions of kernel ones; this is the trace that fits.
+    pub trace_user: bool,
+    /// X86EMU_TRACE_SYSCALLS: with `trace_user`, write only the `syscall`
+    /// instructions and the instruction after each -- the arguments going in
+    /// and RAX coming back. A userspace that fails is usually a syscall
+    /// answering wrongly, and this is a few thousand lines where the full
+    /// ring-3 trace is millions.
+    pub trace_syscalls: bool,
+    /// The last user line written was a `syscall`; write the next one too.
+    trace_after_syscall: bool,
 
     // ---- Instruction fetch cache (#1) ----
     /// Cached physical address of the instruction stream. Valid between
@@ -477,6 +516,7 @@ impl Cpu {
     /// the `Memory`, so this is the only place a size is chosen.
     pub fn with_ram(ram: usize) -> Self {
         let trace_enabled = std::env::var("X86EMU_TRACE").is_ok();
+        NO_SPLIT.store(std::env::var_os("X86EMU_NO_SPLIT").is_some(), std::sync::atomic::Ordering::Relaxed);
         let debug_enabled = std::env::var("X86EMU_DEBUG").is_ok();
         let trace_file = if trace_enabled {
             std::fs::OpenOptions::new()
@@ -539,19 +579,26 @@ impl Cpu {
             dr: [0; 8],
             pit: crate::pit::Pit::new(),
             pic: crate::pic::Pic::new(),
-            servicing_irq: false,
             vga: crate::vga::Vga::new(),
             kbd: crate::kbd::Kbd::new(),
             dma: crate::dma::Dma::new(),
             cmos: crate::cmos::Cmos::new(),
             ide: crate::ide::Ide::new(),
             fpu: crate::fpu::Fpu::new(),
+            xmm: [0; 16],
+            mxcsr: 0x1F80, // all exceptions masked, round-to-nearest
+            xcr0: 1,
+            vmx: crate::vmx::Vmx::new(),
+            sse_pfx: None,
             pending_exception: None,
             tlb: [TlbEntry::default(); TLB_SIZE],
             trace_file,
             trace_enabled,
             trace_from: std::env::var("X86EMU_TRACE_FROM").ok()
                 .and_then(|v| v.parse().ok()).unwrap_or(0),
+            trace_user: std::env::var("X86EMU_TRACE_USER").is_ok(),
+            trace_syscalls: std::env::var("X86EMU_TRACE_SYSCALLS").is_ok(),
+            trace_after_syscall: false,
             phys_ip_cache: 0,
             phys_ip_linear: 0,
             rip_mask: 0xFFFF_FFFF,
@@ -1152,6 +1199,47 @@ impl Cpu {
         self.apply_paging_access((linear) as u64, write)
     }
 
+    /// True when an access of `bytes` starting at physical address `phys`
+    /// crosses a page boundary. The offset within the page is the same for
+    /// the physical and the linear address, so the physical one answers it.
+    #[inline]
+    pub fn straddles(phys: usize, bytes: u32) -> bool {
+        if NO_SPLIT.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+        (phys & 0xFFF) as u32 + bytes > 0x1000
+    }
+
+    /// Read `bytes` (up to 16) of an operand that straddles a page: `phys`
+    /// is the translation of `lin`, the first byte; the tail lives on the
+    /// next page, which is translated here on its own. Two physically
+    /// unrelated pages are the normal case in a vmalloc'd region, and a
+    /// read that took the tail from `phys + n` was reading the wrong page --
+    /// invisible in the direct map, where the pages ARE adjacent, and fatal
+    /// in a module image, whose sections are copied with unaligned tails.
+    pub fn read_split(&mut self, phys: usize, lin: u64, bytes: u32) -> u128 {
+        let first = 0x1000 - (phys & 0xFFF);
+        let phys2 = self.apply_paging_access((lin & !0xFFF).wrapping_add(0x1000), false);
+        if self.pending_exception.is_some() { return 0; }
+        let mut v = 0u128;
+        for i in 0..bytes as usize {
+            let b = if i < first { self.mem.read_u8(phys + i) } else { self.mem.read_u8(phys2 + i - first) };
+            v |= (b as u128) << (8 * i);
+        }
+        v
+    }
+
+    /// The store side of `read_split`. Both pages are translated (and both
+    /// checked for write permission) before a byte is written, so a fault on
+    /// the second page commits nothing on the first.
+    pub fn write_split(&mut self, phys: usize, lin: u64, bytes: u32, v: u128) {
+        let first = 0x1000 - (phys & 0xFFF);
+        let phys2 = self.apply_paging_access((lin & !0xFFF).wrapping_add(0x1000), true);
+        if self.pending_exception.is_some() { return; }
+        for i in 0..bytes as usize {
+            let b = (v >> (8 * i)) as u8;
+            if i < first { self.mem.write_u8(phys + i, b); } else { self.mem.write_u8(phys2 + i - first, b); }
+        }
+    }
+
     /// Flush the entire TLB (called on MOV CR3, or when paging is toggled).
     #[inline]
     pub fn flush_tlb(&mut self) {
@@ -1343,6 +1431,26 @@ impl Cpu {
         self.pending_exception = Some((0x0D, Some(code)));
     }
 
+    /// Record an invalid-opcode fault (`#UD`, no error code).
+    pub fn raise_ud(&mut self) {
+        if self.pending_exception.is_some() { return; }
+        self.pending_exception = Some((0x06, None));
+    }
+
+    /// Write CR0 the way `MOV CR0` does: refresh `pe`, flush the TLB when
+    /// PG toggles, and let the machine enter or leave long mode. `LMSW` and
+    /// a VM entry/exit go through here too, so the side effects cannot be
+    /// forgotten.
+    pub fn write_cr0(&mut self, v: u32) {
+        let old_pg = self.cr0 & CR0_PG != 0;
+        self.cr0 = v;
+        self.pe = v & CR0_PE != 0;
+        if old_pg != (v & CR0_PG != 0) {
+            self.flush_tlb();
+        }
+        self.update_long_mode();
+    }
+
     /// Record a page fault: CR2 takes the faulting linear address and the
     /// error code says whether the page was present, whether the access was a
     /// write, whether it came from user mode, and whether it was an
@@ -1417,7 +1525,8 @@ impl Cpu {
             msr::SYSENTER_CS => self.sysenter_cs as u64,
             msr::SYSENTER_ESP => self.sysenter_esp as u64,
             msr::SYSENTER_EIP => self.sysenter_eip as u64,
-            _ => 0,
+            crate::vmx::msr::FEATURE_CONTROL => self.vmx.feature_control,
+            _ => crate::vmx::read_capability_msr(index).unwrap_or(0),
         }
     }
 
@@ -1444,6 +1553,16 @@ impl Cpu {
             msr::SYSENTER_CS => self.sysenter_cs = value as u32,
             msr::SYSENTER_ESP => self.sysenter_esp = value as u32,
             msr::SYSENTER_EIP => self.sysenter_eip = value as u32,
+            // IA32_FEATURE_CONTROL: writable until its lock bit is set,
+            // which is what firmware does and what a kernel does in its
+            // absence (Linux locks it with VMX enabled on every boot).
+            crate::vmx::msr::FEATURE_CONTROL => {
+                if self.vmx.feature_control & crate::vmx::FEAT_LOCKED != 0 {
+                    self.raise_gp(0);
+                } else {
+                    self.vmx.feature_control = value & 0x7;
+                }
+            }
             _ => {}
         }
     }
@@ -1714,7 +1833,10 @@ impl Cpu {
         let (ea, default_seg) = if self.addrsize {
             self.modrm_ea32(m)
         } else {
-            (self.modrm_offset(m) as u64, SegReg::Ds)
+            // 16-bit addressing: a BP-based operand (rm 2, 3, 6) defaults to
+            // SS, exactly as `modrm_addr_access` decides it.
+            let ss = matches!(m.rm_raw, 2 | 3 | 6);
+            (self.modrm_offset(m) as u64, if ss { SegReg::Ss } else { SegReg::Ds })
         };
         let seg = self.operand_seg_for_exec(default_seg);
         self.linear_addr(seg, ea)
@@ -1800,6 +1922,11 @@ impl Cpu {
             if width == 8 { self.reg8_idx(m.rm) as u64 } else { self.reg_w(m.rm, width) }
         } else {
             let addr = self.rm_addr(m, false);
+            if width > 8 && Self::straddles(addr, width / 8) {
+                if self.pending_exception.is_some() { return 0; }
+                let lin = self.modrm_linear(m);
+                return self.read_split(addr, lin, width / 8) as u64;
+            }
             match width {
                 64 => self.mem.read_u64(addr),
                 32 => self.mem.read_u32(addr) as u64,
@@ -1820,6 +1947,11 @@ impl Cpu {
         }
         let addr = self.rm_addr(m, true);
         if self.pending_exception.is_some() { return; }
+        if width > 8 && Self::straddles(addr, width / 8) {
+            let lin = self.modrm_linear(m);
+            self.write_split(addr, lin, width / 8, val as u128);
+            return;
+        }
         match width {
             64 => self.mem.write_u64(addr, val),
             32 => self.mem.write_u32(addr, val as u32),
@@ -2049,9 +2181,6 @@ impl Cpu {
     /// keyboard/IDE IRQ checks and PIC acknowledge are only done every
     /// `IRQ_CHECK_INTERVAL` instructions to reduce per-instruction overhead.
     pub fn deliver_hardware_interrupt(&mut self) -> bool {
-        if self.servicing_irq {
-            return false;
-        }
         // Tick the PIT (channel 0 drives IRQ0) in batches to reduce
         // per-instruction overhead. We tick every IRQ_CHECK_INTERVAL
         // instructions, passing the accumulated count.
@@ -2059,12 +2188,24 @@ impl Cpu {
         if self.instructions_executed % IRQ_CHECK_INTERVAL != 0 {
             return false;
         }
-        self.pit.tick(IRQ_CHECK_INTERVAL);
+        // The PIT's 1.193182 MHz input runs at INSTRUCTIONS_PER_PIT_CLOCK
+        // emulated instructions per clock. The ratio is the machine's speed
+        // as the guest experiences it: at 1:1 the CPU is a 1.2 MIPS machine,
+        // and a kernel with a 250 Hz tick gets 4.8k instructions between
+        // timer interrupts -- fewer than its timer handler and softirqs cost
+        // it, so it lives inside the timer interrupt (BogoMIPS 0.01, jiffies
+        // running away, a boot that never gets to userspace). At 16:1 it is
+        // a 19 MIPS machine with ~76k instructions per tick, and every
+        // time-based wait (msleep, calibration, RTC and device polls) costs
+        // sixteen times the instructions it did.
+        const INSTRUCTIONS_PER_PIT_CLOCK: u64 = 16;
+        const PIT_CLOCKS: u64 = IRQ_CHECK_INTERVAL / INSTRUCTIONS_PER_PIT_CLOCK;
+        self.pit.tick(PIT_CLOCKS);
         // Advance the wall clock alongside the PIT. One emulated second is
         // one PIT input period (1.193182 MHz), so the RTC keeps step with
         // whatever rate the guest programs the timer at.
         const PIT_HZ: u64 = 1_193_182;
-        self.pit_subsecond += IRQ_CHECK_INTERVAL;
+        self.pit_subsecond += PIT_CLOCKS;
         while self.pit_subsecond >= PIT_HZ {
             self.pit_subsecond -= PIT_HZ;
             self.cmos.tick_second();
@@ -2089,8 +2230,12 @@ impl Cpu {
         if !self.get_flag(crate::cpu::flags::IF) {
             return false;
         }
+        // A guest whose hypervisor asked for external-interrupt exiting does
+        // not take the interrupt: the hypervisor does.
+        if self.vmx.in_guest && self.pic.has_pending() && crate::vmx::interrupt_exit(self) {
+            return true;
+        }
         if let Some(vector) = self.pic.acknowledge() {
-            self.servicing_irq = true;
             self.irq_count += 1;
             self.irq_vectors[vector as usize] += 1;
             if self.pe {
@@ -2132,6 +2277,9 @@ impl Cpu {
         // hardware interrupt. Taking the interrupt first would leave the fault
         // pending and then deliver it one instruction into the interrupt
         // handler, blaming the wrong address entirely.
+        if self.vmx.in_guest {
+            crate::vmx::pre_step(self);
+        }
         if let Some((vector, error_code)) = self.pending_exception.take() {
             self.dispatch_exception(vector, error_code);
         } else {
@@ -2169,7 +2317,11 @@ impl Cpu {
         // what stops demand paging from working -- the first instruction of a
         // freshly exec'd program is always on a not-yet-present page.
         if self.pending_exception.is_none() {
-            crate::instructions::execute(self, &inst);
+            // In a guest, an instruction the hypervisor asked to see exits
+            // instead of executing (see `vmx::intercept`).
+            if !(self.vmx.in_guest && crate::vmx::intercept(self, &inst)) {
+                crate::instructions::execute(self, &inst);
+            }
         }
         self.instructions_executed += 1;
         self.tsc = self.tsc.wrapping_add(1);
@@ -2189,13 +2341,46 @@ impl Cpu {
         // Debug tracing: only when X86EMU_TRACE is set at startup. Uses a
         // cached file handle instead of opening/closing the file per
         // instruction.
-        if self.trace_enabled && self.instructions_executed >= self.trace_from {
+        if self.trace_enabled && self.instructions_executed >= self.trace_from
+            && (!self.trace_user || self.cpl() == 3) {
             use std::io::Write;
             let eip = if self.pe { self.rip } else { self.ip as u64 };
+            // Peek at the next instruction's bytes WITHOUT disturbing the
+            // machine: the translation can fault (the next page is not
+            // present, or a user CS is now looking at kernel text), and a
+            // fault raised by the trace is a fault the untraced run never
+            // took -- the two diverge, and the trace lies about the crash it
+            // was meant to explain. Save and restore the fault state and CR2.
+            let saved = (self.pending_exception, self.cr2);
             let phys = self.phys_ip();
-            let b0 = self.mem.read_u8(phys);
-            let b1 = self.mem.read_u8(phys.wrapping_add(1));
-            let b2 = self.mem.read_u8(phys.wrapping_add(2));
+            let (b0, b1, b2) = if self.pending_exception == saved.0 {
+                (self.mem.read_u8(phys), self.mem.read_u8(phys.wrapping_add(1)),
+                 self.mem.read_u8(phys.wrapping_add(2)))
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            self.pending_exception = saved.0;
+            self.cr2 = saved.1;
+            if self.trace_user {
+                if self.trace_syscalls {
+                    let is_syscall = b0 == 0x0F && b1 == 0x05;
+                    let want = is_syscall || self.trace_after_syscall;
+                    self.trace_after_syscall = is_syscall;
+                    if !want { return inst; }
+                }
+                let line = format!("[{}] rip={:016X} bytes={:02X} {:02X} {:02X} rax={:016X} rcx={:016X} rdx={:016X} rbx={:016X} rsp={:016X} rbp={:016X} rsi={:016X} rdi={:016X} r8={:016X} r9={:016X} r10={:016X} r11={:016X} r12={:016X} r13={:016X} r14={:016X} r15={:016X} fl={:08X}
+",
+                    self.instructions_executed, eip, b0, b1, b2,
+                    self.regs[0], self.regs[1], self.regs[2], self.regs[3],
+                    self.regs[4], self.regs[5], self.regs[6], self.regs[7],
+                    self.regs[8], self.regs[9], self.regs[10], self.regs[11],
+                    self.regs[12], self.regs[13], self.regs[14], self.regs[15],
+                    self.flags);
+                if let Some(ref mut f) = self.trace_file {
+                    let _ = f.write_all(line.as_bytes());
+                }
+                return inst;
+            }
             let line = format!("[{}] cpl={} rip={:016X} bytes={:02X} {:02X} {:02X} rax={:016X} rcx={:016X} rdx={:016X} rbx={:016X} rsp={:016X} rbp={:016X} rsi={:016X} rdi={:016X}
 ",
                 self.instructions_executed, self.cpl(), eip, b0, b1, b2,
@@ -2208,6 +2393,17 @@ impl Cpu {
         inst
     }
 
+    /// A triple fault: the machine resets. Here it halts, flagged -- unless a
+    /// guest is running, in which case it is the hypervisor's to see.
+    pub fn triple_fault(&mut self) {
+        if self.vmx.in_guest {
+            crate::vmx::triple_fault_exit(self);
+            return;
+        }
+        self.triple_fault = true;
+        self.halted = true;
+    }
+
     /// Dispatch an exception through the IDT (protected mode) or IVT
     /// (real mode), pushing an error code first if the exception has one.
     ///
@@ -2216,6 +2412,25 @@ impl Cpu {
     /// with `triple_fault = true` instead of dispatching to a garbage entry
     /// and looping forever (as a real CPU would reset).
     pub fn dispatch_exception(&mut self, vector: u8, error_code: Option<u32>) {
+        // In a guest, an exception the hypervisor's bitmap names is a VM
+        // exit, not a delivery through the guest's IDT.
+        if self.vmx.in_guest && vector < 32 {
+            // The exit reports the faulting instruction, as the guest's
+            // own handler would have seen it.
+            if !matches!(vector, 0x03 | 0x04) {
+                self.rip = self.rip_start;
+            }
+            if crate::vmx::exception_exit(self, vector, error_code) {
+                return;
+            }
+        }
+        self.dispatch_exception_raw(vector, error_code);
+    }
+
+    /// Deliver an exception or interrupt through the IDT/IVT with no VMX
+    /// intercept: what `dispatch_exception` does once it has decided the
+    /// event is the guest's own, and what event injection at VM entry uses.
+    pub fn dispatch_exception_raw(&mut self, vector: u8, error_code: Option<u32>) {
         // Faults report the faulting instruction; traps report the next one.
         // #BP (INT3) and #OF (INTO) are traps -- they are raised *after* the
         // instruction completed and must not re-run it. Everything else here
@@ -2240,15 +2455,13 @@ impl Cpu {
             let gate = if self.long_mode() { 16u32 } else { 8u32 };
             let entry = (vector as u32) * gate;
             if (entry + gate - 1) as u16 > self.idt_limit {
-                self.triple_fault = true;
-                self.halted = true;
+                self.triple_fault();
                 return;
             }
         } else {
             let entry = (vector as usize) * 4;
             if entry + 3 > 0x3FF {
-                self.triple_fault = true;
-                self.halted = true;
+                self.triple_fault();
                 return;
             }
         }
@@ -2256,6 +2469,30 @@ impl Cpu {
             // The error code rides *inside* the frame builder, pushed after
             // EIP so it lands on top of the stack where the handler expects.
             crate::instructions::protected_int_err(self, vector, error_code);
+            // A fault raised while *delivering* a fault is not simply the
+            // next fault. If both are contributory (or page faults) the CPU
+            // escalates to a double fault, and a fault while delivering #DF
+            // is a triple fault -- the machine resets. Without this a stack
+            // that faults on the very first push re-delivers the same #PF
+            // forever, one instruction of progress per attempt and none of
+            // it the kernel's. A benign second exception (a #PF taken while
+            // delivering an external interrupt, say) is left pending and
+            // dispatches normally on its own.
+            if let Some((second, _)) = self.pending_exception {
+                if vector == 0x08 {
+                    self.pending_exception = None;
+                    self.triple_fault();
+                    return;
+                }
+                let contributory = |v: u8| matches!(v, 0x00 | 0x0A | 0x0B | 0x0C | 0x0D);
+                let escalate = (vector == 0x0E && (contributory(second) || second == 0x0E))
+                    || (contributory(vector) && contributory(second));
+                if escalate {
+                    self.pending_exception = None;
+                    self.dispatch_exception(0x08, Some(0));
+                    return;
+                }
+            }
         } else {
             // Real mode has no error code in the frame at all.
             let _ = error_code;

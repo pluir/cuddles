@@ -1,7 +1,8 @@
 //! 8254 Programmable Interval Timer (PIT).
 //!
 //! Three 16-bit countdown channels. Channel 0 is wired to the PIC's IRQ0
-//! (the system timer). The timer is ticked once per emulated instruction.
+//! (the system timer). The timer is ticked by `Cpu::deliver_hardware_interrupt`
+//! at 16 emulated instructions per input clock.
 //!
 //! I/O ports:
 //!   0x40 - channel 0 data

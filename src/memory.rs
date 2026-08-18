@@ -64,6 +64,14 @@ impl Memory {
         unsafe { *self.data.get_unchecked(addr & (Self::SIZE - 1)) }
     }
 
+    /// Read a byte at a physical address, skipping the VGA text window check.
+    /// Used for instruction fetch (code is never in VGA memory).
+    #[inline]
+    pub fn read_u8_raw(&self, addr: usize) -> u8 {
+        // SAFETY: addr is masked to SIZE, which is within the data Vec.
+        unsafe { *self.data.get_unchecked(addr & (Self::SIZE - 1)) }
+    }
+
     /// Read a little-endian u16 at a physical address.
     #[inline]
     pub fn read_u16(&self, addr: usize) -> u16 {

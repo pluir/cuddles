@@ -209,6 +209,16 @@ pub struct Cpu {
     pub trace_file: Option<std::fs::File>,
     /// True if X86EMU_TRACE was set at startup (checked once, not per-instruction).
     pub trace_enabled: bool,
+
+    // ---- Instruction fetch cache (#1) ----
+    /// Cached physical address of the instruction stream. Valid between
+    /// successive `fetch_u8` calls within a single instruction; invalidated
+    /// at the start of each `step()` and whenever EIP/CS/page-mapping changes.
+    pub phys_ip_cache: usize,
+    /// Linear address corresponding to `phys_ip_cache` (for page-boundary checks).
+    pub phys_ip_linear: u32,
+    /// True when `phys_ip_cache` holds a valid mapping for the current EIP.
+    pub phys_ip_valid: bool,
 }
 
 impl Cpu {
@@ -263,6 +273,9 @@ impl Cpu {
             tlb: [TlbEntry::default(); TLB_SIZE],
             trace_file,
             trace_enabled,
+            phys_ip_cache: 0,
+            phys_ip_linear: 0,
+            phys_ip_valid: false,
         }
     }
 
@@ -277,49 +290,74 @@ impl Cpu {
         self.apply_paging(linear)
     }
 
-    // ---- 16-bit register access ----
+    /// Invalidate the cached instruction-fetch physical address. Must be
+    /// called whenever EIP, CS, or the page mapping changes (jumps, calls,
+    /// returns, interrupts, exceptions, paging enable/disable, MOV CR3).
+    #[inline]
+    pub fn invalidate_phys_ip(&mut self) {
+        self.phys_ip_valid = false;
+    }
 
-    pub fn reg16(&self, r: Reg16) -> u16 {
-        match r {
-            Reg16::Ax => self.ax, Reg16::Cx => self.cx, Reg16::Dx => self.dx,
-            Reg16::Bx => self.bx, Reg16::Sp => self.sp, Reg16::Bp => self.bp,
-            Reg16::Si => self.si, Reg16::Di => self.di,
+    /// Compute the linear address of the instruction stream (for page-boundary
+    /// checks in the fetch cache).
+    #[inline]
+    fn ip_linear(&self) -> u32 {
+        if self.pe {
+            self.seg_desc[SegReg::Cs as usize].base.wrapping_add(self.eip)
+        } else {
+            ((self.cs as u32) << 4) + self.ip as u32
         }
     }
 
+    // ---- 16-bit register access ----
+
+    /// Lookup table for 16-bit register fields (avoids 8-way match).
+    /// Indices: 0=AX, 1=CX, 2=DX, 3=BX, 4=SP, 5=BP, 6=SI, 7=DI.
+    #[inline]
+    pub fn reg16(&self, r: Reg16) -> u16 {
+        match r as u8 {
+            0 => self.ax, 1 => self.cx, 2 => self.dx, 3 => self.bx,
+            4 => self.sp, 5 => self.bp, 6 => self.si, _ => self.di,
+        }
+    }
+
+    #[inline]
     pub fn set_reg16(&mut self, r: Reg16, v: u16) {
-        match r {
-            Reg16::Ax => { self.ax = v; self.eax = (self.eax & 0xFFFF0000) | v as u32; }
-            Reg16::Cx => { self.cx = v; self.ecx = (self.ecx & 0xFFFF0000) | v as u32; }
-            Reg16::Dx => { self.dx = v; self.edx = (self.edx & 0xFFFF0000) | v as u32; }
-            Reg16::Bx => { self.bx = v; self.ebx = (self.ebx & 0xFFFF0000) | v as u32; }
-            Reg16::Sp => { self.sp = v; self.esp = (self.esp & 0xFFFF0000) | v as u32; }
-            Reg16::Bp => { self.bp = v; self.ebp = (self.ebp & 0xFFFF0000) | v as u32; }
-            Reg16::Si => { self.si = v; self.esi = (self.esi & 0xFFFF0000) | v as u32; }
-            Reg16::Di => { self.di = v; self.edi = (self.edi & 0xFFFF0000) | v as u32; }
+        let idx = r as u8;
+        match idx {
+            0 => { self.ax = v; self.eax = (self.eax & 0xFFFF0000) | v as u32; }
+            1 => { self.cx = v; self.ecx = (self.ecx & 0xFFFF0000) | v as u32; }
+            2 => { self.dx = v; self.edx = (self.edx & 0xFFFF0000) | v as u32; }
+            3 => { self.bx = v; self.ebx = (self.ebx & 0xFFFF0000) | v as u32; }
+            4 => { self.sp = v; self.esp = (self.esp & 0xFFFF0000) | v as u32; }
+            5 => { self.bp = v; self.ebp = (self.ebp & 0xFFFF0000) | v as u32; }
+            6 => { self.si = v; self.esi = (self.esi & 0xFFFF0000) | v as u32; }
+            _ => { self.di = v; self.edi = (self.edi & 0xFFFF0000) | v as u32; }
         }
     }
 
     // ---- 32-bit register access ----
 
+    #[inline]
     pub fn reg32(&self, r: Reg32) -> u32 {
-        match r {
-            Reg32::Eax => self.eax, Reg32::Ecx => self.ecx, Reg32::Edx => self.edx,
-            Reg32::Ebx => self.ebx, Reg32::Esp => self.esp, Reg32::Ebp => self.ebp,
-            Reg32::Esi => self.esi, Reg32::Edi => self.edi,
+        match r as u8 {
+            0 => self.eax, 1 => self.ecx, 2 => self.edx, 3 => self.ebx,
+            4 => self.esp, 5 => self.ebp, 6 => self.esi, _ => self.edi,
         }
     }
 
+    #[inline]
     pub fn set_reg32(&mut self, r: Reg32, v: u32) {
-        match r {
-            Reg32::Eax => { self.eax = v; self.ax = v as u16; }
-            Reg32::Ecx => { self.ecx = v; self.cx = v as u16; }
-            Reg32::Edx => { self.edx = v; self.dx = v as u16; }
-            Reg32::Ebx => { self.ebx = v; self.bx = v as u16; }
-            Reg32::Esp => { self.esp = v; self.sp = v as u16; }
-            Reg32::Ebp => { self.ebp = v; self.bp = v as u16; }
-            Reg32::Esi => { self.esi = v; self.si = v as u16; }
-            Reg32::Edi => { self.edi = v; self.di = v as u16; }
+        let idx = r as u8;
+        match idx {
+            0 => { self.eax = v; self.ax = v as u16; }
+            1 => { self.ecx = v; self.cx = v as u16; }
+            2 => { self.edx = v; self.dx = v as u16; }
+            3 => { self.ebx = v; self.bx = v as u16; }
+            4 => { self.esp = v; self.sp = v as u16; }
+            5 => { self.ebp = v; self.bp = v as u16; }
+            6 => { self.esi = v; self.si = v as u16; }
+            _ => { self.edi = v; self.di = v as u16; }
         }
     }
 
@@ -371,6 +409,10 @@ impl Cpu {
             self.seg_desc[s as usize] = desc;
         }
         self.set_seg(s, selector);
+        // Loading CS changes the instruction-stream base.
+        if s == SegReg::Cs {
+            self.invalidate_phys_ip();
+        }
     }
 
     /// Translate a logical address through a segment to a physical address.
@@ -391,6 +433,7 @@ impl Cpu {
         for e in self.tlb.iter_mut() {
             e.valid = false;
         }
+        self.invalidate_phys_ip();
     }
 
     /// Invalidate a single TLB entry for the given linear address (INVLPG).
@@ -456,58 +499,79 @@ impl Cpu {
 
     // ---- Instruction stream fetch ----
 
+    /// Ensure the phys_ip cache is valid for the current EIP. Called once
+    /// at the start of an instruction (or after a page-boundary crossing).
+    #[inline]
+    fn ensure_phys_ip(&mut self) {
+        if !self.phys_ip_valid {
+            let linear = self.ip_linear();
+            self.phys_ip_linear = linear;
+            self.phys_ip_cache = self.apply_paging(linear);
+            self.phys_ip_valid = true;
+        }
+    }
+
+    /// Peek at the next instruction byte without advancing EIP. Uses the
+    /// fetch cache for speed. Used by the decoder's prefix loop.
+    #[inline]
+    pub fn peek_u8(&mut self) -> u8 {
+        self.ensure_phys_ip();
+        self.mem.read_u8_raw(self.phys_ip_cache)
+    }
+
     #[inline]
     pub fn fetch_u8(&mut self) -> u8 {
-        let addr = self.phys_ip();
-        let b = self.mem.read_u8(addr);
+        self.ensure_phys_ip();
+        let b = self.mem.read_u8_raw(self.phys_ip_cache);
         if self.pe {
             self.eip = self.eip.wrapping_add(1);
         } else {
             self.ip = self.ip.wrapping_add(1);
+        }
+        // Advance the cached physical + linear addresses. If we just crossed
+        // a page boundary, invalidate so the next fetch re-translates.
+        self.phys_ip_cache = self.phys_ip_cache.wrapping_add(1);
+        let crossed = (self.phys_ip_linear & 0xFFF) == 0xFFF;
+        self.phys_ip_linear = self.phys_ip_linear.wrapping_add(1);
+        if crossed {
+            self.phys_ip_valid = false;
         }
         b
     }
 
     #[inline]
     pub fn fetch_u16(&mut self) -> u16 {
-        // Fast path: fetch both bytes from the same page when possible.
-        // This avoids a second TLB lookup / page walk for the second byte.
-        let addr = self.phys_ip();
-        let lo = self.mem.read_u8(addr);
-        if self.pe {
-            self.eip = self.eip.wrapping_add(1);
-        } else {
-            self.ip = self.ip.wrapping_add(1);
-        }
-        // Check if the next byte is on the same page (offset < 0xFFF).
-        let next_addr = if self.pe {
-            // Recompute: the linear address for eip+1. If we're not at a
-            // page boundary, this is just addr+1.
-            if (addr & 0xFFF) != 0xFFF {
-                addr + 1
+        // Fast path: if both bytes are on the same page, read them without
+        // any re-translation. Only re-translate if we straddle a page boundary.
+        self.ensure_phys_ip();
+        let addr = self.phys_ip_cache;
+        // Check if the 2 bytes straddle a page boundary.
+        if (self.phys_ip_linear & 0xFFF) <= 0xFFE {
+            // Same page: read both bytes directly.
+            let lo = self.mem.read_u8_raw(addr) as u16;
+            let hi = self.mem.read_u8_raw(addr + 1) as u16;
+            // Advance EIP by 2.
+            if self.pe {
+                self.eip = self.eip.wrapping_add(2);
             } else {
-                self.phys_ip()
+                self.ip = self.ip.wrapping_add(2);
             }
-        } else {
-            // Real mode: no paging, linear = seg<<4 + ip.
-            Memory::phys(self.cs, self.ip)
-        };
-        let hi = self.mem.read_u8(next_addr);
-        if self.pe {
-            self.eip = self.eip.wrapping_add(1);
-        } else {
-            self.ip = self.ip.wrapping_add(1);
+            self.phys_ip_cache = self.phys_ip_cache.wrapping_add(2);
+            self.phys_ip_linear = self.phys_ip_linear.wrapping_add(2);
+            return lo | (hi << 8);
         }
-        lo as u16 | ((hi as u16) << 8)
+        // Page boundary: fall back to two single-byte fetches.
+        let lo = self.fetch_u8() as u16;
+        let hi = self.fetch_u8() as u16;
+        lo | (hi << 8)
     }
 
     #[inline]
     pub fn fetch_u32(&mut self) -> u32 {
-        let b0 = self.fetch_u8() as u32;
-        let b1 = self.fetch_u8() as u32;
-        let b2 = self.fetch_u8() as u32;
-        let b3 = self.fetch_u8() as u32;
-        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        // Reuse fetch_u16 for the two halves. The fetch cache keeps this fast.
+        let lo = self.fetch_u16() as u32;
+        let hi = self.fetch_u16() as u32;
+        lo | (hi << 16)
     }
 
     /// Read the ModR/M byte and decode it into a `ModRm` descriptor, fetching
@@ -874,17 +938,17 @@ impl Cpu {
         if self.servicing_irq {
             return false;
         }
-        // Tick the PIT (channel 0 drives IRQ0) every instruction.
-        self.pit.tick(1);
-        if self.pit.irq0 {
-            self.pit.irq0 = false;
-            self.pic.raise_irq(0);
-        }
-        // Only check the other devices and the PIC every N instructions.
-        // This avoids checking the keyboard/IDE/PIC on every single step.
+        // Tick the PIT (channel 0 drives IRQ0) in batches to reduce
+        // per-instruction overhead. We tick every IRQ_CHECK_INTERVAL
+        // instructions, passing the accumulated count.
         const IRQ_CHECK_INTERVAL: u64 = 64;
         if self.instructions_executed % IRQ_CHECK_INTERVAL != 0 {
             return false;
+        }
+        self.pit.tick(IRQ_CHECK_INTERVAL);
+        if self.pit.irq0 {
+            self.pit.irq0 = false;
+            self.pic.raise_irq(0);
         }
         // Keyboard (8042) drives IRQ1.
         if self.kbd.irq1 {
@@ -916,6 +980,7 @@ impl Cpu {
                 self.cs = seg;
                 self.ip = off;
             }
+            self.invalidate_phys_ip();
             true
         } else {
             false
@@ -937,6 +1002,9 @@ impl Cpu {
         if let Some((vector, error_code)) = self.pending_exception.take() {
             self.dispatch_exception(vector, error_code);
         }
+        // Invalidate the instruction-fetch cache at the start of each step.
+        // The decoder's fetch calls will re-establish it.
+        self.invalidate_phys_ip();
         let inst = crate::instructions::decode(self);
         crate::instructions::execute(self, &inst);
         self.instructions_executed += 1;
@@ -1010,6 +1078,7 @@ impl Cpu {
             self.cs = seg;
             self.ip = off;
         }
+        self.invalidate_phys_ip();
     }
 
     /// Run until halted or `max` instructions have executed.

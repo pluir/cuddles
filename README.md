@@ -18,23 +18,34 @@ and **Intel VT-x** (VMXON, a VMCS, VMLAUNCH/VMRESUME and VM exits), so a
 
 A real **64-bit Alpine Linux kernel (6.18)** boots from `--kernel-elf64`
 through its whole init, unpacks its initramfs, runs `/init` — busybox on musl,
-in ring 3, SSE2 and all — loads its boot-driver modules, and goes looking for
-boot media:
+in ring 3, SSE2 and all — loads its boot-driver modules, looks for boot media,
+and drops to the initramfs emergency shell when there is none:
 
 ```
-[   63.754665] Run /init as init process
-[   65.232978] Alpine Init 3.14.0-r0
- * Loading boot drivers: [   66.774632] loop: module loaded
-[   67.919385] squashfs: version 4.0 (2009/01/31) Phillip Lougher
-[   67.990152] Loading boot drivers: ok.
- * Mounting boot media:
+[   63.754741] Run /init as init process
+[   65.252059] Alpine Init 3.14.0-r0
+ * Loading boot drivers: [   66.798577] loop: module loaded
+[   67.939634] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[   68.010422] Loading boot drivers: ok.
+ * Mounting boot media: [  103.859489] Mounting boot media: failed.
+Launching initramfs emergency recovery shell.
+
+sh: can't access tty; job control turned off
+~ #
 ```
 
-There is no boot media to find; Alpine's `nlplug-findfs` waits for it and
-currently never gives up — its two threads end in a pair of timeless
-`futex` waits (see the roadmap). With that step skipped, `/init` drops to the
-initramfs emergency shell (`~ #`), which is where the earlier iterations of
-this boot ended.
+Without a `--disk` there is no boot media to find, so `nlplug-findfs`
+searches, times out and reports failure — which is what it does on real
+hardware too. The shell it lands in can be typed at, and the machine has a
+PCI bus with a virtio block device on it:
+
+```
+~ # head -c 14 /dev/vda; echo
+VIRTIO_DISK_OK
+~ # echo KBD_WORKS; uname -m
+KBD_WORKS
+x86_64
+```
 
 A real 32-bit Linux kernel (buildroot, 2.6.34.14) boots on this emulator from
 `startup_32` to a busybox shell prompt: it brings up its devices, mounts an
@@ -80,12 +91,37 @@ enough RAM for a 6.x kernel and a 30 MB initramfs:
 ```sh
 python tools/unpack_bzimage.py images/vmlinuz-virt images/alpine_kernel.bin
 ./target/release/x86emu --mem 2G --kernel-elf64 images/alpine_kernel.bin \
-    --initrd images/initramfs-virt --cmdline "console=tty0" 1600000000
+    --initrd images/initramfs-virt --cmdline "console=tty0" 2500000000
 ```
 
-Userspace starts at about 1.2 billion instructions and `/init` has loaded
-its modules by 1.6 billion. `X86EMU_TRACE_USER=1 X86EMU_TRACE_SYSCALLS=1`
-is the way to watch what it does from there.
+`tools/extract_iso.py` will pull the pair out of an Alpine ISO too — it
+walks subdirectories, so `BOOT/...` works — but Alpine's ISO carries long
+filenames through Rock Ridge, which the extractor does not implement, so
+list the directory first and use the mangled 8.3 names it prints. The
+netboot files are plain downloads and avoid the question.
+
+Give the machine a disk and type at it. `--disk` appears as `/dev/vda`
+through a virtio block device on the emulated PCI bus, and `--keys` types at
+the keyboard:
+
+```sh
+python -c "open('disk.img','wb').write(bytes(16*1024*1024))"
+./target/release/x86emu --mem 2G --kernel-elf64 images/alpine_kernel.bin \
+    --initrd images/initramfs-virt --cmdline "console=tty0" \
+    --disk disk.img --keys 'head -c 14 /dev/vda; echo\n' \
+    --keys-at 2600000000 3800000000
+```
+
+`--keys-at` names the instruction to start typing at, and it is not a
+nicety: a keyboard driver attaching is not the same as something reading.
+Keys delivered before the shell opens the console are read by `atkbd` and
+thrown away, so typing too early silently loses the front of the line.
+
+Userspace starts at about 1.2 billion instructions, `/init` has loaded its
+modules by 1.6 billion, and the shell arrives at about 2.4 billion.
+`X86EMU_TRACE_USER=1 X86EMU_TRACE_SYSCALLS=1` is the way to watch what it
+does from there, and `tools/systrace.py` turns that trace into named
+syscalls per thread.
 
 Debugging switches, all off by default and all environment variables:
 
@@ -626,9 +662,7 @@ Hello from x86emu!
    demand paging and copy-on-write behave as the kernel expects.
 
    Not done: the in-kernel bzImage decompressor still does not run correctly,
-   so `--kernel-elf` loads the decompressed ELF directly. The 8042 keyboard
-   controller does not implement the command interface the kernel probes
-   (`i8042: probe failed`), so the shell has no keyboard input yet.
+   so `--kernel-elf` loads the decompressed ELF directly.
 10. **SSE / SSE2 / SSE3** — *done* (`src/sse.rs`). The x86-64 ABI requires
     SSE2, and a 64-bit libc uses it for things that have nothing to do with
     floating point: musl's malloc initialises a bin sentinel with
@@ -639,13 +673,20 @@ Hello from x86emu!
     now has one decode table keyed on opcode + mandatory prefix, one executor
     with lane helpers, FXSAVE/FXRSTOR with the 80-bit conversions, and
     twenty-odd tests that hand-assemble each family.
-11. **Boot a real OS (Linux, 64-bit)** — *done to userspace*. Alpine's 6.18
-    kernel boots, unpacks its initramfs, runs `/init` (busybox on musl, in
-    ring 3), execs applets and loads modules; the initramfs shell was reached
-    while a bug kept `nlplug-findfs` from running, and with that fixed
-    `nlplug-findfs` now waits forever for boot media — a userspace deadlock
-    (two threads, two timeless `futex` waits) still to be explained. Beyond
-    SSE, what it took was again correctness in things that already existed:
+11. **Boot a real OS (Linux, 64-bit)** — *done*. Alpine's 6.18 kernel boots,
+    unpacks its initramfs, runs `/init` (busybox on musl, in ring 3), execs
+    applets, loads modules, searches for boot media, times out and drops to
+    the initramfs emergency shell. The last thing in the way was a deadlock
+    in `nlplug-findfs` — two threads in timeless `futex` waits — and it was
+    not a lost wakeup but **`XADD` committing its register before its
+    memory**. `fork()` makes libc's data page copy-on-write, so the next
+    `__unlock` (`lock xadd $0x7FFFFFFF, (l)`) faults on its store; the
+    restart then read its own clobbered source register back as the addend,
+    turning musl's lock word into `2V` instead of `V+1` and matching the
+    `INT_MIN+1` test that decides whether to wake anyone. Two hundred forks
+    later the word had walked to `-1`, which no unlock can clear, and the
+    next `fork()` waited on it forever. Beyond SSE, what it took was again
+    correctness in things that already existed:
 
     - **`SGDT`/`SIDT` were missing.** `cpu_init` stores the GDTR to verify
       it; the `#UD` that produced went to a `#UD` handler that then...

@@ -2,7 +2,9 @@
 """Pull files out of the ISO9660 image the boot effort uses.
 
     python tools/extract_iso.py images/linux.iso            # list the root
+    python tools/extract_iso.py images/linux.iso BOOT        # list a directory
     python tools/extract_iso.py images/linux.iso ROOT.BIN images/root.bin
+    python tools/extract_iso.py alpine.iso BOOT/VMLINUZ-VIRT images/vmlinuz-virt
 
 The ISO carries the kernel (BZIMAGE) and an ext2 root filesystem (ROOT.BIN)
 that isolinux hands to the kernel as an initrd. `images/root.bin` is what
@@ -50,35 +52,70 @@ def root_of(data):
     return struct.unpack('<I', rec[2:6])[0], struct.unpack('<I', rec[10:14])[0]
 
 
+def entries_of(data, lba, size):
+    """Directory entries, without the "." and ".." records."""
+    for name, extent, length, is_dir in listdir(data, lba, size):
+        if len(name) == 1 and name in (chr(0), chr(1)):
+            continue
+        yield name, extent, length, is_dir
+
+
+def bare_name(name):
+    """An ISO9660 name without its ";1" version suffix and trailing dot."""
+    return name.split(';')[0].upper().rstrip('.')
+
+
+def resolve(data, path):
+    """Walk a slash-separated path from the root.
+
+    Alpine keeps its kernel and initramfs under /boot, so one level of
+    directory records is not enough; the 32-bit image happened to have both
+    of its files at the root, which is why this went unnoticed.
+    """
+    lba, size = root_of(data)
+    parts = [p for p in path.upper().split('/') if p]
+    for depth, want in enumerate(parts):
+        for name, extent, length, is_dir in entries_of(data, lba, size):
+            if bare_name(name) != want and name.upper() != want:
+                continue
+            if depth == len(parts) - 1:
+                return extent, length, is_dir
+            if not is_dir:
+                sys.exit('%s is not a directory' % want)
+            lba, size = extent, length
+            break
+        else:
+            sys.exit('no such entry in the image: %s' % want)
+    return lba, size, True
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
-    lba, size = root_of(data)
-    entries = list(listdir(data, lba, size))
 
-    if len(sys.argv) == 2:
-        for name, _, length, is_dir in entries:
-            # The first two records are "." and ".." with one-byte names.
-            if len(name) == 1 and name in ('\0', '\1'):
-                continue
+    # With no output file this lists a directory: the root by default, or
+    # whatever path is named.
+    if len(sys.argv) < 4:
+        if len(sys.argv) == 2:
+            lba, size = root_of(data)
+        else:
+            lba, size, is_dir = resolve(data, sys.argv[2])
+            if not is_dir:
+                sys.exit('%s is a file; give an output path to extract it'
+                         % sys.argv[2])
+        for name, _, length, is_dir in entries_of(data, lba, size):
             print('%-24s %10d  %s' % (name, length, 'dir' if is_dir else 'file'))
         return
 
     if len(sys.argv) != 4:
-        sys.exit('usage: extract_iso.py <iso> <NAME> <outfile>')
-    want = sys.argv[2].upper()
-    for name, extent, length, is_dir in entries:
-        # ISO9660 names carry a ";1" version suffix, and a trailing dot when
-        # the name has no extension ("BZIMAGE.;1").
-        bare = name.split(';')[0].upper().rstrip('.')
-        if is_dir or (bare != want and name.upper() != want):
-            continue
-        blob = data[extent * SECTOR:extent * SECTOR + length]
-        open(sys.argv[3], 'wb').write(blob)
-        print('wrote %s (%d bytes) from %s' % (sys.argv[3], len(blob), name))
-        return
-    sys.exit('no such file in the image: %s' % sys.argv[2])
+        sys.exit('usage: extract_iso.py <iso> <PATH> <outfile>')
+    extent, length, is_dir = resolve(data, sys.argv[2])
+    if is_dir:
+        sys.exit('%s is a directory' % sys.argv[2])
+    blob = data[extent * SECTOR:extent * SECTOR + length]
+    open(sys.argv[3], 'wb').write(blob)
+    print('wrote %s (%d bytes)' % (sys.argv[3], len(blob)))
 
 
 main()

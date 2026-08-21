@@ -382,12 +382,24 @@ pub struct Cpu {
     pub vga: crate::vga::Vga,
     /// 8042 keyboard controller.
     pub kbd: crate::kbd::Kbd,
+    /// Scancodes still to be typed (`--keys`), already expanded to make and
+    /// break codes. They are fed one at a time, and only once a driver in the
+    /// guest has attached to the keyboard and drained the previous one --
+    /// bytes typed before `atkbd` binds go nowhere, and a burst delivered
+    /// faster than the guest reads is a burst it loses.
+    pub key_script: std::collections::VecDeque<u8>,
+    /// Earliest instruction count at which the next scancode may be sent.
+    key_next: u64,
     /// 8237 DMA controller.
     pub dma: crate::dma::Dma,
     /// MC146818 CMOS RTC (ports 0x70/0x71).
     pub cmos: crate::cmos::Cmos,
     /// IDE/ATA disk controller.
     pub ide: crate::ide::Ide,
+    /// PCI bus: configuration space and the devices on it.
+    pub pci: crate::pci::Pci,
+    /// The virtio block device that hangs off it.
+    pub virtio: crate::virtio::VirtioBlk,
     /// x87 FPU.
     pub fpu: crate::fpu::Fpu,
     /// SSE/SSE2: the sixteen 128-bit XMM registers (XMM0–XMM15).
@@ -581,9 +593,13 @@ impl Cpu {
             pic: crate::pic::Pic::new(),
             vga: crate::vga::Vga::new(),
             kbd: crate::kbd::Kbd::new(),
+            key_script: std::collections::VecDeque::new(),
+            key_next: 0,
             dma: crate::dma::Dma::new(),
             cmos: crate::cmos::Cmos::new(),
             ide: crate::ide::Ide::new(),
+            pci: crate::pci::Pci::new(),
+            virtio: crate::virtio::VirtioBlk::new(),
             fpu: crate::fpu::Fpu::new(),
             xmm: [0; 16],
             mxcsr: 0x1F80, // all exceptions masked, round-to-nearest
@@ -2071,7 +2087,12 @@ impl Cpu {
 
     /// Read a byte from an I/O port.
     pub fn port_in(&mut self, port: u16) -> u8 {
+        if let Some(off) = self.virtio_port(port) {
+            return self.virtio.read(off, 1) as u8;
+        }
         match port {
+            // PCI configuration data, one lane of the addressed register.
+            0xCFC..=0xCFF => self.pci.read_data((port - 0xCFC) as usize, 1) as u8,
             0x20 => self.pic.read_command(0x20),
             0x21 => self.pic.read_data(0x21),
             0xA0 => self.pic.read_command(0xA0),
@@ -2106,7 +2127,11 @@ impl Cpu {
 
     /// Read a 16-bit value from an I/O port (two byte reads).
     pub fn port_in16(&mut self, port: u16) -> u16 {
+        if let Some(off) = self.virtio_port(port) {
+            return self.virtio.read(off, 2) as u16;
+        }
         match port {
+            0xCFC..=0xCFF => self.pci.read_data((port - 0xCFC) as usize, 2) as u16,
             // IDE/ATA: data register (0x1F0) is 16-bit; the command block
             // registers (0x1F1-0x1F7) are byte registers read through the
             // 16-bit port path.
@@ -2122,9 +2147,63 @@ impl Cpu {
         }
     }
 
+    /// Offset into the virtio device's register window, when `port` falls
+    /// inside the I/O BAR the guest has assigned it. The base moves: the
+    /// kernel reassigns BARs during enumeration, so this is looked up rather
+    /// than fixed.
+    #[inline]
+    fn virtio_port(&self, port: u16) -> Option<u16> {
+        let base = self.pci.virtio_io_base()?;
+        if port >= base && port < base + 64 {
+            Some(port - base)
+        } else {
+            None
+        }
+    }
+
+    /// Read a doubleword from an I/O port. Configuration mechanism #1 is
+    /// the reason this exists: the address latch at 0xCF8 is a 32-bit
+    /// register and `in eax, dx` is how a driver reads the data port.
+    /// Anything else is two 16-bit accesses, low half first.
+    pub fn port_in32(&mut self, port: u16) -> u32 {
+        if let Some(off) = self.virtio_port(port) {
+            return self.virtio.read(off, 4);
+        }
+        match port {
+            0xCF8 => self.pci.address,
+            0xCFC..=0xCFF => self.pci.read_data((port - 0xCFC) as usize, 4),
+            _ => {
+                let lo = self.port_in16(port);
+                let hi = self.port_in16(port.wrapping_add(2));
+                lo as u32 | ((hi as u32) << 16)
+            }
+        }
+    }
+
+    /// Write a doubleword to an I/O port.
+    pub fn port_out32(&mut self, port: u16, val: u32) {
+        if let Some(off) = self.virtio_port(port) {
+            self.virtio.write(off, val, &mut self.mem);
+            return;
+        }
+        match port {
+            0xCF8 => self.pci.address = val,
+            0xCFC..=0xCFF => self.pci.write_data((port - 0xCFC) as usize, 4, val),
+            _ => {
+                self.port_out16(port, val as u16);
+                self.port_out16(port.wrapping_add(2), (val >> 16) as u16);
+            }
+        }
+    }
+
     /// Write a byte to an I/O port.
     pub fn port_out(&mut self, port: u16, val: u8) {
+        if let Some(off) = self.virtio_port(port) {
+            self.virtio.write(off, val as u32, &mut self.mem);
+            return;
+        }
         match port {
+            0xCFC..=0xCFF => self.pci.write_data((port - 0xCFC) as usize, 1, val as u32),
             0x20 => self.pic.write_command(0x20, val),
             0x21 => self.pic.write_data(0x21, val),
             0xA0 => self.pic.write_command(0xA0, val),
@@ -2155,7 +2234,12 @@ impl Cpu {
 
     /// Write a 16-bit value to an I/O port (two byte writes).
     pub fn port_out16(&mut self, port: u16, val: u16) {
+        if let Some(off) = self.virtio_port(port) {
+            self.virtio.write(off, val as u32, &mut self.mem);
+            return;
+        }
         match port {
+            0xCFC..=0xCFF => self.pci.write_data((port - 0xCFC) as usize, 2, val as u32),
             // IDE/ATA command block (ports 0x1F0-0x1F7 exceed u8 range, so
             // they are reached through the 16-bit port path).
             0x1F0 => self.ide.write_data(val),
@@ -2214,10 +2298,30 @@ impl Cpu {
             self.pit.irq0 = false;
             self.pic.raise_irq(0);
         }
+        // Scripted keystrokes (`--keys`), paced by the guest rather than by a
+        // clock: the interval is only a floor, and `idle()` is what actually
+        // holds the next one back until the last has been read.
+        const KEY_INTERVAL: u64 = 20_000;
+        if !self.key_script.is_empty()
+            && self.kbd.driver_attached
+            && self.kbd.idle()
+            && self.instructions_executed >= self.key_next
+        {
+            if let Some(scancode) = self.key_script.pop_front() {
+                self.kbd.push_scancode(scancode);
+                self.key_next = self.instructions_executed + KEY_INTERVAL;
+            }
+        }
         // Keyboard (8042) drives IRQ1.
         if self.kbd.irq1 {
             self.kbd.irq1 = false;
             self.pic.raise_irq(1);
+        }
+        // The virtio block device drives its PCI interrupt line. Unlike the
+        // others this is level-triggered: it stays asserted until the driver
+        // reads the ISR, which is what clears it.
+        if self.virtio.irq {
+            self.pic.raise_irq(crate::pci::VIRTIO_IRQ);
         }
         // IDE drives IRQ14 when a transfer completes.
         if self.ide.busy {
@@ -2391,6 +2495,22 @@ impl Cpu {
             }
         }
         inst
+    }
+
+    /// Queue text to be typed at the emulated keyboard, starting no earlier
+    /// than instruction `start`. Characters with no key on a US layout are
+    /// skipped rather than mistyped.
+    ///
+    /// `start` matters more than it looks. Waiting for a keyboard driver to
+    /// attach is not the same as waiting for something to be *reading*: keys
+    /// delivered while the kernel is still booting are read from the
+    /// controller by `atkbd`, handed to a console nobody has opened yet, and
+    /// dropped. Typing `echo KBD_WORKS` from the moment the driver bound
+    /// arrived at the shell as `bD_WORKS`, the first thirteen scancodes gone
+    /// -- which is also why the surviving `B` lost its shift.
+    pub fn type_keys(&mut self, text: &str, start: u64) {
+        self.key_script.extend(crate::kbd::scancodes_for(text));
+        self.key_next = start;
     }
 
     /// A triple fault: the machine resets. Here it halts, flagged -- unless a

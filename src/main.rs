@@ -3,8 +3,8 @@
 //! Usage:
 //!   x86emu [--mem SIZE] <file> [segment:offset] [max_instructions]
 //!   x86emu [--mem SIZE] --boot <bootsector.bin> [max_instructions]
-//!   x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [n]
-//!   x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [n]
+//!   x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [--keys s] [--keys-at n] [--disk img] [n]
+//!   x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [--keys s] [--keys-at n] [--disk img] [n]
 //!   x86emu [--mem SIZE] --long <flat64.bin> [load_addr_hex] [max_instructions]
 //!
 //! Defaults: load at 0000:0x0100 (like a DOS .COM), run up to 100000
@@ -70,8 +70,8 @@ fn main() -> ExitCode {
     if args.len() < 2 {
         eprintln!("usage: x86emu [--mem SIZE] <file> [segment:offset] [max_instructions]");
         eprintln!("       x86emu [--mem SIZE] --boot <bootsector.bin> [max_instructions]");
-        eprintln!("       x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [n]");
-        eprintln!("       x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [n]");
+        eprintln!("       x86emu [--mem SIZE] --kernel-elf <kernel.elf> [--initrd f] [--cmdline s] [--keys s] [--keys-at n] [--disk img] [n]");
+        eprintln!("       x86emu [--mem SIZE] --kernel-elf64 <kernel.elf> [--initrd f] [--cmdline s] [--keys s] [--keys-at n] [--disk img] [n]");
         eprintln!("       x86emu [--mem SIZE] --long <flat64.bin> [load_addr_hex] [max_instructions]");
         return ExitCode::from(2);
     }
@@ -286,6 +286,28 @@ fn dump(ram: usize, args: &[String]) -> ExitCode {
 /// Load a decompressed kernel ELF and run it (bypasses the in-kernel
 /// decompressor, which the emulator does not yet execute correctly).
 ///
+/// Interpret the backslash escapes a shell will not: `--keys` is typed at
+/// the guest, and a command line without a newline never runs.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => { out.push('\\'); out.push(other); }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Usage: --kernel-elf <kernel.elf> [--initrd <file>] [--cmdline <str>]
 ///        [max_instructions]
 fn kernel_elf(ram: usize, args: &[String], long_mode: bool) -> ExitCode {
@@ -297,6 +319,9 @@ fn kernel_elf(ram: usize, args: &[String], long_mode: bool) -> ExitCode {
     let path = &args[0];
     let mut initrd_path: Option<&String> = None;
     let mut cmdline = String::from("console=tty0");
+    let mut keys: Option<String> = None;
+    let mut disk_path: Option<&String> = None;
+    let mut keys_at: u64 = 0;
     let mut max: u64 = 5_000_000;
     let mut i = 1;
     while i < args.len() {
@@ -304,6 +329,17 @@ fn kernel_elf(ram: usize, args: &[String], long_mode: bool) -> ExitCode {
             "--initrd" => { initrd_path = args.get(i + 1); i += 2; }
             "--cmdline" => {
                 if let Some(c) = args.get(i + 1) { cmdline = c.clone(); }
+                i += 2;
+            }
+            "--keys" => {
+                if let Some(k) = args.get(i + 1) { keys = Some(unescape(k)); }
+                i += 2;
+            }
+            "--disk" => { disk_path = args.get(i + 1); i += 2; }
+            "--keys-at" => {
+                if let Some(n) = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                    keys_at = n;
+                }
                 i += 2;
             }
             other => {
@@ -333,6 +369,34 @@ fn kernel_elf(ram: usize, args: &[String], long_mode: bool) -> ExitCode {
 
     let mut cpu = Cpu::with_ram(ram);
     println!("machine: {} MiB of RAM", cpu.mem.ram_size() >> 20);
+    if let Some(text) = &keys {
+        cpu.type_keys(text, keys_at);
+        println!("queued {} scancodes to type, from instruction {}",
+            cpu.key_script.len(), keys_at);
+    }
+    if let Some(path) = disk_path {
+        match std::fs::read(path) {
+            Ok(image) => {
+                // A drive is a whole number of sectors; a short tail would be
+                // read back as a partial sector rather than refused, so round
+                // it up and let the padding read as zeros.
+                let sectors = image.len().div_ceil(512);
+                println!("disk: {} ({} sectors)", path, sectors);
+                let mut image = image;
+                image.resize(sectors * 512, 0);
+                // Presented on both controllers: a guest uses whichever it
+                // has a driver for, and no guest here has both. Alpine's
+                // virt initramfs carries virtio_blk and no ATA driver at
+                // all, while the BIOS INT 0x13 path only knows the IDE one.
+                cpu.virtio.attach(image.clone());
+                cpu.ide.load_disk(image);
+            }
+            Err(e) => {
+                eprintln!("error reading disk image {}: {}", path, e);
+                return ExitCode::from(1);
+            }
+        }
+    }
     let loaded = if long_mode {
         x86emu::boot::load_elf64_kernel(&mut cpu, &bytes, &cmdline, initrd.as_deref())
     } else {

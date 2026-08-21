@@ -4,6 +4,7 @@
 # Downloaded OS images (large binaries, not source)
 /images/*.iso
 /images/*.bin
+/images/*.img
 /images/vmlinuz*
 /images/initramfs*
 # Symbol table extracted from a kernel image (derived; regenerate with

@@ -16,9 +16,10 @@ from `startup_32` to a busybox prompt — device init, an ext2 root filesystem
 off a ramdisk, `/sbin/init` in ring 3, the whole log on the emulated VGA text
 console. A real **64-bit Alpine Linux kernel (6.18)** boots from
 `--kernel-elf64` through its whole init to `/init`, runs the musl/busybox
-userspace of its initramfs in ring 3 (SSE2 and all), execs applets and loads
-modules, and then waits in `nlplug-findfs` for boot media that is not there
-— see the roadmap for that open item.
+userspace of its initramfs in ring 3 (SSE2 and all), execs applets, loads
+modules, searches for boot media, times out when there is none and drops to
+the initramfs emergency shell (`~ #`). That shell cannot be typed at yet —
+the i8042 probe fails, so there is no tty; see the roadmap.
 
 Underneath that: a 16-bit real-mode 8086-style core, a minimal BIOS (native
 Rust handlers for `INT 0x10/0x16/0x13/0x15`), 32-bit protected mode (GDT/IDT,
@@ -82,13 +83,15 @@ cargo run --release --example gen_long64
 | `src/kbd.rs` | 8042 keyboard controller (scancodes, IRQ1). |
 | `src/dma.rs` | 8237 DMA controller (4 channels, page registers). |
 | `src/ide.rs` | IDE/ATA disk controller (PIO, LBA28, IRQ14). |
+| `src/pci.rs` | PCI configuration space through 0xCF8/0xCFC (mechanism #1): a host bridge and a transitional virtio block device. An absent slot reads back all ones, which is what ends a bus scan; BARs report their size when written all ones, and their type bits are read-only. |
+| `src/virtio.rs` | The virtio block device behind that BAR: the legacy register window, one split virtqueue, and the block requests carried on it. The used ring is page-aligned after the available ring -- the legacy layout says so, and packing them together writes completions over the driver's own data. |
 | `src/boot.rs` | Linux boot-protocol loader: parse bzImage, load kernel, build `boot_params`, enter protected mode. Also `enter_long_mode()` (the four-step handover), `build_identity_map()`, `load_elf64_kernel()` and `load_flat64()`. |
 | `src/fpu.rs` | x87 FPU: control/status/tag words, 8 data registers (as `f64`), the D8-DF instructions. |
 | `src/bios.rs` | `Bios` struct: native Rust handlers for `INT 0x10/0x16/0x13/0x15`. |
-| `src/main.rs` | CLI: a flat binary, `--boot`, `--kernel`, `--kernel-elf`, `--kernel-elf64`, `--long`, and `--mem SIZE` (applies to every mode). |
+| `src/main.rs` | CLI: a flat binary, `--boot`, `--kernel`, `--kernel-elf`, `--kernel-elf64`, `--long`, `--mem SIZE` (applies to every mode), `--disk IMAGE` (presented on both the IDE controller and the virtio block device, since no guest here has drivers for both), and `--keys TEXT` / `--keys-at N` for scripted keystrokes. |
 | `examples/` | `gen_add.rs` (generates `add.bin`) and `gen_long64.rs` (generates `long64.bin`, the 64-bit demo), plus the prebuilt `add.bin`, `boot.bin` and `long64.bin`. |
 | `gen_boot.py` | Python script that hand-assembles `examples/boot.bin`. |
-| `tools/` | Host-side helpers for the boot effort: `extract_iso.py` (pull the kernel and root filesystem out of the ISO), `unpack_bzimage.py` (decompress a bzImage to the ELF `--kernel-elf` wants), `kallsyms.py` (symbol table out of a stripped kernel), `sym.py` (address -> name), `elfsyms.py`. |
+| `tools/` | Host-side helpers for the boot effort: `extract_iso.py` (pull the kernel and root filesystem out of the ISO), `unpack_bzimage.py` (decompress a bzImage to the ELF `--kernel-elf` wants), `kallsyms.py` / `kallsyms64.py` (symbol table out of a stripped 32- or 64-bit kernel), `sym.py` / `sym64.py` (address -> name), `systrace.py` (an `X86EMU_TRACE_SYSCALLS` trace -> named syscalls per thread), `elfsyms.py`. |
 | `images/` | Downloaded OS images for the boot effort: `linux.iso` and, extracted from it, `bzImage`, `golden_kernel.bin` (the decompressed kernel ELF) and `root.bin` (the ext2 root filesystem, loaded as an initrd). All git-ignored — they are downloads, not source. |
 
 The project is a git repository (initialized at the project root, branch
@@ -172,7 +175,8 @@ cargo run -- --boot examples/boot.bin
   `AH=0x88` (extended memory in KB) — the RAM-layout queries Linux makes very
   early in boot.
 - **Devices & hardware interrupts.** The `Cpu` owns a `Pit`, a `Pic`, a
-  `Vga`, a `Kbd`, a `Dma`, and an `Ide`. `Cpu::step` calls
+  `Vga`, a `Kbd`, a `Dma`, an `Ide`, a `Pci` bus and the `VirtioBlk` device
+  on it. `Cpu::step` calls
   `deliver_hardware_interrupt` before each instruction: it ticks the PIT
   (channel 0 asserts IRQ0), latches the keyboard (IRQ1) and IDE (IRQ14) into
   the PIC, and if the PIC acknowledges a pending unmasked IRQ, dispatches it
@@ -460,6 +464,18 @@ every one of them is the sort of thing a tidy-up would quietly revert.
   pops five words. There is no privilege-dependent variant to "optimize" into.
 - **CMP and TEST commit nothing**; the ALU r/m↔reg forms check `AluOp::Cmp`
   before writing back, exactly as the immediate forms always did.
+- **`XADD` commits memory before the register when the destination is
+  memory.** It is the one read-modify-write that writes *both*, and it wrote
+  the register first -- which the fault suppression in `set_reg*` cannot
+  catch, because nothing is pending yet. When the store faulted, the restart
+  read its own clobbered source back as the addend and computed `2V` instead
+  of `V+1`. This is what deadlocked a 64-bit Alpine boot: every `fork()`
+  makes libc's data page copy-on-write, so the next `__unlock` (`lock xadd`
+  with `0x7FFFFFFF`) faults on its store, and musl's lock word walked away
+  from any value an unlock could clear -- while the `cmp` against `INT_MIN+1`
+  matched the stale register and skipped the wake as well. The register form
+  keeps the SDM's order (DEST last) so `xadd %eax,%eax` still leaves the sum;
+  both halves are pinned by tests.
 - **Stores translate as stores.** `translate_write` / `modrm_addr*_write`, not
   the read-side helpers — that is what applies `CR0.WP` and the user/supervisor
   check. The moffs and x87 store forms were on the read path and silently
@@ -476,6 +492,20 @@ every one of them is the sort of thing a tidy-up would quietly revert.
   and only when the PIC's priority logic lets them through (`Pic::next_irq`).
   Do not reintroduce a CPU-side "servicing an interrupt" flag: `SYSRET` is a
   legitimate way out of an interrupt's aftermath and clears nothing.
+- **Port I/O is width-generic like everything else.** `IN`/`OUT`'s "Ax"
+  forms cover 16 *and* 32 bits and read `cpu.osize()` at execute time; they
+  used to call the 16-bit path unconditionally, which left the top half of
+  EAX holding whatever was there before. PCI configuration mechanism #1 is a
+  32-bit address latch and a 32-bit data port, so nothing on the bus can be
+  enumerated without this. There is no 64-bit port access -- REX.W does not
+  widen either instruction -- so the size saturates at 32.
+- **The virtio used ring is page-aligned after the available ring**, because
+  the legacy layout says so. Packing it straight after the available ring
+  puts completions on top of whatever the driver left in the gap.
+- **Virtqueue indices are compared with `wrapping_sub`, not `<`.** Both are
+  free-running `u16` counters that wrap at 65536 rather than at the queue
+  size; a `<` comparison stalls the queue permanently the first time the
+  driver's index wraps past the device's.
 - **`X86EMU_*` diagnostics stay.** They are the only reason a bug 47 million
   instructions into a boot is findable at all, and they cost nothing when
   unset. Do not "clean them up".
@@ -531,27 +561,47 @@ every one of them is the sort of thing a tidy-up would quietly revert.
       `#DF` escalation, `mov %cr4,%r12` losing REX.B, the SSE stores,
       operands that straddle a page, a PIC with a real in-service register,
       and a PIT clocked at a plausible ratio to the CPU.
-- [ ] **`nlplug-findfs` deadlocks** waiting for boot media: its trigger
-      thread ends in `futex(WAIT, 2)` on a stack variable and the main thread
-      in `futex(WAIT, -1)` on a global, no timeout on either, and nothing
-      wakes them (`X86EMU_TRACE_USER=1 X86EMU_TRACE_SYSCALLS=1` from
-      instruction 1.17e9 shows the whole exchange). Deterministic across
-      epochs and independent of the PIC/PIT changes (the earlier iterations
-      reached the shell only because a broken exec kept nlplug-findfs from
-      running). Something the two threads hand each other -- a wake, a
-      signal, a scheduler decision -- is being lost; that is the next 64-bit
-      bug to find. With it found, `/init` falls through to the initramfs
-      shell.
+- [x] **`nlplug-findfs` deadlocked** waiting for boot media, and the cause
+      was `XADD`, not a lost wakeup. Its trigger thread sat in `futex(WAIT,
+      2)` on a stack local and the main thread in `futex(WAIT, -1)` on a libc
+      global, neither with a timeout. The `-1` was the tell: musl's `__lock`
+      word encodes `INT_MIN + congestion`, so `-1` means a congestion count
+      of 2^31 and no unlock can ever clear it. `fork()` makes libc's data
+      page copy-on-write, so the very next `__unlock` -- which is
+      `lock xadd $0x7FFFFFFF, (l)` -- faults on its store; the emulator had
+      already written the *register* by then, so the restart read its own
+      clobbered source back as the addend and stored `2V` instead of
+      `V+1`, while the `cmp` against `INT_MIN+1` saw the stale value and
+      skipped the wake too. Roughly two hundred forks of that walked the word
+      to `-1` and the next `fork()` blocked forever. Found by dumping the
+      futex words at the deadlock (`X86EMU_DUMP_LINEAR` through the blocked
+      process's still-loaded CR3), reading musl's `__lock`/`__unlock` out of
+      the guest's own libc, and watching the word's stores
+      (`X86EMU_WATCH`), which showed the fault sentinel and the retry landing
+      on a fresh physical page. `/init` now falls through to the initramfs
+      shell. **Rebuild the binary, not just the tests** -- `cargo test
+      --release` does not relink `target/release/x86emu.exe`, and a boot run
+      against the stale one looks exactly like a fix that changed nothing.
 - [x] **Intel VT-x** (`src/vmx.rs`): VMXON/VMXOFF, the VMCS and
       VMREAD/VMWRITE/VMPTRLD/VMPTRST/VMCLEAR, VMLAUNCH/VMRESUME, VM exits for
       CPUID/HLT/VMCALL/exceptions/interrupts/CR/DR/I/O/MSR and the rest,
       event injection, CR0/CR4 mask and shadow, the capability MSRs and
       CPUID.1:ECX.VMX. Not there: EPT, unrestricted guest, the preemption
       timer, APIC virtualization, nested VMX — the MSRs say so.
-- [ ] Keyboard input: the kernel's i8042 probe fails (`Can't read CTR`), so
-      the shell that comes up cannot be typed at. `src/kbd.rs` implements the
-      scancode/status side but not the controller command interface
-      (0x64 commands 0x20/0x60/0xAA/0xAB and the responses they expect).
+- [x] **Keyboard input**: `src/kbd.rs` implements the controller command
+      interface, so the i8042 probe succeeds and the shell can be typed at.
+      The controller command byte round trips (0x20 read, 0x60 write), the
+      self-test answers 0x55 and the port test 0x00, and responses share one
+      output buffer with scancodes as they do on the real device. There is no
+      mouse: the auxiliary port test answers 0xFF and a byte written through
+      to it is dropped, which is what the absence looks like from the guest.
+      Host keystrokes arrive through `--keys` (and `--keys-at`), expanded to
+      set-1 make and break codes and fed one at a time as the guest drains
+      them. **`--keys-at` is not a nicety**: a keyboard driver attaching is
+      not the same as something reading, and keys delivered before the shell
+      opens the console are read by `atkbd` and thrown away -- typing
+      `echo KBD_WORKS` from the moment the driver bound arrived as
+      `bD_WORKS`, thirteen scancodes short.
       With the 64-bit boot landing at a shell prompt this is now the thing
       between the emulator and an interactive session.
 - [ ] Run the in-kernel bzImage decompressor, so `--kernel` works end to end
@@ -573,7 +623,21 @@ variables, all off by default, and none of them cost anything when unset.
    images/kernel.syms` extracts a symbol table from the stripped kernel (it
    scans `.rodata` for the kallsyms table), and `python tools/sym.py C02EF525`
    turns an address into `early_page_fault+0x5`. Do this first: "stuck at
-   C01A2BD0" is not a lead, "stuck in `delay_loop`" is.
+   C01A2BD0" is not a lead, "stuck in `delay_loop`" is. For a 64-bit kernel
+   use `kallsyms64.py` / `sym64.py` (`X86EMU_SYMS` picks the file, default
+   `images/alpine.syms`): a 6.x kernel is base-relative and does not lay its
+   tables out in the order the 32-bit one does, so each piece is found by its
+   own signature and cross-checked rather than by walking forward from the
+   first.
+1b. **Name what userspace is doing.** `X86EMU_TRACE_USER=1
+   X86EMU_TRACE_SYSCALLS=1` writes the `syscall` instruction and the one
+   after it; `python tools/systrace.py trace.txt -n 40` turns that into named
+   calls with arguments, grouped by stack pointer, which is the only thread
+   identity a register dump carries. **A syscall that blocks is not followed
+   by its own return** -- the next traced instruction belongs to whichever
+   thread ran next, so pair a return only when the stack pointer matches and
+   the RIP is the syscall's plus two. Getting that wrong reads a blocked
+   thread as one that returned.
 2. **See the state.** `X86EMU_DEBUG=<n>` prints the exception log (vector,
    error code, faulting EIP, CR2 — the first ones, which is what you want),
    per-vector interrupt counts with the IDT target each resolves to, PIT/PIC

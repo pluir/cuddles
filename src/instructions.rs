@@ -2368,28 +2368,54 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
         },
         // XADD: the destination gets the sum, the source register gets the
         // destination's old value. Flags are those of ADD.
+        //
+        // The order of the two commits is load-bearing, and it differs by
+        // operand. With a MEMORY destination the store can fault, so it goes
+        // first: a register written before it is not covered by the
+        // fault-suppression in `set_reg*` (nothing is pending yet), so it
+        // would survive into the restart and be read back as the addend --
+        // `lock xadd $1, (l)` retried after a copy-on-write fault turned a
+        // lock word of V into 2V instead of V+1. With a REGISTER destination
+        // nothing can fault and the SDM's order stands (TEMP := SRC + DEST;
+        // SRC := DEST; DEST := TEMP), which is what makes the degenerate
+        // `xadd %eax,%eax` leave the sum rather than the old value.
         Inst::Xadd { m, reg, width } => match width {
             8 => {
                 let dest = cpu.read_rm8(&m);
                 let src = cpu.reg8_idx(reg);
                 let sum = alu8(cpu, AluOp::Add, dest, src);
-                cpu.set_reg8_idx(reg, dest);
-                cpu.write_rm8(&m, sum);
+                if m.is_reg() {
+                    cpu.set_reg8_idx(reg, dest);
+                    cpu.write_rm8(&m, sum);
+                } else {
+                    cpu.write_rm8(&m, sum);
+                    cpu.set_reg8_idx(reg, dest);
+                }
             }
             16 => {
                 let dest = cpu.read_rm16(&m);
                 let src = cpu.reg16_idx(reg);
                 let sum = alu16(cpu, AluOp::Add, dest, src);
-                cpu.set_reg16_idx(reg, dest);
-                cpu.write_rm16(&m, sum);
+                if m.is_reg() {
+                    cpu.set_reg16_idx(reg, dest);
+                    cpu.write_rm16(&m, sum);
+                } else {
+                    cpu.write_rm16(&m, sum);
+                    cpu.set_reg16_idx(reg, dest);
+                }
             }
             _ => {
                 let w = cpu.osize();
                 let dest = cpu.read_rm_w(&m, w);
                 let src = cpu.reg_w(reg, w);
                 let sum = alu_w(cpu, AluOp::Add, dest, src, w);
-                cpu.set_reg_w(reg, w, dest);
-                cpu.write_rm_w(&m, w, sum);
+                if m.is_reg() {
+                    cpu.set_reg_w(reg, w, dest);
+                    cpu.write_rm_w(&m, w, sum);
+                } else {
+                    cpu.write_rm_w(&m, w, sum);
+                    cpu.set_reg_w(reg, w, dest);
+                }
             }
         },
         // CMPXCHG8B: compare EDX:EAX with the 64-bit destination; on a
@@ -2971,33 +2997,61 @@ pub fn execute(cpu: &mut Cpu, inst: &Inst) {
             let v = cpu.port_in(port as u16);
             cpu.set_reg8(Reg8::Al, v);
         }
+        // The "Ax" forms cover 16 AND 32 bits, like every other width-generic
+        // shape here: `cpu.osize()` at execute time is what decides. There is
+        // no 64-bit port access -- REX.W does not widen IN or OUT -- so the
+        // operand size saturates at 32. Reading only 16 bits for `in eax, dx`
+        // left the top half of EAX holding whatever was there before, which
+        // is not something a driver reading a 32-bit register survives.
         Inst::InAxImm { port } => {
-            let v = cpu.port_in16(port as u16);
-            cpu.set_reg16(Reg16::Ax, v);
+            if cpu.osize() >= 32 {
+                let v = cpu.port_in32(port as u16);
+                cpu.set_reg32(Reg32::Eax, v);
+            } else {
+                let v = cpu.port_in16(port as u16);
+                cpu.set_reg16(Reg16::Ax, v);
+            }
         }
         Inst::InAlDx => {
             let v = cpu.port_in(cpu.dx());
             cpu.set_reg8(Reg8::Al, v);
         }
         Inst::InAxDx => {
-            let v = cpu.port_in16(cpu.dx() as u16);
-            cpu.set_reg16(Reg16::Ax, v);
+            let port = cpu.dx();
+            if cpu.osize() >= 32 {
+                let v = cpu.port_in32(port);
+                cpu.set_reg32(Reg32::Eax, v);
+            } else {
+                let v = cpu.port_in16(port);
+                cpu.set_reg16(Reg16::Ax, v);
+            }
         }
         Inst::OutImmAl { port } => {
             let v = cpu.reg8(Reg8::Al);
             cpu.port_out(port as u16, v);
         }
         Inst::OutImmAx { port } => {
-            let v = cpu.reg16(Reg16::Ax);
-            cpu.port_out16(port as u16, v);
+            if cpu.osize() >= 32 {
+                let v = cpu.eax();
+                cpu.port_out32(port as u16, v);
+            } else {
+                let v = cpu.reg16(Reg16::Ax);
+                cpu.port_out16(port as u16, v);
+            }
         }
         Inst::OutDxAl => {
             let v = cpu.reg8(Reg8::Al);
             cpu.port_out(cpu.dx(), v);
         }
         Inst::OutDxAx => {
-            let v = cpu.reg16(Reg16::Ax);
-            cpu.port_out16(cpu.dx() as u16, v);
+            let port = cpu.dx();
+            if cpu.osize() >= 32 {
+                let v = cpu.eax();
+                cpu.port_out32(port, v);
+            } else {
+                let v = cpu.reg16(Reg16::Ax);
+                cpu.port_out16(port, v);
+            }
         }
 
         // ---- Flag-control instructions ----
@@ -5549,6 +5603,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn thirty_two_bit_port_io_reaches_pci_configuration_space() {
+        // `in eax, dx` has to move 32 bits. Configuration mechanism #1 is a
+        // 32-bit address latch and a 32-bit data port, so a 16-bit access
+        // leaves the top half of EAX holding whatever was there before --
+        // and every device on the bus reads back half-garbage.
+        let mut cpu = flat32();
+        cpu.mem.load(0x1000, &[
+            0xBA, 0xF8, 0x0C, 0x00, 0x00, // mov edx, 0xCF8
+            0xB8, 0x00, 0x00, 0x00, 0x80, // mov eax, 0x80000000 (bus 0, dev 0, reg 0)
+            0xEF,                         // out dx, eax
+            0xBA, 0xFC, 0x0C, 0x00, 0x00, // mov edx, 0xCFC
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov eax, -1   (poison both halves)
+            0xED,                         // in eax, dx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.eax(), 0x1237_8086, "the host bridge, all 32 bits of it");
+    }
+
+    #[test]
+    fn xadd_into_its_own_source_register_leaves_the_sum() {
+        // The degenerate `xadd %eax,%eax`: both writes name one register, and
+        // the SDM writes DEST last (TEMP := SRC + DEST; SRC := DEST;
+        // DEST := TEMP), so the sum wins over the old value. This is why the
+        // register form keeps that order while the memory form -- where the
+        // store can fault -- has to commit memory first.
+        let mut cpu = flat32();
+        cpu.mem.load(0x1000, &[
+            0xB8, 0x05, 0x00, 0x00, 0x00,   // mov eax, 5
+            0x0F, 0xC1, 0xC0,               // xadd eax, eax
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.eax(), 10, "the destination write is the one that lands");
+    }
+
+    #[test]
     fn cmpxchg8b_compares_and_swaps_64_bits() {
         let mut cpu = flat32();
         cpu.mem.write_u32(0x3000, 0x1111_1111);
@@ -5793,6 +5884,50 @@ pub(crate) mod tests {
         cpu.run(64);
         assert_eq!(cpu.cr2, 0x0003_0000, "the faulting address");
         assert_eq!(cpu.edx(), 10, "EDX must be untouched by the faulted add");
+    }
+
+    #[test]
+    fn a_faulting_xadd_does_not_clobber_its_source_register() {
+        // XADD is the one read-modify-write that commits BOTH a register and
+        // memory, and it wrote the register first. When the store faults the
+        // instruction restarts -- and a source register already overwritten
+        // with the memory operand's old value makes the retry add the wrong
+        // addend, turning a word of V into 2V instead of V+1.
+        //
+        // musl's `a_fetch_add(l, 1)` on a copy-on-write libc page is exactly
+        // that: the first write after a fork faults, and the lock word came
+        // back with an impossible value. It stranded nlplug-findfs in a
+        // futex wait nothing could satisfy.
+        let mut cpu = flat32();
+        cpu.cr3 = 0x20000;
+        cpu.mem.write_u32(0x20000, 0x21003);
+        for i in 0..16u32 {
+            cpu.mem.write_u32(0x21000 + i as usize * 4, (i << 12) | 3);
+        }
+        // Virtual 0x30000 -> physical 0x30000, present but READ-ONLY, so the
+        // load succeeds and only the store faults.
+        cpu.mem.write_u32(0x21000 + 0x30 * 4, 0x30000 | 1);
+        cpu.mem.write_u32(0x30000, 0x7FFF_FFFF);
+        // PG | PE | WP: a supervisor write to a read-only page must fault.
+        cpu.cr0 = 0x8001_0001;
+        cpu.idt_base = 0x5000;
+        cpu.idt_limit = 0xFF;
+        let entry = 0x5000 + 0x0E * 8;
+        cpu.mem.write_u16(entry, 0x2000);
+        cpu.mem.write_u16(entry + 2, 0x08);
+        cpu.mem.write_u16(entry + 4, 0x8E00);
+        cpu.mem.write_u16(entry + 6, 0x0000);
+        cpu.mem.write_u8(0x2000, 0xF4);
+        cpu.mem.load(0x1000, &[
+            0xBB, 0x01, 0x00, 0x00, 0x00,   // mov ebx, 1
+            0xBF, 0x00, 0x00, 0x03, 0x00,   // mov edi, 0x30000
+            0xF0, 0x0F, 0xC1, 0x1F,         // lock xadd [edi], ebx
+            0xF4,
+        ]);
+        cpu.run(64);
+        assert_eq!(cpu.cr2, 0x0003_0000, "the faulting address");
+        assert_eq!(cpu.ebx(), 1, "EBX must still hold the addend for the retry");
+        assert_eq!(cpu.mem.read_u32(0x30000), 0x7FFF_FFFF, "memory unchanged");
     }
 
     #[test]

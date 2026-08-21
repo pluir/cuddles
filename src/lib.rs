@@ -19,6 +19,8 @@ pub mod vga;
 pub mod kbd;
 pub mod dma;
 pub mod ide;
+pub mod pci;
+pub mod virtio;
 pub mod boot;
 pub mod fpu;
 pub mod sse;
